@@ -12,8 +12,10 @@ class signUpPersist:
             os.getenv("MYSQLHOST"),
             os.getenv("MYSQLUSER"),
             os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE")
+            os.getenv("MYSQLDATABASE"),
+            os.getenv("MYSQLPORT", 3306)
         )
+        
         cursor=connection.cursor()
         cursor.execute(INSERT_USER_QUERY, (signup_request.first_name, signup_request.last_name, signup_request.email, signup_request.password, signup_request.phone_number))
         connection.commit()

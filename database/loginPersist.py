@@ -10,7 +10,8 @@ def login_user(login_request: Any):
             os.getenv("MYSQLHOST"),
             os.getenv("MYSQLUSER"),
             os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE")
+            os.getenv("MYSQLDATABASE"),
+            os.getenv("MYSQLPORT", 3306)
     )
     if conn is None:
         raise Exception("Database connection failed")
