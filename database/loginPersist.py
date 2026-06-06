@@ -1,9 +1,17 @@
 from .ConnectionFactory import ConnectionFactory
 from typing import Any
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 
 def login_user(login_request: Any):
-    conn = ConnectionFactory.create_connection("localhost", "root", "root", "PortfolioDb")
+    conn = ConnectionFactory.create_connection(
+            os.getenv("MYSQLHOST"),
+            os.getenv("MYSQLUSER"),
+            os.getenv("MYSQLPASSWORD"),
+            os.getenv("MYSQLDATABASE")
+    )
     if conn is None:
         raise Exception("Database connection failed")
     cursor = conn.cursor()
