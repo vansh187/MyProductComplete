@@ -1,3 +1,5 @@
+import os
+
 import mysql.connector
 from mysql.connector import Error
 
@@ -7,6 +9,9 @@ class ConnectionFactory:
     def create_connection(host_name, user_name, user_password, db_name):
         connection = None
         try:
+            print("host:", host_name)
+            print("user:", user_name)
+            print("database:", db_name)
             connection = mysql.connector.connect(
                 host=host_name,
                 user=user_name,
