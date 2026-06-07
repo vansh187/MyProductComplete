@@ -5,9 +5,9 @@ from api.login import router as login_router
 from api.orders import router as orders_router
 app=FastAPI()
 
+app.include_router(orders_router)
 app.include_router(signup_router)
 app.include_router(login_router)
-app.include_router(orders_router)
 @app.get("/")
 def read_root():
     return {"Message":"Finnaly I am able to run my first API"}
