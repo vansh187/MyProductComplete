@@ -18,4 +18,9 @@ def getorders(user_id):
 def getOrderById(userId,orderId):
     order=orderPersistence.getOrderById(userId,orderId)
     print(f"Retrieving orders for user_id: {userId}")
-    return order    
+    return order  
+
+def cancelOrderById(userId,orderId):
+    order=orderPersistence.cancelOrderById(userId,orderId)
+    print(f"order cancelled for user_id: {userId}")
+    return order 

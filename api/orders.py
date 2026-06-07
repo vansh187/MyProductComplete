@@ -4,6 +4,8 @@ from utils.auth_dependency import get_current_user
 from service.orderService import create_order as service_create_order
 from service.orderService import getorders as service_get_orders
 from service.orderService import getOrderById as service_get_OrderById
+from service.orderService import cancelOrderById as service_cancelOrderById
+
 router = APIRouter()
 
 @router.get("/orders")
@@ -39,9 +41,20 @@ class OrderCreate(BaseModel):
 @router.get("/getOrderById/{orderId}")
 def getOrderById(orderId:int,current_user=Depends(get_current_user)):
     userId = current_user["user_id"]
-    order = service_get_OrderById(userId, orderId)
+    order = service_cancelOrderById(userId, orderId)
     return {
                 "Message": "Order retrieved successfully",
+                "User": current_user,
+                "Order": order
+            }
+
+
+@router.get("/cancelOrderById/{orderId}")
+def cancelOrderById(orderId:int,current_user=Depends(get_current_user)):
+    userId = current_user["user_id"]
+    order = service_cancelOrderById(userId, orderId)
+    return {
+                "Message": "Order cancelled Success",
                 "User": current_user,
                 "Order": order
             }
