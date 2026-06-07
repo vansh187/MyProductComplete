@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from utils.auth_dependency import get_current_user
 from service.orderService import create_order as service_create_order
 from service.orderService import getorders as service_get_orders
+from service.orderService import getOrderById as service_get_OrderById
 router = APIRouter()
 
 @router.get("/orders")
@@ -33,3 +34,15 @@ class OrderCreate(BaseModel):
     quantity: int
     price: float
     status: str
+
+
+@router.get("/getOrderById/{orderId}")
+def getOrderById(orderId:int,current_user=Depends(get_current_user)):
+    userId = current_user["user_id"]
+    order = service_get_OrderById(userId, orderId)
+    return {
+                "Message": "Order retrieved successfully",
+                "User": current_user,
+                "Order": order
+            }
+

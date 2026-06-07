@@ -42,3 +42,20 @@ def get_orders(user_id):
     
     print(f"Retrieving orders for user_id: {user_id}")
     return orders
+
+
+def getOrderById(userId,orderId):
+     ORDER_BY_ID="SELECT id, symbol, side, quantity, price, status FROM orders WHERE user_id = %s and id=%s"
+     conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
+            os.getenv("MYSQLUSER"),
+            os.getenv("MYSQLPASSWORD"),
+            os.getenv("MYSQLDATABASE"),
+            os.getenv("MYSQLPORT", 3306)
+
+        )
+     cursor = conn.cursor()
+     cursor.execute(ORDER_BY_ID,(userId,orderId))
+     order=cursor.fetchone()
+     cursor.close()
+     conn.close()
+     return order
