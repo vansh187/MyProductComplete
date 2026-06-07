@@ -15,6 +15,7 @@ class LoginService:
             raise ValueError("Invalid credentials")
         else:
             usertoken = create_access_token({
-        "sub": login_request.email  # subject = user identity
+        "sub": login_request.email,
+         "user_id": user[0] # subject = user identity
             })
             return usertoken
