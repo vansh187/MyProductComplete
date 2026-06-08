@@ -5,7 +5,8 @@ from service.orderService import create_order as service_create_order
 from service.orderService import getorders as service_get_orders
 from service.orderService import getOrderById as service_get_OrderById
 from service.orderService import cancelOrderById as service_cancelOrderById
-
+from service.portfolioService import portfolioService
+#from service.portfolioService import process_buy as service_process_sell
 router = APIRouter()
 
 @router.get("/orders")
@@ -22,6 +23,11 @@ def get_orders(current_user=Depends(get_current_user)):
 def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
     user_id = current_user["user_id"]
     service_create_order(order, user_id)
+    if order.side == "BUY":
+        portfolioService.process_buyer(user_id, order.symbol, order.quantity, order.price)
+
+    elif order.side == "SELL":
+        portfolioService.process_seller(user_id, order.symbol, order.quantity,order.price)
 
     return {
                 "Message": "Order created successfully",
