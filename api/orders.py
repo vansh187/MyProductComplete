@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from utils.auth_dependency import get_current_user
@@ -23,22 +25,21 @@ def get_orders(current_user=Depends(get_current_user)):
 @router.post("/orders")
 def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
     user_id = current_user["user_id"]
-    service_create_order(order, user_id)
-    ExecutionEngine.executeOrder(order,user_id)
+    id=service_create_order(order, user_id)
+    order.id=id
+    status=ExecutionEngine.executeOrder(order,user_id)
    ## if order.side == "BUY":
      ##   portfolioService.process_buyer(user_id, order.symbol, order.quantity, order.price)
 
 ##    elif order.side == "SELL":
-  ##      portfolioService.process_seller(user_id, order.symbol, order.quantity,order.price)
-
-    return {
-                "Message": "Order created successfully",
-                "User": current_user
-            }
+  ##    portfolioService.process_seller(user_id, order.symbol, order.quantity,order.price)
+   
+    return status
 
 
 class OrderCreate(BaseModel):
     
+    id:Optional[int]=None
     symbol: str
     side: str
     quantity: int

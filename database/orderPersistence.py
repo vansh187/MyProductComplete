@@ -18,10 +18,12 @@ def create_order(order, user_id):
     cursor = conn.cursor()
     cursor.execute(INSERT_ORDER_QUERY, (user_id, order.symbol, order.side, order.quantity, order.price, order.status))
     conn.commit()
-    cursor.close()
-    conn.close()
+    id= cursor.lastrowid
     print(f"Creating order for user_id: {user_id}")
     print(f"Order details: {order}")
+    cursor.close()
+    conn.close()
+    return id
 
 def get_orders(user_id):
     # Here you would implement the logic to retrieve orders from the database
