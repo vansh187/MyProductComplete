@@ -59,7 +59,13 @@ def getOrderById(orderId:int,current_user=Depends(get_current_user)):
 def cancelOrderById(orderId:int,current_user=Depends(get_current_user)):
     userId = current_user["user_id"]
     order = service_cancelOrderById(userId, orderId)
-    return {
+    if order is None:
+        return{
+                "Message": "Only pending orders are allowed",
+                "User": current_user,
+        }
+    else:
+        return {
                 "Message": "Order cancelled Success",
                 "User": current_user,
                 "Order": order
