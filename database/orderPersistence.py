@@ -62,7 +62,7 @@ def getOrderById(userId,orderId):
 
 def cancelOrderById(userId,orderId):
     CANCELLED="CANCELLED"
-    CANCEL_ORDER_ID="UPDATE orders SET status=%s WHERE user_id=%s AND id=%s"
+    CANCEL_ORDER_ID="UPDATE orders SET status=%s WHERE user_id=%s AND id=%s and status =%s"
     conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
             os.getenv("MYSQLUSER"),
             os.getenv("MYSQLPASSWORD"),
@@ -71,9 +71,18 @@ def cancelOrderById(userId,orderId):
 
         )
     cursor = conn.cursor()
-    cursor.execute(CANCEL_ORDER_ID,(CANCELLED,userId,orderId))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print(f"order cancelled with order id: {userId}")
+    cursor.execute(CANCEL_ORDER_ID,(CANCELLED,userId,orderId,"PENDING"))
+   
+    if cursor.rowcount == 0:
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return
+    else:
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return "Cancel Success"
+        print(f"order cancelled with order id: {userId}")
+    
 

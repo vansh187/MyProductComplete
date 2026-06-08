@@ -22,5 +22,8 @@ def getOrderById(userId,orderId):
 
 def cancelOrderById(userId,orderId):
     order=orderPersistence.cancelOrderById(userId,orderId)
-    print(f"order cancelled for user_id: {userId}")
+    if order is None:
+       print(f"only pending orders are allowed: {userId}") 
+    else:
+        print(f"order cancelled for user_id: {userId}")
     return order 
