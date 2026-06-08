@@ -1,4 +1,6 @@
 from database import orderPersistence
+from database.portfolioPersistence import portfolioPersistence
+
 
 def create_order(order, user_id):
     # Here you would implement the logic to save the order to the database
@@ -27,3 +29,7 @@ def cancelOrderById(userId,orderId):
     else:
         print(f"order cancelled for user_id: {userId}")
     return order 
+
+def updateStatus(user_id, symbol, status):
+    portfolioPersistence.updateStatus(user_id, symbol, status)
+

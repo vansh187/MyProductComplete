@@ -25,10 +25,10 @@ class portfolioPersistence:
             cursor.execute(UPDATE_HOLDINGS, (new_qty, new_avg, userId, symbol))
         else:
             cursor.execute(INSERT_HOLDINGS, (userId, symbol, quantity, price))    
-        try:
-            portfolioPersistence.updateorderStatus(conn, userId, symbol)
-        except:
-            raise Exception("Exception in calling updateorderStatus") from exc
+        ##try:
+        ##    portfolioPersistence.updateorderStatus(conn, userId, symbol)
+       ## except:
+           ## raise Exception("Exception in calling updateorderStatus") 
 
         conn.commit()
         cursor.close()
@@ -58,16 +58,32 @@ class portfolioPersistence:
          new_qty = old_qty - quantity
 
          cursor.execute(UPDATE_ORDER_QUANTITY, (new_qty, userId, symbol))
-         try:
-                portfolioPersistence.updateorderStatus(conn, userId, symbol)
-         except Exception as exc:
-             raise Exception("Exception in calling updateorderStatus") from exc
+        ## try:
+              ##  portfolioPersistence.updateorderStatus(conn, userId, symbol)
+        ## except Exception as exc:
+         ##    raise Exception("Exception in calling updateorderStatus") from exc
          conn.commit()
          cursor.close()
          conn.close()
     
-    def updateorderStatus(conn,userId,symbol) :
+    def updateorderStatus(conn,userId,symbol,status) :
         UPDATE_ORDER_STATUS="UPDATE orders SET status=%s WHERE user_id=%s AND symbol=%s"
         cursor=conn.cursor()
-        cursor.execute(UPDATE_ORDER_STATUS,("EXECUTED",userId,symbol))
+        if status is None:
+             cursor.execute(UPDATE_ORDER_STATUS,("EXECUTED",userId,symbol))
+        else:
+            cursor.execute(UPDATE_ORDER_STATUS,(status,userId,symbol))
+            cursor.close()
         print("order status update success")
+
+
+    def updateStatus(userId,symbol,status):
+            
+            conn=ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
+            os.getenv("MYSQLUSER"),
+            os.getenv("MYSQLPASSWORD"),
+            os.getenv("MYSQLDATABASE"),
+            os.getenv("MYSQLPORT", 3306))
+            portfolioPersistence.updateorderStatus(conn, userId, symbol,status)
+            conn.commit()
+            conn.close()
