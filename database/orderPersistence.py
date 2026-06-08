@@ -62,7 +62,7 @@ def getOrderById(userId,orderId):
 
 def cancelOrderById(userId,orderId):
     CANCELLED="CANCELLED"
-    CANCEL_ORDER_ID="UPDATE ORDERS SET STATUS= %s WHERE USER_ID=%s AND ID=%s"
+    CANCEL_ORDER_ID="UPDATE orders SET status=%s WHERE user_id=%s AND id=%s"
     conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
             os.getenv("MYSQLUSER"),
             os.getenv("MYSQLPASSWORD"),
