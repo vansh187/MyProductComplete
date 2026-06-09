@@ -4,8 +4,8 @@ from database.tradeHistoryPersistence import TradeHistoryPersistence as tradeHis
 
 class TradeHistoryService:
 
-    def insertTradeOrders(orderId,userId, symbol,side ,quantity,price):
-       return tradeHist.insertTradeHistoryOrders(orderId,userId,symbol, side,quantity,price)
+    def insertTradeOrders(orderId,userId, symbol,side ,quantity,price,cursor):
+       return tradeHist.insertTradeHistoryOrders(orderId,userId,symbol, side,quantity,price,cursor)
         
 
     def getTradeOrdersById(userId):
