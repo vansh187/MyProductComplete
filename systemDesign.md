@@ -2,122 +2,233 @@
 
 ## Overview
 
-`MyProductComplete` is an API-first Order Management System (OMS) built with FastAPI and MySQL. The application is structured using a layered architecture:
+`MyProductComplete` is an API-first Order Management System (OMS) implemented with FastAPI and MySQL. The product is built as a layered application with separate modules for API routing, business logic, persistence, and utilities.
 
-- API layer (`api/`) for request handling and routing
-- Service layer (`service/`) for business logic
-- Persistence layer (`database/`) for direct database access
-- Utility layer (`utils/`) for authentication and support functions
+The application supports:
+- User signup and login
+- JWT-based authentication
+- Order creation, retrieval, and cancellation
+- Portfolio updates for buy/sell orders
+- Trade history tracking
 
-The current implementation includes user authentication, order creation, order retrieval, order cancellation, and portfolio updates.
-
-## Architecture Components
+## Architecture Layers
 
 ### 1. API Layer
 
-Entry point:
+The API layer exposes REST endpoints and delegates request handling to services.
+
 - `app.py`
-  - Creates the FastAPI application
-  - Includes routers for signup, login, and orders
-  - Defines a health endpoint at `/`
+  - Instantiates the FastAPI application
+  - Mounts routers for signup, login, orders, and trade history
+  - Provides a health check or root endpoint
 
-Routers:
-- `api/signup.py` - user registration endpoint `/signup`
-- `api/login.py` - login endpoint `/login`
-- `api/orders.py` - order-related endpoints:
-  - `GET /orders` - fetch user orders
-  - `POST /orders` - create a new order
-  - `GET /getOrderById/{orderId}` - retrieve specific order by id
-  - `GET /cancelOrderById/{orderId}` - cancel an order
+- `api/signup.py`
+  - Endpoint: `POST /signup`
+  - Registers new users
 
-### 2. Authentication
+- `api/login.py`
+  - Endpoint: `POST /login`
+  - Authenticates users and issues JWT tokens
 
-Authentication uses JWT tokens and FastAPI dependency injection:
+- `api/orders.py`
+  - Endpoints for order lifecycle management:
+    - `GET /orders`
+    - `POST /orders`
+    - `GET /getOrderById/{orderId}`
+    - `GET /cancelOrderById/{orderId}`
+
+- `api/trade.py`
+  - Endpoints for trade history operations (if implemented)
+
+### 2. Authentication and Security
+
+Authentication is handled via JWT and request dependency injection:
+
 - `utils/jwt_handler.py`
-  - `create_access_token()` generates JWTs with HS256 and expiration
-  - `verify_token()` validates incoming tokens
-- `utils/auth_dependency.py`
-  - `get_current_user()` protects endpoints using `HTTPBearer`
-  - Decodes and validates the token, returning the user payload
+  - Creates and validates JWT tokens
+  - Uses application secrets from environment variables
 
-This means protected endpoints can access `current_user` and obtain `user_id`.
+- `utils/auth_dependency.py`
+  - Implements `HTTPBearer` security dependency
+  - Verifies incoming tokens and exposes authenticated user data to endpoints
+
+- `utils/password_hasher.py`
+  - Hashes user passwords at signup
+  - Verifies passwords at login
+
+This design keeps endpoints stateless and protects sensitive actions with token validation.
 
 ### 3. Service Layer
 
-Business logic is routed through service classes and modules:
+The service layer contains business rules and orchestration logic.
+
 - `service/signupService.py`
-  - Hashes passwords using `utils/password_hasher.py`
-  - Persists new users via `database/signUpPersist.py`
+  - Validates user data
+  - Hashes passwords
+  - Calls persistence layer to create new users
+
 - `service/loginService.py`
-  - Verifies credentials using `database/loginPersist.py`
-  - Checks password with `verify_password()`
-  - Returns JWT token on success
+  - Validates credentials
+  - Verifies passwords
+  - Issues JWT tokens on successful login
+
 - `service/orderService.py`
-  - Delegates order creation, retrieval, and cancellation to persistence
+  - Creates and retrieves orders
+  - Delegates persistence operations and executes order flows
+
 - `service/portfolioService.py`
-  - Manages portfolio updates after buy/sell orders
+  - Adjusts holdings after buy/sell orders
+  - Ensures portfolio state matches executed trades
+
+- `service/tradeHistoryService.py`
+  - Records trade execution details
+  - Retrieves trade history for users
+
+- `service/ExecutionEngine.py`
+  - Coordinates order execution, trade insertion, portfolio updates, and order status transitions
+  - Manages connection lifecycle and rollback/commit behavior
 
 ### 4. Persistence Layer
 
-Database operations are centralized in `database/`:
-- `database/ConnectionFactory.py` - creates MySQL connections
-- `database/orderPersistence.py` - order CRUD operations
-- `database/portfolioPersistence.py` - holdings and order status updates
-- `database/loginPersist.py` - login user lookup
-- `database/signUpPersist.py` - signup user insertion
+The persistence layer abstracts direct database operations.
 
-The persistence layer executes SQL queries and returns raw results to the service layer.
+- `database/ConnectionFactory.py`
+  - Creates MySQL database connections using environment variables
 
-### 5. Database and Schema
+- `database/loginPersist.py`
+  - Queries user records for authentication
 
-The application is designed to use MySQL with environment-driven configuration from `.env`.
+- `database/signUpPersist.py`
+  - Inserts new user records
 
-Key tables implied by the code:
+- `database/orderPersistence.py`
+  - Inserts, selects, updates, and cancels orders
+
+- `database/portfolioPersistence.py`
+  - Updates holdings, balances, and order statuses
+
+- `database/tradeHistoryPersistence.py`
+  - Persists executed trade records
+
+This separation keeps SQL handling away from higher-level business rules.
+
+## Architecture Diagram
+
+A simplified component diagram for `MyProductComplete`:
+
+```text
+Client
+  |
+  | HTTP
+  v
+FastAPI API Layer (`app.py`, routers)
+  |
+  | calls
+  v
+Service Layer
+  - signupService
+  - loginService
+  - orderService
+  - portfolioService
+  - tradeHistoryService
+  - ExecutionEngine
+  |
+  | uses
+  v
+Persistence Layer
+  - ConnectionFactory
+  - loginPersist
+  - signUpPersist
+  - orderPersistence
+  - portfolioPersistence
+  - tradeHistoryPersistence
+  |
+  | stores/retrieves
+  v
+MySQL Database
+```
+
+The flow is:
+- Client -> API layer
+- API layer -> Service layer
+- Service layer -> Persistence layer
+- Persistence layer -> MySQL
+
+## Data Model and Schema
+
+The project expects a MySQL database backed by environment configuration in `.env`.
+
+Suggested tables and fields:
+
+- `users`
+  - `id`
+  - `username`
+  - `email`
+  - `password_hash`
+  - `created_at`
+
 - `orders`
-  - Columns: `id`, `user_id`, `symbol`, `side`, `quantity`, `price`, `status`, `created_at`
+  - `id`
+  - `user_id`
+  - `symbol`
+  - `side`
+  - `quantity`
+  - `price`
+  - `status`
+  - `created_at`
+
 - `holdings`
-  - Columns: `user_id`, `symbol`, `quantity`, `avg_price`
-- `users` or equivalent signup table
-  - Required by signup and login persistence
+  - `user_id`
+  - `symbol`
+  - `quantity`
+  - `avg_price`
 
-## Current Order Workflow
+- `trade_history`
+  - `id`
+  - `order_id`
+  - `user_id`
+  - `symbol`
+  - `side`
+  - `quantity`
+  - `price`
+  - `executed_at`
 
-1. Client POSTs `/orders` with order payload and bearer token
-2. `api/orders.py` extracts `user_id` from token
-3. `service/orderService.create_order()` stores the order
-4. If `side == BUY`:
-   - `portfolioService.process_buyer()` updates holdings
-   - `portfolioPersistence.updateorderStatus()` marks the order executed
-5. If `side == SELL`:
-   - `portfolioService.process_seller()` updates holdings quantity
-   - `portfolioPersistence.updateorderStatus()` marks the order executed
+## Request Flow
 
-## Current Features Implemented
+1. User signs up with `POST /signup`
+2. User logs in with `POST /login` and receives a JWT
+3. Authenticated user posts an order to `POST /orders`
+4. The order is validated and stored
+5. Order execution begins:
+   - `ExecutionEngine` opens a database connection
+   - `portfolioService` updates holdings based on `BUY` or `SELL`
+   - `tradeHistoryService` records the trade
+   - Order status is updated to `EXECUTED`
+   - Transaction commits on success or rolls back on failure
+6. User can retrieve orders and cancel pending orders
 
-- User signup with hashed password storage
-- User login with JWT generation
-- Authenticated order creation
-- Fetching user orders
-- Retrieving order by ID
-- Cancelling an order
-- Portfolio holdings update on buy/sell
+## Project Status and Implementation Notes
 
-## Design Notes and Observations
+The system design is implemented through the existing modules. The current project covers:
 
-- The architecture follows a clean separation: API → Service → Persistence
-- Authentication is stateless using JWT
-- Current order flow mixes persistence and business logic in portfolio persistence
-- There is room to add stronger validation and richer domain models
+- Complete authentication flow
+- Order management endpoints
+- Portfolio update logic for buy/sell orders
+- Trade history recording
+- Database connection management
+- JWT-based protected routes
 
-## Suggested Next Improvements
+## Improvements and Next Steps
 
-1. Add Pydantic request/response models for all APIs
-2. Add proper HTTP status codes and error handling
-3. Move portfolio and order-status logic into dedicated service methods
-4. Add transaction management for atomic buy/sell + order updates
-5. Add unit tests for service and persistence logic
-6. Document the expected database schema in migration files
+Future refinements should include:
+
+- Stronger request and response validation with Pydantic models
+- Explicit HTTP status codes for success and failure cases
+- More robust error handling and logging
+- Clearer domain boundaries between services and persistence
+- A migration strategy or schema definition file for MySQL
+- End-to-end tests for order execution and authentication
 
 ## Summary
 
-The system is a FastAPI-backed OMS with JWT auth, user onboarding, order management, and portfolio updates. The current layers are functional and ready for refinement toward more robust validation, transaction safety, and formal data modeling.
+`MyProductComplete` is a functioning OMS product built in Python with FastAPI and MySQL. It is structured in clean service/persistence layers and currently supports user onboarding, authenticated trading, portfolio updates, and trade history. The project is ready for formal schema documentation, validation hardening, and production-grade transaction handling.
