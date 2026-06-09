@@ -7,4 +7,6 @@ class TradeHistoryService:
     def insertTradeOrders(orderId,userId, symbol,side ,quantity,price):
        return tradeHist.insertTradeHistoryOrders(orderId,userId,symbol, side,quantity,price)
         
-        
+
+    def getTradeOrdersById(userId):
+        return tradeHist.getTradeOrdersById(userId)    
