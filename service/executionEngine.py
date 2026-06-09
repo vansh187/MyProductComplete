@@ -21,7 +21,7 @@ class ExecutionEngine:
             portfolioService.process_seller(userId, order.symbol, order.quantity,order.price)
          
          transaction_id=tradeService.insertTradeOrders(order.id, userId, order.symbol, order.side, order.quantity, order.price)
-
+         
          update_order_status(
                 userId,
                  order.symbol,
