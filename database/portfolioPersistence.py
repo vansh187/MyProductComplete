@@ -124,7 +124,7 @@ class portfolioPersistence:
              conn.commit()
 
     def getPortfolioServiceforLoggedInUser(userId):
-        SELECT_USER_PORTFOLIO="SELECT id,user_id,symbol,quantity,avg_price,updated_at from holdings where user_id=%s"
+        SELECT_USER_PORTFOLIO="SELECT symbol,quantity,avg_price,updated_at from holdings where user_id=%s and quantity > 0"
         conn=None
         cursor=None
         try:
@@ -133,7 +133,7 @@ class portfolioPersistence:
              os.getenv("MYSQLPASSWORD"),
              os.getenv("MYSQLDATABASE"),
              os.getenv("MYSQLPORT", 3306))
-            cursor=conn.cursor()
+            cursor=conn.cursor(dictionary=True)
             cursor.execute(SELECT_USER_PORTFOLIO,(userId,))
             portfolio=cursor.fetchall()
             return portfolio
@@ -142,8 +142,8 @@ class portfolioPersistence:
             raise Exception("Error in getting portfolion for logged in user")
 
         finally: 
-            if cursor is None:
+            if cursor is not None:
                 cursor.close()
-            if conn is None:
+            if conn is not None:
                 conn.close()
                   
