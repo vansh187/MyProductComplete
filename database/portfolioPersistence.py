@@ -6,6 +6,7 @@ import os
 load_dotenv()
 class portfolioPersistence:
     
+    @staticmethod
     def process_buyer(userId,symbol,quantity,price,cursor):
         SELECT_HOLDINGS="SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
         UPDATE_HOLDINGS="UPDATE holdings SET quantity = %s, avg_price = %s WHERE user_id = %s AND symbol = %s"
@@ -42,6 +43,7 @@ class portfolioPersistence:
             
 
 
+    @staticmethod
     def process_seller(userId,symbol,quantity,price,cursor):   
          SELECT_SELL_PROCESS=" SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
          UPDATE_ORDER_QUANTITY="UPDATE holdings SET quantity = %s WHERE user_id = %s AND symbol = %s"
@@ -75,6 +77,7 @@ class portfolioPersistence:
          
          
     
+    @staticmethod
     def updateorderStatus(cursor,userId,symbol,status) :
         UPDATE_ORDER_STATUS="UPDATE orders SET status=%s WHERE user_id=%s AND symbol=%s"
         if status is None:
@@ -84,11 +87,13 @@ class portfolioPersistence:
         print("order status update success")
 
 
+    @staticmethod
     def updateStatus(userId,symbol,status,cursor):
             
             portfolioPersistence.updateorderStatus(cursor, userId, symbol,status)
            
 
+    @staticmethod
     def createUserHolding(order,userId):
          CREATE_HOLDINGS_ORDER="INSERT INTO holdings (user_id, symbol, quantity, avg_price,updated_at) VALUES (%s, %s, %s, %s,NOW())"
          try:
@@ -106,6 +111,7 @@ class portfolioPersistence:
              cursor.close()
              conn.commit()
          
+    @staticmethod
     def updateUserHoldings(order,userId,new_qty,round,new_avg):
          UPDATE_USER_HOLDINGS="UPDATE holdings set quantity=%s,avg_price=%s,updated_at=NOW() where user_id=%s and symbol=%s"
          try:
@@ -123,6 +129,7 @@ class portfolioPersistence:
              cursor.close()
              conn.commit()
 
+    @staticmethod
     def getPortfolioServiceforLoggedInUser(userId):
         SELECT_USER_PORTFOLIO="SELECT symbol,quantity,avg_price,updated_at from holdings where user_id=%s and quantity > 0"
         conn=None
@@ -147,3 +154,32 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
                   
+    @staticmethod
+    def getPortfolioOfLoggedInUserWithProfitLoss(userId):
+        conn=None
+        cursor=None
+        UserProfitLossdto=None
+        SELECT_PORTFOLIO_QUERY="SELECT h.symbol, h.quantity, h.avg_price, COALESCE(mp.current_price, h.avg_price) as current_price FROM holdings h LEFT JOIN market_prices mp ON h.symbol = mp.symbol WHERE h.user_id = %s AND h.quantity > 0"
+        try:
+            conn=ConnectionFactory.create_connection(
+                os.getenv("MYSQLHOST"),
+             os.getenv("MYSQLUSER"),
+             os.getenv("MYSQLPASSWORD"),
+             os.getenv("MYSQLDATABASE"),
+             os.getenv("MYSQLPORT", 3306)
+                
+            )
+            cursor=conn.cursor(dictionary=True)
+            cursor.execute(SELECT_PORTFOLIO_QUERY,(userId,))
+            userPortfolio=cursor.fetchall()
+            return userPortfolio
+            
+        except Exception as Ex:
+            raise Exception("Error in fetching data for Profit and Loss") from Ex
+                
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:           
+                conn.close()
+        

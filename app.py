@@ -5,19 +5,26 @@ from api.login import router as login_router
 from api.orders import router as orders_router
 from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
-app=FastAPI()
+from contextlib import asynccontextmanager
+from scheduler.marketPriceSchedular import MarketPriceScheduler
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    MarketPriceScheduler.start()
+    print("App starting... Scheduler initialized")
+    yield
+    # ---- shutdown ----
+    print("App shutting down...")
+
+app=FastAPI(lifespan=lifespan)
 app.include_router(orders_router)
 app.include_router(signup_router)
 app.include_router(login_router)
 app.include_router(trade_history)
 app.include_router(user_portfolio)
-
 @app.get("/")
 def read_root():
     return {"Message":"Finnaly I am able to run my first API"}
-
-
-
 
 
