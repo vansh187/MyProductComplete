@@ -122,3 +122,28 @@ class portfolioPersistence:
          finally:
              cursor.close()
              conn.commit()
+
+    def getPortfolioServiceforLoggedInUser(userId):
+        SELECT_USER_PORTFOLIO="SELECT id,user_id,symbol,quantity,avg_price,updated_at from holdings where user_id=%s"
+        conn=None
+        cursor=None
+        try:
+            conn=ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
+             os.getenv("MYSQLUSER"),
+             os.getenv("MYSQLPASSWORD"),
+             os.getenv("MYSQLDATABASE"),
+             os.getenv("MYSQLPORT", 3306))
+            cursor=conn.cursor()
+            cursor.execute(SELECT_USER_PORTFOLIO,(userId,))
+            portfolio=cursor.fetchall()
+            return portfolio
+
+        except Exception as ex:
+            raise Exception("Error in getting portfolion for logged in user")
+
+        finally: 
+            if cursor is None:
+                cursor.close()
+            if conn is None:
+                conn.close()
+                  
