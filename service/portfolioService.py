@@ -16,3 +16,7 @@ class portfolioService:
 
     def updateUserHoldings(order,userId,new_qty,round,new_avg):
         portfolioPersistence.updateUserHoldings(order,userId,new_qty,round,new_avg)
+
+    def getPortfolioServiceforLoggedInUser(userId):
+        return portfolioPersistence.getPortfolioServiceforLoggedInUser(userId)
+
