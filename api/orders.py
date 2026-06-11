@@ -9,6 +9,7 @@ from service.orderService import getOrderById as service_get_OrderById
 from service.orderService import cancelOrderById as service_cancelOrderById
 from service.portfolioService import portfolioService
 from service.executionEngine import ExecutionEngine
+from decimal import Decimal
 #from service.portfolioService import process_buy as service_process_sell
 router = APIRouter()
 
@@ -43,7 +44,7 @@ class OrderCreate(BaseModel):
     symbol: str
     side: str
     quantity: int
-    price: float
+    price: Decimal
     status: str
 
 

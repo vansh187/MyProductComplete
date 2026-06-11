@@ -1,12 +1,12 @@
 from dotenv import load_dotenv
 from database.ConnectionFactory import ConnectionFactory
 import os
-
+from decimal import Decimal
 
 load_dotenv()
 class portfolioPersistence:
     
-    @staticmethod
+    
     def process_buyer(userId,symbol,quantity,price,cursor):
         SELECT_HOLDINGS="SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
         UPDATE_HOLDINGS="UPDATE holdings SET quantity = %s, avg_price = %s WHERE user_id = %s AND symbol = %s"
@@ -36,14 +36,14 @@ class portfolioPersistence:
         ##    portfolioPersistence.updateorderStatus(conn, userId, symbol)
        ## except:
            ## raise Exception("Exception in calling updateorderStatus") 
-        except:
+        except Exception as ex:
             raise Exception("Exception in inserting holdings")
         finally:
               print("Execute finally block process buy")
             
 
 
-    @staticmethod
+    
     def process_seller(userId,symbol,quantity,price,cursor):   
          SELECT_SELL_PROCESS=" SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
          UPDATE_ORDER_QUANTITY="UPDATE holdings SET quantity = %s WHERE user_id = %s AND symbol = %s"
@@ -77,7 +77,7 @@ class portfolioPersistence:
          
          
     
-    @staticmethod
+    
     def updateorderStatus(cursor,userId,symbol,status) :
         UPDATE_ORDER_STATUS="UPDATE orders SET status=%s WHERE user_id=%s AND symbol=%s"
         if status is None:
@@ -87,13 +87,13 @@ class portfolioPersistence:
         print("order status update success")
 
 
-    @staticmethod
+  
     def updateStatus(userId,symbol,status,cursor):
             
             portfolioPersistence.updateorderStatus(cursor, userId, symbol,status)
            
 
-    @staticmethod
+    
     def createUserHolding(order,userId):
          CREATE_HOLDINGS_ORDER="INSERT INTO holdings (user_id, symbol, quantity, avg_price,updated_at) VALUES (%s, %s, %s, %s,NOW())"
          try:
@@ -111,7 +111,7 @@ class portfolioPersistence:
              cursor.close()
              conn.commit()
          
-    @staticmethod
+    
     def updateUserHoldings(order,userId,new_qty,round,new_avg):
          UPDATE_USER_HOLDINGS="UPDATE holdings set quantity=%s,avg_price=%s,updated_at=NOW() where user_id=%s and symbol=%s"
          try:
@@ -129,7 +129,7 @@ class portfolioPersistence:
              cursor.close()
              conn.commit()
 
-    @staticmethod
+   
     def getPortfolioServiceforLoggedInUser(userId):
         SELECT_USER_PORTFOLIO="SELECT symbol,quantity,avg_price,updated_at from holdings where user_id=%s and quantity > 0"
         conn=None
@@ -154,7 +154,7 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
                   
-    @staticmethod
+   
     def getPortfolioOfLoggedInUserWithProfitLoss(userId):
         conn=None
         cursor=None
@@ -182,4 +182,34 @@ class portfolioPersistence:
                 cursor.close()
             if conn is not None:           
                 conn.close()
+ 
+       
+    def createTradeinOrderBook(conn,cursor,order,userId):
+        INSERT_ORDER_BOOK= """
+            INSERT INTO order_book
+            (user_id, symbol, side, order_type,
+            quantity, remaining_quantity, price, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+         """
+    
+        try:
+            
+            cursor.execute(INSERT_ORDER_BOOK,(
+                userId,
+                order.symbol,
+                order.side,
+                'LIMIT',
+                order.quantity,
+                order.quantity,
+                order.price,
+                'PENDING'
+                ))
+            orderId = cursor.lastrowid
+            return orderId
+        except Exception  as ex:
+                Exception("Error in Inserting Data") 
+            
+        finally:
+                print("finally block of order book")
+            
         
