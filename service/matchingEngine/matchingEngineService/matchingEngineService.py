@@ -1,17 +1,18 @@
-from matchingEnginePersistence import matchingEnginePersistence
-from productdto import matchingOrderDTO as MatchingOrderDTO
+from service.matchingEngine.matchingEnginePersistence import matchingEnginePersistence
+from productdto.matchingOrderDTO import MatchingOrderDTO
 from datetime import datetime
 from decimal import Decimal
 
 
 class MatchingEngineService:
 
-    def price_match(self, incomingOrder, matchedOrder):
+    @staticmethod
+    def price_match( incomingOrder, matchedOrder):
 
-        incoming_side = incomingOrder["side"].upper()
+        incoming_side = incomingOrder.side.upper()
         matched_side = matchedOrder["side"].upper()
 
-        incoming_price = Decimal(str(incomingOrder["price"]))
+        incoming_price = Decimal(str(incomingOrder.price))
         matched_price = Decimal(str(matchedOrder["price"]))
 
         if incoming_side == "BUY" and matched_side == "SELL":
@@ -23,10 +24,11 @@ class MatchingEngineService:
         return False
 
 
-    def matchtradeOrderforUser(self, order, userId, status):
+    @staticmethod
+    def matchtradeOrderforUser( order, userId, status,cursor):
 
         matchFoundOrderResponse = matchingEnginePersistence.matchtradeOrderforUser(
-            order, userId, status
+            order, userId, status,cursor
         )
 
         if matchFoundOrderResponse is None:
@@ -35,79 +37,81 @@ class MatchingEngineService:
                 "message": "No MatchFound Order still in order Book"
             }
 
-        trades = self.matchingOrder(order, matchFoundOrderResponse)
+        trades = MatchingEngineService.matchingOrder(order, matchFoundOrderResponse,userId)
 
         return {
             "userId": userId,
-            "message": trades
+            "tradeExcecution": trades
         }
 
 
-    def matchingOrder(self, incomingOrder, matchFoundOrderResponse):
+    @staticmethod
+    def matchingOrder( incomingOrder, matchFoundOrderResponse,userId):
 
         trades = []
 
         try:
             # FIX 1: safe access
-            incoming_qty = incomingOrder.get("remaining_quantity", 0)
+            if len(matchFoundOrderResponse)>0 :
+                incoming_qty = incomingOrder.quantity
 
-            for response in matchFoundOrderResponse:
+                for response in matchFoundOrderResponse:
+
+                    if incoming_qty == 0:
+                        break
+
+                    if not MatchingEngineService.price_match(incomingOrder, response):
+                        continue
+
+                    # FIX 2: safe access for DB rows
+                    opp_remaining_qty = response.get("remaining_quantity", 0)
+                    if opp_remaining_qty <= 0:
+                        continue
+
+                    trade_qty = min(incoming_qty, opp_remaining_qty)
+
+                    execution_price = Decimal(str(response.get("price", 0)))
+
+                    # Decide BUY/SELL mapping
+                    if incomingOrder.side.upper() == "BUY":
+                        buy_order_id = incomingOrder.id
+                        sell_order_id = response["id"]
+                        buy_user_id = userId
+                        sell_user_id = response["user_id"]
+                    else:
+                        buy_order_id = response["id"]
+                        sell_order_id = incomingOrder.id
+                        buy_user_id = response["user_id"]
+                        sell_user_id = incomingOrder.id
+
+                    trades.append(
+                        MatchingOrderDTO(
+                            symbol=incomingOrder.symbol,
+                            buy_order_id=buy_order_id,
+                            sell_order_id=sell_order_id,
+                            buy_user_id=buy_user_id,
+                            sell_user_id=sell_user_id,
+                            quantity=trade_qty,
+                            execution_price=execution_price,
+                            trade_value=execution_price * Decimal(trade_qty),
+                            executed_at=datetime.now()
+                        )
+                    )
+
+                    # FIX 3: IMPORTANT state updates (was missing)
+                    incoming_qty -= trade_qty
+                    response["remaining_quantity"] = opp_remaining_qty - trade_qty
+
+                # update incoming order state
+                incomingOrder.remainiungQty = incoming_qty
 
                 if incoming_qty == 0:
-                    break
-
-                if not self.price_match(incomingOrder, response):
-                    continue
-
-                # FIX 2: safe access for DB rows
-                opp_remaining_qty = response.get("remaining_quantity", 0)
-                if opp_remaining_qty <= 0:
-                    continue
-
-                trade_qty = min(incoming_qty, opp_remaining_qty)
-
-                execution_price = Decimal(str(response.get("price", 0)))
-
-                # Decide BUY/SELL mapping
-                if incomingOrder["side"].upper() == "BUY":
-                    buy_order_id = incomingOrder["id"]
-                    sell_order_id = response["id"]
-                    buy_user_id = incomingOrder["user_id"]
-                    sell_user_id = response["user_id"]
+                    incomingOrder.status = "EXECUTED"
                 else:
-                    buy_order_id = response["id"]
-                    sell_order_id = incomingOrder["id"]
-                    buy_user_id = response["user_id"]
-                    sell_user_id = incomingOrder["user_id"]
-
-                trades.append(
-                    MatchingOrderDTO(
-                        symbol=incomingOrder["symbol"],
-                        buy_order_id=buy_order_id,
-                        sell_order_id=sell_order_id,
-                        buy_user_id=buy_user_id,
-                        sell_user_id=sell_user_id,
-                        quantity=trade_qty,
-                        execution_price=execution_price,
-                        trade_value=execution_price * Decimal(trade_qty),
-                        executed_at=datetime.now()
-                    )
-                )
-
-                # FIX 3: IMPORTANT state updates (was missing)
-                incoming_qty -= trade_qty
-                response["remaining_quantity"] = opp_remaining_qty - trade_qty
-
-            # update incoming order state
-            incomingOrder["remaining_quantity"] = incoming_qty
-
-            if incoming_qty == 0:
-                incomingOrder["status"] = "EXECUTED"
-            else:
-                incomingOrder["status"] = "PARTIALLY_EXECUTED"
+                    incomingOrder.status = "PARTIALLY_EXECUTED"
 
         except Exception as ex:
-            # FIX 4: don't hide real error
+                # FIX 4: don't hide real error
             raise Exception(f"Exception in matching trade with incoming order: {str(ex)}")
 
         return trades

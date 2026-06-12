@@ -12,8 +12,7 @@ class portfolioPersistence:
         UPDATE_HOLDINGS="UPDATE holdings SET quantity = %s, avg_price = %s WHERE user_id = %s AND symbol = %s"
         INSERT_HOLDINGS="INSERT INTO holdings (user_id, symbol, quantity, avg_price) VALUES (%s, %s, %s, %s)"
         try:
-            if quantity <= 0:
-                raise Exception("Quantity must be greater than zero")
+            
 
             if price <= 0:
                 raise Exception("Price must be greater than zero")
@@ -21,7 +20,8 @@ class portfolioPersistence:
             cursor.execute(SELECT_HOLDINGS,(userId,symbol))
             holdings=cursor.fetchone()
             if  holdings:
-                old_qty, old_price = holdings
+                old_qty=holdings["quantity"]
+                old_price=holdings["avg_price"]
                 if old_qty <= 0:
                     raise Exception("Quantity must be greater than zero")
             
@@ -212,4 +212,17 @@ class portfolioPersistence:
         finally:
                 print("finally block of order book")
             
+    
+    
+    def updateOrderBookQuantity(quantity,oredrBookId,cursor):
+        UPDATE_ORDER_BOOK_QUANTITY="update order_book set quantity =%s where id=%s"
+        try:
+            cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,oredrBookId))
+            print("trade xecuted")    
+            
+        except Exception as ex:
+            raise Exception("Error in updating orderBook")
         
+        finally:
+            print("final block of update Order book")
+                  

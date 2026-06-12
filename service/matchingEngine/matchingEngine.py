@@ -1,21 +1,20 @@
-from matchingEngineService import matchingEngineService
-from matchingEnginePersistence import matchingEnginePersistence
+from service.matchingEngine.matchingEngineService import matchingEngineService
+from service.matchingEngine.matchingEnginePersistence import matchingEnginePersistence
 
 
 ##class is for matching the order from order book
 class MatchingEngine:
-    def execute(order,userId):
+    @staticmethod
+    def execute(order, userId,cursor):
         
         ##this call will be replaced by real time NSE market
-        if order.type is 'BUY':
-            matchFound=matchingEngineService.matchtradeOrderforUser(order,userId,'SELL')
-        elif order.type:
-             matchFound=matchingEngineService.mamatchtradeOrderforUser(order,userId,'BUY')
+        if order.side == 'BUY':
+            matchFound = matchingEngineService.matchtradeOrderforUser(order, userId, 'SELL',cursor)
+        elif order.side == 'SELL':
+             matchFound = matchingEngineService.matchtradeOrderforUser(order, userId, 'BUY',cursor)
         
                 
         if matchFound is None:
                 return None
-        elif matchFound is True:
-                return True
-        elif matchFound is False:
-                return False  
+        elif matchFound :
+                return matchFound

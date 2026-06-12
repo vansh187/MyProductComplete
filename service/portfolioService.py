@@ -55,3 +55,10 @@ class portfolioService:
     @staticmethod
     def createTradeinOrderBook(conn,cursor,order,userId):
         return portfolioPersistence.createTradeinOrderBook(conn,cursor,order,userId)
+    
+    
+    
+    @staticmethod
+    def updateOrderBookQuantity(quantity,orderBookId,cursor):
+        return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,cursor)
+        

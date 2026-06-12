@@ -46,7 +46,7 @@ class OrderCreate(BaseModel):
     quantity: int
     price: Decimal
     status: str
-
+    remainiungQty:Optional[int]=None
 
 @router.get("/getOrderById/{orderId}")
 def getOrderById(orderId:int,current_user=Depends(get_current_user)):
