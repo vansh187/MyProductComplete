@@ -1,6 +1,7 @@
 from database.portfolioPersistence import portfolioPersistence
 from productdto.portfolioDTO import PortfolioDTO
 from productdto.holdingDTO import HoldingDTO
+
 class portfolioService:
 
     @staticmethod
@@ -49,3 +50,15 @@ class portfolioService:
             total_pnl=total_pnl,
             holdings=holdings)
         return None
+    
+    
+    @staticmethod
+    def createTradeinOrderBook(conn,cursor,order,userId):
+        return portfolioPersistence.createTradeinOrderBook(conn,cursor,order,userId)
+    
+    
+    
+    @staticmethod
+    def updateOrderBookQuantity(quantity,orderBookId,cursor):
+        return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,cursor)
+        
