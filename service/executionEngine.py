@@ -5,9 +5,7 @@ from service.tradeHistoryService import TradeHistoryService as tradeService
 from dotenv import load_dotenv
 from database.ConnectionFactory import ConnectionFactory
 import os
-from service.matchingEngine.matchingEngineService import MatchingEngineService as MatchingEngine
-
-
+from service.matchingEngine.matchingEngine import MatchingEngine 
 load_dotenv()
 
 class ExecutionEngine:
