@@ -6,11 +6,11 @@ class portfolioService:
 
     @staticmethod
     def process_buyer(userId,symbol,quantity,price,cursor):
-        portfolioPersistence.process_buyer(userId,symbol,quantity,price,cursor)
+        return portfolioPersistence.process_buyer(userId,symbol,quantity,price,cursor)
 
     @staticmethod
     def process_seller(userId,symbol,quantity,price,cursor):
-        portfolioPersistence.process_seller(userId,symbol,quantity,price,cursor)
+        return portfolioPersistence.process_seller(userId,symbol,quantity,price,cursor)
 
     @staticmethod
     def createUserHolding(order,userId):
@@ -53,12 +53,12 @@ class portfolioService:
     
     
     @staticmethod
-    def createTradeinOrderBook(conn,cursor,order,userId):
-        return portfolioPersistence.createTradeinOrderBook(conn,cursor,order,userId)
+    def createTradeinOrderBook(conn,cursor,order,userId,orderId):
+        return portfolioPersistence.createTradeinOrderBook(conn,cursor,order,userId,orderId)
     
     
     
     @staticmethod
-    def updateOrderBookQuantity(quantity,orderBookId,cursor):
-        return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,cursor)
+    def updateOrderBookQuantity(quantity,orderBookId,status,cursor):
+        return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,status,cursor)
         
