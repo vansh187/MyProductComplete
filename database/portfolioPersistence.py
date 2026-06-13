@@ -38,8 +38,6 @@ class portfolioPersistence:
                 new_avg = ((old_qty * old_price) + (quantity * price)) / new_qty
                 cursor.execute(UPDATE_HOLDINGS, (new_qty, new_avg, userId, symbol))
                 
-            else:
-                cursor.execute(INSERT_HOLDINGS, (userId, symbol, quantity, price))    
                 
         ##try:
         ##    portfolioPersistence.updateorderStatus(conn, userId, symbol)
