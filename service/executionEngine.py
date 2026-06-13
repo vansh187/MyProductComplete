@@ -100,7 +100,7 @@ class ExecutionEngine:
                         "status": "ORDER STATUS EXECUTED",
                         "tradeOrderId": transaction_id
                     }
-
+            conn.commit()
             return {
                 "userId": userId,
                 "message": "Orders execution is in process. Please wait"
