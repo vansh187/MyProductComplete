@@ -15,15 +15,24 @@ class portfolioPersistence:
             
 
             if price <= 0:
-                raise Exception("Price must be greater than zero")
+                 return{
+                       "userId":userId,
+                       "Message":"Trade did not happened for negative price"
+                   }
             
             cursor.execute(SELECT_HOLDINGS,(userId,symbol))
             holdings=cursor.fetchone()
-            if  holdings:
+            if not holdings:
+                cursor.execute(INSERT_HOLDINGS,(userId,symbol,quantity,price))
+                print("HOLDINGS INSERTED")
+            else:
                 old_qty=holdings["quantity"]
                 old_price=holdings["avg_price"]
                 if old_qty <= 0:
-                    raise Exception("Quantity must be greater than zero")
+                     return{
+                       "userId":userId,
+                       "Message":"Trade did not happened for negative quantity"
+                   }
             
                 new_qty = old_qty + quantity
                 new_avg = ((old_qty * old_price) + (quantity * price)) / new_qty
@@ -47,6 +56,7 @@ class portfolioPersistence:
     def process_seller(userId,symbol,quantity,price,cursor):   
          SELECT_SELL_PROCESS=" SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
          UPDATE_ORDER_QUANTITY="UPDATE holdings SET quantity = %s WHERE user_id = %s AND symbol = %s"
+         INSERT_HOLDINGS="INSERT INTO holdings (user_id, symbol, quantity, avg_price,updated_at) VALUES (%s, %s, %s, %s,NOW())"
          if quantity <= 0:
             raise Exception("Quantity must be greater than zero")
          try:
@@ -55,16 +65,25 @@ class portfolioPersistence:
             sellHolding=cursor.fetchone()
 
             if not sellHolding:
-                raise Exception("No holdings found")
-            old_qty, avg_price = sellHolding    
-            if quantity <= 0:
-                raise Exception("Quantity must be greater than zero")
-            if quantity > old_qty:
-                raise Exception("Not enough quantity")
-         
-            new_qty = old_qty - quantity
+                cursor.execute(INSERT_HOLDINGS,(userId,symbol,quantity,price))
+                print("HOLDINGS INSERTED")
+            else:    
+                old_qty=sellHolding["quantity"]
+                avg_price=sellHolding["avg_price"]     
+                if quantity <= 0:
+                   return{
+                       "userId":userId,
+                       "Message":"Trade did not happened for negative quantity"
+                   }
+                if quantity > old_qty:
+                     return{
+                       "userId":userId,
+                       "Message":"quantity you have is less than trade quantity"
+                   }
+            
+                new_qty = old_qty - quantity
 
-            cursor.execute(UPDATE_ORDER_QUANTITY, (new_qty, userId, symbol))
+                cursor.execute(UPDATE_ORDER_QUANTITY, (new_qty, userId, symbol))
         ## try:
               ##  portfolioPersistence.updateorderStatus(conn, userId, symbol)
         ## except Exception as exc:
@@ -184,12 +203,12 @@ class portfolioPersistence:
                 conn.close()
  
        
-    def createTradeinOrderBook(conn,cursor,order,userId):
+    def createTradeinOrderBook(conn,cursor,order,userId,orderId):
         INSERT_ORDER_BOOK= """
             INSERT INTO order_book
             (user_id, symbol, side, order_type,
-            quantity, remaining_quantity, price, status, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            quantity, remaining_quantity, price, status, created_at, updated_at,order_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(),%s)
          """
     
         try:
@@ -203,6 +222,7 @@ class portfolioPersistence:
                 order.quantity,
                 order.price,
                 'PENDING'
+                ,orderId
                 ))
             orderId = cursor.lastrowid
             return orderId
@@ -214,11 +234,11 @@ class portfolioPersistence:
             
     
     
-    def updateOrderBookQuantity(quantity,oredrBookId,cursor):
-        UPDATE_ORDER_BOOK_QUANTITY="update order_book set quantity =%s where id=%s"
+    def updateOrderBookQuantity(quantity,oredrBookId,status,cursor):
+        UPDATE_ORDER_BOOK_QUANTITY="update order_book set quantity =%s, status=%s where id=%s"
         try:
-            cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,oredrBookId))
-            print("trade xecuted")    
+            cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,status,oredrBookId))
+            print("trade executed")    
             
         except Exception as ex:
             raise Exception("Error in updating orderBook")

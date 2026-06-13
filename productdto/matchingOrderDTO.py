@@ -15,3 +15,4 @@ class MatchingOrderDTO:
     execution_price: Decimal = Decimal("0")
     trade_value: Decimal = Decimal("0")
     executed_at: datetime = None
+    remaining_qty:int=0

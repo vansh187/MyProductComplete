@@ -42,58 +42,69 @@ class ExecutionEngine:
             cursor = conn.cursor(dictionary=True)
 
             # Create order in order book
-            orderBookId = portfolioService.createTradeinOrderBook(conn,cursor,order, userId)
+            orderBookId = portfolioService.createTradeinOrderBook(conn,cursor,order, userId,order.id)
 
             # Call matching engine to find matching orders
             matchFoundList = MatchingEngine.execute(order, userId,cursor)
-            matchFound=matchFoundList["tradeExcecution"]
-            matchFoundObject =matchFound[0]
-            if matchFound is not None:
+            tradeExecutions = matchFoundList.get("tradeExcecution", [])
+
+            for matchFound in tradeExecutions:
+                if matchFound is None:
+                    continue
+
                 # Insert trade history
                 transaction_id = tradeService.insertTradeOrders(
-                    matchFoundObject.buy_order_id,
-                    matchFoundObject.sell_order_id,
-                    matchFoundObject.buy_user_id,
-                    matchFoundObject.sell_user_id,
-                    matchFoundObject.symbol,
-                    matchFoundObject.quantity,
-                    matchFoundObject.execution_price,
-                    matchFoundObject.trade_value,
+                    matchFound.buy_order_id,
+                    matchFound.sell_order_id,
+                    matchFound.buy_user_id,
+                    matchFound.sell_user_id,
+                    matchFound.symbol,
+                    matchFound.quantity,
+                    matchFound.execution_price,
+                    matchFound.trade_value,
                     cursor
                 )
-                #orderbook will update the 
-                #call to update remaining quantity of order book
-                updatedQty=order.remainiungQty
-                portfolioService.updateOrderBookQuantity(updatedQty,orderBookId,cursor)
+                # orderbook will update the remaining quantity of order book
+                updatedQty = matchFound.remaining_qty
+                
+
                 # Update user holdings based on order side
-                 # Update order status to executed
-                if updatedQty== 0:
-                        status = "EXECUTED"
+                # Update order status to executed
+                if updatedQty == 0:
+                    status = "EXECUTED"
                 else:
                     status = "PARTIALLY_EXECUTED"
+                portfolioService.updateOrderBookQuantity(updatedQty, orderBookId, status,cursor)
                 update_order_status(userId, order.symbol, status, cursor)
+                message=None
                 if order.side == "BUY":
-                    portfolioService.process_buyer(userId, order.symbol, updatedQty, executionPrice, cursor)
+                   message= portfolioService.process_buyer(userId, order.symbol, order.quantity, executionPrice, cursor)
                 elif order.side == "SELL":
-                    portfolioService.process_seller(userId, order.symbol,updatedQty, order.price, cursor)
+                    message=portfolioService.process_seller(userId, order.symbol, order.quantity, order.price, cursor)
+                    if message is not None:
+                        return message                       
+                            
+                if status == 'PARTIALLY_EXECUTED':
+                    if conn is not None:
+                        conn.commit()
+                    return {
+                        "success": True,
+                        "status": "ORDER Partially EXECUTED",
+                        "tradeOrderId": transaction_id
+                    }
+                elif status == 'EXECUTED':
+                    if conn is not None:
+                        conn.commit()
+                    return {
+                        "success": True,
+                        "status": "ORDER STATUS EXECUTED",
+                        "tradeOrderId": transaction_id
+                    }
 
-               
-            if status  =='PARTIALLY_EXECUTED':
-                    return{ "success": True,
-                    "status": "ORDER Partially EXECUTED",
-                    "tradeOrderId": transaction_id} 
-
-            elif status  =='EXECUTED':
-                     return {
-                            "success": True,
-                            "status": "ORDER STATUS EXECUTED",
-                            "tradeOrderId": transaction_id
-                }
-            else:
-                return {
-                    "userId": userId,
-                    "message": "Orders execution is in process. Please wait"
-                }
+            return {
+                "userId": userId,
+                "message": "Orders execution is in process. Please wait"
+            }
 
         except Exception as e:
             if conn is not None:
@@ -112,6 +123,5 @@ class ExecutionEngine:
             if cursor is not None:
                 cursor.close()
             if conn is not None:
-                conn.commit()
                 conn.close()    
 
