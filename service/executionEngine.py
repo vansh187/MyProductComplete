@@ -5,6 +5,7 @@ from service.tradeHistoryService import TradeHistoryService as tradeService
 from dotenv import load_dotenv
 from database.ConnectionFactory import ConnectionFactory
 import os
+import traceback
 from service.matchingEngine.matchingEngine import MatchingEngine 
 load_dotenv()
 
@@ -105,6 +106,7 @@ class ExecutionEngine:
             }
 
         except Exception as e:
+            print(traceback.format_exc())
             if conn is not None:
                 conn.rollback()
             if cursor is not None:
