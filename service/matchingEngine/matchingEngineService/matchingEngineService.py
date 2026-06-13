@@ -69,20 +69,21 @@ class MatchingEngineService:
                         continue
 
                     trade_qty = min(incoming_qty, opp_remaining_qty)
-
+                    remainingQty=opp_remaining_qty-trade_qty
+                    #opp one is which is in order book and incoming one is order from person
                     execution_price = Decimal(str(response.get("price", 0)))
 
                     # Decide BUY/SELL mapping
                     if incomingOrder.side.upper() == "BUY":
                         buy_order_id = incomingOrder.id
-                        sell_order_id = response["id"]
+                        sell_order_id = response["order_id"]
                         buy_user_id = userId
                         sell_user_id = response["user_id"]
                     else:
-                        buy_order_id = response["id"]
+                        buy_order_id = response["order_id"]
                         sell_order_id = incomingOrder.id
                         buy_user_id = response["user_id"]
-                        sell_user_id = incomingOrder.id
+                        sell_user_id = userId
 
                     trades.append(
                         MatchingOrderDTO(
@@ -94,7 +95,8 @@ class MatchingEngineService:
                             quantity=trade_qty,
                             execution_price=execution_price,
                             trade_value=execution_price * Decimal(trade_qty),
-                            executed_at=datetime.now()
+                            executed_at=datetime.now(),
+                            remaining_qty=remainingQty
                         )
                     )
 
@@ -103,7 +105,7 @@ class MatchingEngineService:
                     response["remaining_quantity"] = opp_remaining_qty - trade_qty
 
                 # update incoming order state
-                incomingOrder.remainiungQty = incoming_qty
+                incomingOrder.remainingQty = incoming_qty
 
                 if incoming_qty == 0:
                     incomingOrder.status = "EXECUTED"
