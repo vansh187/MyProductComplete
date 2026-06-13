@@ -1,6 +1,4 @@
-from service.matchingEngine.matchingEngineService import matchingEngineService
-from service.matchingEngine.matchingEnginePersistence import matchingEnginePersistence
-
+from service.matchingEngine.matchingEngineService.matchingEngineService import MatchingEngineService
 
 ##class is for matching the order from order book
 class MatchingEngine:
@@ -9,9 +7,11 @@ class MatchingEngine:
         
         ##this call will be replaced by real time NSE market
         if order.side == 'BUY':
-            matchFound = matchingEngineService.matchtradeOrderforUser(order, userId, 'SELL',cursor)
+            print("NEW MATCHING ENGINE IMPORT LOADED")
+            matchFound = MatchingEngineService.matchtradeOrderforUser(order, userId, 'SELL',cursor)
         elif order.side == 'SELL':
-             matchFound = matchingEngineService.matchtradeOrderforUser(order, userId, 'BUY',cursor)
+             print("NEW MATCHING ENGINE IMPORT LOADED")
+             matchFound = MatchingEngineService.matchtradeOrderforUser(order, userId, 'BUY',cursor)
         
                 
         if matchFound is None:
