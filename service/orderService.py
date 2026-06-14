@@ -31,6 +31,6 @@ def cancelOrderById(userId,orderId):
         print(f"order cancelled for user_id: {userId}")
     return order 
 
-def updateStatus(user_id, symbol, status,cursor):
-    portfolioPersistence.updateStatus(user_id, symbol, status,cursor)
+def updateStatus(user_id, symbol, status,buy_order_id, sell_order_id,cursor):
+    portfolioPersistence.updateStatus(user_id, symbol, status,buy_order_id, sell_order_id,cursor)
 
