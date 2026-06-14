@@ -59,6 +59,6 @@ class portfolioService:
     
     
     @staticmethod
-    def updateOrderBookQuantity(quantity,orderBookId,status,cursor):
-        return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,status,cursor)
+    def updateOrderBookQuantity(quantity,orderBookId,status,buy_order_id, sell_order_id,cursor):
+        return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,status,buy_order_id, sell_order_id,cursor)
         

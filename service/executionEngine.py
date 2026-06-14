@@ -73,7 +73,7 @@ class ExecutionEngine:
                     status = "EXECUTED"
                 else:
                     status = "PARTIALLY_EXECUTED"
-                portfolioService.updateOrderBookQuantity(updatedQty, orderBookId, status,cursor)
+                portfolioService.updateOrderBookQuantity(updatedQty, orderBookId, status,matchFound.buy_order_id, matchFound.sell_order_id,cursor)
                 update_order_status(userId, order.symbol, status,matchFound.buy_order_id, matchFound.sell_order_id,cursor)
                 message=None
                 if order.side == "BUY":

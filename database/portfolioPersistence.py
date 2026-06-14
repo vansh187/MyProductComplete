@@ -231,10 +231,10 @@ class portfolioPersistence:
             
     
     
-    def updateOrderBookQuantity(quantity,oredrBookId,status,cursor):
-        UPDATE_ORDER_BOOK_QUANTITY="update order_book set remaining_quantity=%s, status=%s where id=%s"
+    def updateOrderBookQuantity(quantity,oredrBookId,status,buy_order_id, sell_order_id,cursor):
+        UPDATE_ORDER_BOOK_QUANTITY="update order_book set remaining_quantity=%s, status=%s where id in (%s,%s)"
         try:
-            cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,status,oredrBookId))
+            cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,status,buy_order_id,sell_order_id))
             print("trade executed")    
             
         except Exception as ex:
