@@ -7,7 +7,8 @@ from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
 from contextlib import asynccontextmanager
 from scheduler.marketPriceSchedular import MarketPriceScheduler
-
+from utils.redisConnection import RedisConnection
+from api.Dashboard import router as dashboardRouter
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -23,8 +24,12 @@ app.include_router(signup_router)
 app.include_router(login_router)
 app.include_router(trade_history)
 app.include_router(user_portfolio)
+app.include_router(dashboardRouter)
 @app.get("/")
 def read_root():
+   ##redisConnection=RedisConnection()
+    ##redisObject=redisConnection.createRedisConnection()
+    ##print(redisObject)
     return {"Message":"Finnaly I am able to run my first API"}
 
 
