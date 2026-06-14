@@ -94,19 +94,19 @@ class portfolioPersistence:
          
     
     
-    def updateorderStatus(cursor,userId,symbol,status) :
-        UPDATE_ORDER_STATUS="UPDATE orders SET status=%s WHERE user_id=%s AND symbol=%s"
+    def updateorderStatus(cursor,userId,symbol,status,buy_order_id, sell_order_id) :
+        UPDATE_ORDER_STATUS="UPDATE orders SET status=%s WHERE id in (%s,%s) "
         if status is None:
-             cursor.execute(UPDATE_ORDER_STATUS,("EXECUTED",userId,symbol))
+             cursor.execute(UPDATE_ORDER_STATUS,("EXECUTED",buy_order_id, sell_order_id))
         else:
-            cursor.execute(UPDATE_ORDER_STATUS,(status,userId,symbol))
+            cursor.execute(UPDATE_ORDER_STATUS,(status,buy_order_id, sell_order_id))
         print("order status update success")
 
 
   
-    def updateStatus(userId,symbol,status,cursor):
+    def updateStatus(userId,symbol,status,buy_order_id, sell_order_id,cursor):
             
-            portfolioPersistence.updateorderStatus(cursor, userId, symbol,status)
+            portfolioPersistence.updateorderStatus(cursor, userId, symbol,status,buy_order_id, sell_order_id)
            
 
     
@@ -232,7 +232,7 @@ class portfolioPersistence:
     
     
     def updateOrderBookQuantity(quantity,oredrBookId,status,cursor):
-        UPDATE_ORDER_BOOK_QUANTITY="update order_book set quantity =%s, status=%s where id=%s"
+        UPDATE_ORDER_BOOK_QUANTITY="update order_book set remaining_quantity=%s, status=%s where id=%s"
         try:
             cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,status,oredrBookId))
             print("trade executed")    
