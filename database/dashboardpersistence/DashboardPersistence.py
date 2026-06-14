@@ -38,7 +38,11 @@ class DashBoardPersistence:
             return dto
         except Exception as ex:
                 raise  Exception(f"exception raised while fetching dashboard count: {str(ex)}")
-        
+        finally:
+            if conn is not None:
+                conn.close()
+            if cursor is not None:
+                cursor.close()
         
         
         
