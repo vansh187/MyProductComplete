@@ -1,4 +1,4 @@
-from database.dashboardpersistence.DashboardPersistence import DashBoardPersistence 
+from database.dashboardpersistence.DashBoardPersistence import DashBoardPersistence 
 from utils.redisConnection import RedisConnection
 class DashboardService:
 
