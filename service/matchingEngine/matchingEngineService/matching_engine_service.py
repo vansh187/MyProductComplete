@@ -1,4 +1,4 @@
-from service.matchingEngine.matchingEnginePersistence import matchingEnginePersistence
+from service.matchingEngine.matchingEnginePersistence.matchingEnginePersistence import matchtradeOrderforUser as MatchingPersistence
 from productdto.matchingOrderDTO import MatchingOrderDTO
 from datetime import datetime
 from decimal import Decimal
@@ -27,9 +27,7 @@ class MatchingEngineService:
     @staticmethod
     def matchtradeOrderforUser( order, userId, status,cursor):
 
-        matchFoundOrderResponse = matchingEnginePersistence.matchtradeOrderforUser(
-            order, userId, status,cursor
-        )
+        matchFoundOrderResponse = MatchingPersistence.matchtradingOrderforUser( order,status,cursor)
 
         if matchFoundOrderResponse is None:
             return {

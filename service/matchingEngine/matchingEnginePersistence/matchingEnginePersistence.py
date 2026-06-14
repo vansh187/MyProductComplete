@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 class matchtradeOrderforUser:
     @staticmethod
-    def matchtradeOrderforUser( order,userId,status,cursor):
+    def matchtradingOrderforUser( order,status,cursor):
         
         SELECT_BUY_QUERY="SELECT *  FROM order_book WHERE symbol = %s AND side = 'SELL' AND status IN ('PENDING', 'PARTIALLY_EXECUTED') AND remaining_quantity > 0 ORDER BY price ASC, created_at DESC"
         SELECT_SELL_QURY="SELECT * FROM order_book WHERE symbol = %s AND side = 'BUY' AND status IN ('PENDING', 'PARTIALLY_EXECUTED') AND remaining_quantity > 0 ORDER BY price ASC, created_at ASC"
