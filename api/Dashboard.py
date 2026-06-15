@@ -14,6 +14,6 @@ def getDashboardSummary(currentUser=Depends(get_current_user)):
     userDashboard=dashboardService.getDashBoarddetailForUser(userId)
     return{
         "userId": userId,
-        "DashboardSummary":userDashboard
+        "dashboard":userDashboard
     }
 

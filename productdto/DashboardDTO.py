@@ -6,7 +6,6 @@ from productdto.TradesSummaryDTO import TradesSummaryDTO
 
 @dataclass
 class DashboardDTO:
-    user_id: int
     orders: OrdersSummary
     trades: Optional[TradesSummaryDTO] = None
     portfolio: Optional[PortfolioSummary] = None
