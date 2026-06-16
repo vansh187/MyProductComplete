@@ -4,7 +4,7 @@ from productdto.matchingOrderDTO import MatchingOrderDTO
 
 class TradeHistoryService:
 
-    def insertTradeOrders(  buy_order_id,
+    def insertTradeOrders( buy_order_id,
                             sell_order_id,
                             buy_user_id,
                             sell_user_id,

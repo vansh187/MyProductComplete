@@ -4,11 +4,13 @@ from productdto.holdingDTO import HoldingDTO
 
 class portfolioService:
 
-    @staticmethod
+    def __init__(self):
+        pass
+    
     def process_buyer(userId,symbol,quantity,price,cursor):
         return portfolioPersistence.process_buyer(userId,symbol,quantity,price,cursor)
 
-    @staticmethod
+   
     def process_seller(userId,symbol,quantity,price,cursor):
         return portfolioPersistence.process_seller(userId,symbol,quantity,price,cursor)
 
@@ -52,13 +54,12 @@ class portfolioService:
         return None
     
     
-    @staticmethod
-    def createTradeinOrderBook(conn,cursor,order,userId,orderId):
+    def createTradeinOrderBook(self,conn,cursor,order,userId,orderId):
         return portfolioPersistence.createTradeinOrderBook(conn,cursor,order,userId,orderId)
     
     
     
-    @staticmethod
-    def updateOrderBookQuantity(quantity,orderBookId,status,buy_order_id, sell_order_id,cursor):
+    
+    def updateOrderBookQuantity(self,quantity,orderBookId,status,buy_order_id, sell_order_id,cursor):
         return portfolioPersistence.updateOrderBookQuantity(quantity,orderBookId,status,buy_order_id, sell_order_id,cursor)
         

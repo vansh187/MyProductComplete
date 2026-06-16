@@ -1,6 +1,6 @@
 from service.portfolioService import portfolioService
-from service.orderService import create_order
-from service.orderService import updateStatus as update_order_status
+#from service.orderService import create_order
+from service.orderService import OrderService
 from service.tradeHistoryService import TradeHistoryService as tradeService
 from dotenv import load_dotenv
 from database.ConnectionFactory import ConnectionFactory
@@ -10,9 +10,11 @@ from service.matchingEngine.matchingEngine import MatchingEngine
 load_dotenv()
 
 class ExecutionEngine:
-
-    @staticmethod
-    def executeOrder( order, userId):
+    
+    def __init__(self,order):
+        self.order=order
+   
+    def executeOrder(self,order, userId):
         """
         Execute an order for a user by:
         1. Creating an order book entry
@@ -21,7 +23,8 @@ class ExecutionEngine:
         4. Updating order status
         """
         executionPrice = order.price
-
+        portfolio_service = portfolioService()
+        order_service = OrderService() 
         if order.status != "PENDING":
             return {
                 "success": False,
@@ -41,17 +44,17 @@ class ExecutionEngine:
             cursor = conn.cursor(dictionary=True)
 
             # Create order in order book
-            orderBookId = portfolioService.createTradeinOrderBook(conn,cursor,order, userId,order.id)
+            orderBookId = portfolio_service.createTradeinOrderBook(conn,cursor,order, userId,order.id)
 
             # Call matching engine to find matching orders
-            matchFoundList = MatchingEngine.execute(order, userId,cursor)
+            matchingEngine=MatchingEngine(order,userId,cursor)
+            matchFoundList = matchingEngine.execute(order, userId,cursor)
             tradeExecutions = matchFoundList.get("tradeExcecution", [])
 
             for matchFound in tradeExecutions:
                 if matchFound is None:
                     continue
-
-                # Insert trade history
+                
                 transaction_id = tradeService.insertTradeOrders(
                     matchFound.buy_order_id,
                     matchFound.sell_order_id,
@@ -73,8 +76,9 @@ class ExecutionEngine:
                     status = "EXECUTED"
                 else:
                     status = "PARTIALLY_EXECUTED"
-                portfolioService.updateOrderBookQuantity(updatedQty, orderBookId, status,matchFound.buy_order_id, matchFound.sell_order_id,cursor)
-                update_order_status(userId, order.symbol, status,matchFound.buy_order_id, matchFound.sell_order_id,cursor)
+                portfolio_service.updateOrderBookQuantity(updatedQty, orderBookId, status,matchFound.buy_order_id, matchFound.sell_order_id,cursor)
+                order_service.updateStatus(userId, order.symbol, status,matchFound.buy_order_id, matchFound.sell_order_id,cursor)
+                
                 message=None
                 if order.side == "BUY":
                    message= portfolioService.process_buyer(userId, order.symbol, order.quantity, executionPrice, cursor)
@@ -111,7 +115,7 @@ class ExecutionEngine:
                 conn.rollback()
             if cursor is not None:
                 try:
-                    update_order_status(userId, order.symbol, "FAILED", cursor)
+                    order_service.updateStatus(userId, order.symbol, "FAILED", cursor)
                 except:
                     pass
             return {
