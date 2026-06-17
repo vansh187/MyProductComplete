@@ -6,8 +6,14 @@ from decimal import Decimal
 
 class MatchingEngineService:
 
-    @staticmethod
-    def price_match( incomingOrder, matchedOrder):
+    def __init__(self,order,userId,cursor):
+        self.order=order
+        self.userId=userId
+        self.cursor=cursor
+    
+    
+    
+    def price_match( self,incomingOrder, matchedOrder):
 
         incoming_side = incomingOrder.side.upper()
         matched_side = matchedOrder["side"].upper()
@@ -24,10 +30,11 @@ class MatchingEngineService:
         return False
 
 
-    @staticmethod
-    def matchtradeOrderforUser( order, userId, status,cursor):
+   
+    def matchtradeOrderforUser( self,order, userId, status,cursor):
 
-        matchFoundOrderResponse = MatchingPersistence.matchtradingOrderforUser( order,status,cursor)
+        matchingPersistence=MatchingPersistence()
+        matchFoundOrderResponse = matchingPersistence.matchtradingOrderforUser( order,status,cursor)
 
         if matchFoundOrderResponse is None:
             return {
@@ -35,7 +42,7 @@ class MatchingEngineService:
                 "message": "No MatchFound Order still in order Book"
             }
 
-        trades = MatchingEngineService.matchingOrder(order, matchFoundOrderResponse,userId)
+        trades = self.matchingOrder(order, matchFoundOrderResponse,userId)
 
         return {
             "userId": userId,
@@ -43,8 +50,8 @@ class MatchingEngineService:
         }
 
 
-    @staticmethod
-    def matchingOrder( incomingOrder, matchFoundOrderResponse,userId):
+
+    def matchingOrder( self,incomingOrder, matchFoundOrderResponse,userId):
 
         trades = []
 
@@ -58,7 +65,7 @@ class MatchingEngineService:
                     if incoming_qty == 0:
                         break
 
-                    if not MatchingEngineService.price_match(incomingOrder, response):
+                    if not self.price_match(incomingOrder, response):
                         continue
 
                     # FIX 2: safe access for DB rows
