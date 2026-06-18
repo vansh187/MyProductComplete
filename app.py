@@ -7,19 +7,25 @@ from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
 from contextlib import asynccontextmanager
 from scheduler.marketPriceSchedular import MarketPriceScheduler
-from database.redisConnection import RedisConnection
+#from database.redisConnection import RedisConnection
 from api.Dashboard import router as dashboardRouter
 from marketengine.AlphaVantageprovider import AlphaVantageProvider
+from marketengine.BreezeProvider import BreezeMarketProvider
 import asyncio
 from repository.MarketRepository import MarketRepository as market_repo
+from api.AddfundstoWallet import router as razorPayPaymentRouter
+
+
 
 async def on_market_tick_received(tick: dict):
-    symbol = tick.get("symbol")
+    symbol = tick.get("stock_code")
     if symbol:
         # Save straight to our shared memory map component
         payload ={
-            "ltp": tick["ltp"],
+            "exchange_code": tick["exchange_code"],
             "volume": tick["volume"],
+            "open" : tick["open"],
+            "close" : tick["close"],
             "timestamp": tick["timestamp"]
         }
         
@@ -31,7 +37,7 @@ async def on_market_tick_received(tick: dict):
         }"""
         
         await market_repo.save_live_tick(symbol, payload)
-        print(f"[Memory Cached] {symbol} -> {tick['ltp']}")
+        print(f"[Memory Cached] {symbol} -> {tick['exchange_code']}")
 
 
 @asynccontextmanager
@@ -39,10 +45,12 @@ async def lifespan(app: FastAPI):
     print("App starting... Initializing Market Engine Background Services")
     engine = AlphaVantageProvider()
     await engine.connect()
+    # 1. Register your internal adapter method reference cleanly
     engine.on_tick(on_market_tick_received)
-    watchlist = ["RELIANCE.BSE", "INFY.BSE", "AAPL"]
+
+    watchlist = ["RELIND", "INFTEC","TANCAM"]
+
     market_task = asyncio.create_task(engine.subscribe(watchlist))
-    print("Alpha Vantage async loop successfully scheduled.")
     
     yield
     print("Terminating background HTTP data sessions...")
@@ -72,6 +80,7 @@ app.include_router(login_router)
 app.include_router(trade_history)
 app.include_router(user_portfolio)
 app.include_router(dashboardRouter)
+app.include_router(razorPayPaymentRouter)
 @app.get("/")
 def read_root():
    ##redisConnection=RedisConnection()
