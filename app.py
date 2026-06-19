@@ -5,6 +5,7 @@ from api.login import router as login_router
 from api.orders import router as orders_router
 from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
+from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
 from scheduler.marketPriceSchedular import MarketPriceScheduler
 #from database.redisConnection import RedisConnection
@@ -81,6 +82,7 @@ app.include_router(trade_history)
 app.include_router(user_portfolio)
 app.include_router(dashboardRouter)
 app.include_router(razorPayPaymentRouter)
+app.include_router(verify_transaction)
 @app.get("/")
 def read_root():
    ##redisConnection=RedisConnection()

@@ -49,7 +49,7 @@ class BreezeMarketProvider(BaseMarketProvider):
         worker_thread.start()"""
         
         #self.breeze.ws_connect()
-        today_str = datetime.now().strftime("%Y-%m-%dT")
+        """today_str = datetime.now().strftime("%Y-%m-%dT")
         response = self.breeze.get_historical_data(
             interval="1minute",
             from_date=f"{today_str}09:15:00.000Z",
@@ -57,7 +57,7 @@ class BreezeMarketProvider(BaseMarketProvider):
             stock_code=symbol,
             exchange_code="NSE",
             product_type="cash"
-        )
+        )"""
         # Assign our internal adapter function to Breeze's raw callback trigger
         self.breeze.on_ticks = self._on_breeze_tick_received
         print("Connected to live Breeze Rate Refresh WebSocket Server.")

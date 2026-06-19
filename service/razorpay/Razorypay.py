@@ -1,15 +1,20 @@
 
 from service.razorpay.RazorPayMangerService import RazorPayManagerService
-
+from fastapi import BackgroundTasks as background_tasks
+import os
+from dotenv import load_dotenv
+import hmac
+import hashlib
+load_dotenv()
 class Razorpay:
     def __init__(self):
         pass
     
     
     
-    def invokeRazorPayintegration(self,walletLedger,userId):
+    def invokeRazorPayintegration(self,walletLedger,userId,background_tasks):
         razorPayManagerService=RazorPayManagerService()
-        razorPaystatus=razorPayManagerService.invokeRazorPayServiceForAddFundsToAccount(walletLedger,userId)
+        razorPaystatus=razorPayManagerService.invokeRazorPayServiceForAddFundsToAccount(walletLedger,userId,background_tasks)
         if razorPaystatus is None:
             return{
                 "Message" :"Invalid Request"
@@ -22,13 +27,18 @@ class Razorpay:
                return razorPaystatus
                 """
             
-    def verifyPaymentSignature(self):
+    def verifyPaymentSignature(self,payload,userId,background_tasks):
         razorPayManagerService=RazorPayManagerService()
-        is_authentic= razorPayManagerService.verify_payment_signature( razorpay_order_id="order_Qx9z3M8vP1kL5n",
-                                razorpay_payment_id="pay_Qx9z8N2mK3jR6b",
-                                razorpay_signature="abcdef1234567890yourgeneratedsignaturehashhere")
+        secret = os.getenv("RAZORPAY_SECRET_KEY")
+        razorpay_order_id=payload.razorpay_order_id
         
-        if is_authentic:
-                print("Payment Signature Verified! Safe to credit user funds.")
-        else:
-                print("Fraud Warning: Cryptographic signature mismatch!")  
+        is_authentic = razorPayManagerService.verify_payment_signature(
+            razorpay_order_id=razorpay_order_id,
+            razorpay_payment_id=payload.razorpay_payment_id,
+            razorpay_signature=payload.razorpay_signature,
+            userId=userId,
+            background_tasks=background_tasks
+        )
+        
+        return is_authentic
+               
