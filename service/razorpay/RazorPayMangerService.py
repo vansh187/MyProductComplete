@@ -3,6 +3,8 @@ import hashlib
 import razorpay
 import os
 from dotenv import load_dotenv
+from database.razorpaypersistence.RazorPayPersistence import RazorPayPersistence
+from fastapi import BackgroundTasks 
 load_dotenv()
 
 class RazorPayManagerService:
@@ -11,10 +13,10 @@ class RazorPayManagerService:
         self.key_id = None
         self.key_secret = None
         self.client = None
+        
     
     
-    
-    def invokeRazorPayServiceForAddFundsToAccount(self,walletLedger,userId):
+    def invokeRazorPayServiceForAddFundsToAccount(self,walletLedger,userId,background_tasks):
         self.key_id=os.getenv("RAZORPAY_API_KEY")
         self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
         if self.key_id is not None and self.key_secret is not None:
@@ -32,6 +34,19 @@ class RazorPayManagerService:
         }
             razonrPayOrder = self.client.order.create(data=order_payload)
             if razonrPayOrder is not None:
+                razorPayPersistence=RazorPayPersistence(walletLedger,razonrPayOrder,userId)
+                
+                def run_background_insert():
+                    razorPayPersistence.inssertPendingstatusOfAddFunds(
+                        walletLedger, 
+                        razonrPayOrder, 
+                        userId
+                    )
+                
+                background_tasks.add_task(
+                   run_background_insert
+                )
+                
                 return {
                 "status":"success", 
                 "userId":userId,  
@@ -46,22 +61,47 @@ class RazorPayManagerService:
             }
     
     
-    def verify_payment_signature(self, razorpay_order_id: str, razorpay_payment_id: str, razorpay_signature: str) -> bool:
+    def verify_payment_signature(self, razorpay_order_id: str, razorpay_payment_id: str, razorpay_signature: str,userId:int,background_tasks: BackgroundTasks) -> bool:
         """
         Step 2: Cryptographically verifies the payment signature returned by the frontend checkout window.
         Returns True if authentic, False if compromised.
         """
         # Construct the expected raw text blob payload
-        signature_payload = f"{razorpay_order_id}|{razorpay_payment_id}"
-        
-        # Generate local SHA256 HMAC hash using your secret key
-        local_hash = hmac.new(
-            bytes(self.key_secret, "utf-8"),
-            bytes(signature_payload, "utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        
-        # Secure string comparison to prevent timing attacks
-        return hmac.compare_digest(local_hash, razorpay_signature)    
+        try:
+                self.key_id=os.getenv("RAZORPAY_API_KEY")
+                self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
+                self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
+                signature_payload = f"{razorpay_order_id}|{razorpay_payment_id}"
+                
+                # Generate local SHA256 HMAC hash using your secret key
+                valid_signature = hmac.new(
+                    bytes(str(str(self.key_secret)), "utf-8"),
+                    bytes(str(str(signature_payload)), "utf-8"),
+                    hashlib.sha256
+                    ).hexdigest()
+                
+                # Secure string comparison to prevent timing attacks
+                params_dict = {
+                    'razorpay_order_id': razorpay_order_id,
+                    'razorpay_payment_id': razorpay_payment_id,
+                    'razorpay_signature': valid_signature
+                }
+                self.client.utility.verify_payment_signature(params_dict)
+                razorPayPersistence=RazorPayPersistence()
+                def run_background_insert():
+                    razorPayPersistence.updatePaymentStatus(
+                       razorpay_order_id , 
+                       razorpay_payment_id , 
+                        userId
+                    )
+                    
+                    razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id)
+                
+                background_tasks.add_task(
+                   run_background_insert
+                )
+                return True   
+        except Exception as ex:
+            print("Error in verification of payment"+ex)
         
         
