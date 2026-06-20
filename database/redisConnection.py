@@ -23,7 +23,7 @@ class RedisConnection:
             
             # Safe parsing of host and port variables from your centralized config properties
             try:
-                host_name = os.getenv("REDIS_URL")
+                host_name = os.getenv("REDIS_HOST")
                 port_number = os.getenv("REDIS_PORT")
             except Exception as ex:
                raise Exception("Error in creating Redis CONNECTION"+ex)
