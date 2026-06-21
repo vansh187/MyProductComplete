@@ -15,7 +15,7 @@ from marketengine.BreezeProvider import BreezeMarketProvider
 import asyncio
 from repository.MarketRepository import MarketRepository as market_repo
 from api.AddfundstoWallet import router as razorPayPaymentRouter
-
+from fastapi.middleware.cors import CORSMiddleware
 
 
 async def on_market_tick_received(tick: dict):
@@ -83,6 +83,13 @@ app.include_router(user_portfolio)
 app.include_router(dashboardRouter)
 app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173","https://myproductreact.onrender.com/","https://primepiptrade.com/"], # Your React dev server URL
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"], # Allows all headers
+)
 @app.get("/")
 def read_root():
    ##redisConnection=RedisConnection()
