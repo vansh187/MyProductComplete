@@ -52,7 +52,8 @@ class RazorPayManagerService:
                 "userId":userId,  
                 "razorpay_order": razonrPayOrder,
                 "amount_subunits": walletLedger.amount,
-                "currency": walletLedger.currency
+                "currency": walletLedger.currency,
+                "key": self.key_id
             }
         else:
             return {
@@ -103,5 +104,27 @@ class RazorPayManagerService:
                 return True   
         except Exception as ex:
             print("Error in verification of payment"+ex)
-        
+    
+    
+    def verify_webhook_signature(self, raw_body, webhook_signature,background_tasks:BackgroundTasks) -> bool:
+        """
+        Validates the incoming webhook signature using the raw request body bytes.
+        """
+        try:
+            #This is the secret passphrase you will set in the Razorpay Dashboard
+            webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+            if not webhook_secret:
+                print("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
+                return False
+            
+            # Using Razorpay's utility helper to verify the signature
+            self.client.utility.verify_webhook_signature(
+                raw_body.decode('utf-8'), 
+                webhook_signature, 
+                webhook_secret
+            )
+            return True
+        except Exception as e:
+            print(f" Webhook signature verification failed: {e}")
+            return False   
         
