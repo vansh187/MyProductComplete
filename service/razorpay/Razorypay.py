@@ -41,4 +41,36 @@ class Razorpay:
         )
         
         return is_authentic
-               
+
+    
+    def verifyWebhookSignature(self,raw_body,webhook_signature):
+        razorPayManger=RazorPayManagerService()
+        print("inside verifyWebhookSignature inside RazorPay")
+        return  razorPayManger.verify_webhook_signature(raw_body,webhook_signature)
+    
+    
+    def verifyPaymentSignatureWebhook(self,payment_entity,user_id):
+         razorPayManagerService=RazorPayManagerService()
+         secret = os.getenv("RAZORPAY_SECRET_KEY")
+         razorpay_order_id=payment_entity.razorpay_order_id
+         is_authentic = razorPayManagerService.verify_webhook_signature(
+            payload=payment_entity,
+            razorpay_signature=razorpay_order_id,
+            userId=user_id 
+        )
+    
+    
+    
+    def verifyPaymentSignatureWebHook(self,payload,userId):
+        razorPayManagerService=RazorPayManagerService()
+        """secret = os.getenv("RAZORPAY_SECRET_KEY")"""
+        print("inside verifyPaymentSignatureWebHook after backgroundprocess")
+        razorpay_order_id=payload.razorpay_order_id
+        razorpay_payment_id=payload.razorpay_payment_id
+        is_authentic = razorPayManagerService.invokeCallToDatabase(
+            razorpay_order_id=razorpay_order_id,
+            razorpay_payment_id=razorpay_payment_id,
+            userId=userId,
+        )
+        print("All authentication is in process")
+        return is_authentic     
