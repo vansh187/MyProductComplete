@@ -85,7 +85,7 @@ app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","https://myproductreact.onrender.com","https://primepiptrade.com","https://primepiptrade.com"], # Your React dev server URL
+    allow_origins=["http://localhost:5173","https://myproductreact.onrender.com","https://primepiptrade.com","https://www.primepiptrade.com/"], # Your React dev server URL
     allow_credentials=True,
     allow_methods=["*"], # Allows all HTTP methods (GET, POST, etc.)
     allow_headers=["*"], # Allows all headers
