@@ -119,6 +119,8 @@ class RazorPayManagerService:
             
             # Using Razorpay's utility helper to verify the signature
             print("inside verify_webhook_signature inside RazorPayManagerService")
+            print("webhook signatue"+webhook_signature)
+            print(raw_body)
             self.key_id=os.getenv("RAZORPAY_API_KEY")
             self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
             self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
