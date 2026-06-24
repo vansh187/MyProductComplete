@@ -23,7 +23,7 @@ class RazorPayManagerService:
             self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
             print("client success")
             order_payload = {
-            "amount": walletLedger.amount * 100 ,
+            "amount": int(walletLedger.amount * 100),
             "currency": walletLedger.currency,
             "receipt": f"rcpt_{userId}_{int(walletLedger.amount)}",
             "notes": {
