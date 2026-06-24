@@ -3,6 +3,7 @@ from utils.auth_dependency import get_current_user
 from service.razorpay.Razorypay import Razorpay
 from pydantic import BaseModel
 import json
+from utils.auth_dependency import get_current_user
 router=APIRouter()
 
 @router.post("/v1/VerifyFundPayements")
@@ -23,9 +24,11 @@ def verifyFundPayments(payload:VeriFyTransaction,background_tasks: BackgroundTas
         }
 
 @router.post("/v1/razorpay-webhook", status_code=status.HTTP_200_OK)
-async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = Header(None)):
+async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = Header(None),current_user = Depends(get_current_user)):
         payload_bytes = await request.body()
-
+        userId=current_user["user_id"]
+        print(userId)
+        print("going to update database")
         try:
             payload_dict = json.loads(payload_bytes.decode('utf-8'))
         except Exception:
@@ -45,31 +48,29 @@ async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = H
             )
 
         print("before process webhook data in background")
-        process_webhook_data_in_background(payload_dict)
+        process_webhook_data_in_background(payload_dict,userId)
         print("after process webhook data in background")
         return {"status": "accepted", "message": "Webhook authenticated and queued"}
 
 
-def process_webhook_data_in_background(event_data: dict):
+def process_webhook_data_in_background(event_data: dict,userId):
         try:
             event_type = event_data.get("event")
             if event_type in ("payment.captured", "payment.authorized"):
                 payment_entity = event_data["payload"]["payment"]["entity"]
                 print(str(payment_entity))
-                #notes = payment_entity.get("notes") or {}
-                currentUser=get_current_user()
-                print(currentUser)
-                user_id=currentUser["user_id"]
-                print(str(user_id))
-                if not user_id:
+                print(str(userId))
+                if not userId:
                     print("Webhook: user_id missing from payment notes, skipping wallet update")
                     return
                 razorPay = Razorpay()
-                razorPay.verifyPaymentSignatureWebHook(payment_entity, user_id)
-
+                razorPay.verifyPaymentSignatureWebHook(payment_entity, userId)
+                
         except Exception as ex:
             print(f"Exception occurred while processing webhook: {ex}")
             raise Exception("Exception Occured while verifying webhooks")
+
+
 class VeriFyTransaction(BaseModel):
     razorpay_order_id: str=None
     razorpay_payment_id: str=None
