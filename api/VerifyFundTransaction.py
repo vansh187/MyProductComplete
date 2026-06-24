@@ -57,6 +57,9 @@ def process_webhook_data_in_background(event_data: dict):
                 payment_entity = event_data["payload"]["payment"]["entity"]
                 notes = payment_entity.get("notes") or {}
                 user_id = notes.get("user_id")
+                print("userId from notes"+user_id)
+                user_id=payment_entity.get("user_id")
+                print("userId from payment_entity"+user_id)
                 if not user_id:
                     print("Webhook: user_id missing from payment notes, skipping wallet update")
                     return
