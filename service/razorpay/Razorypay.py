@@ -61,16 +61,18 @@ class Razorpay:
     
     
     
-    def verifyPaymentSignatureWebHook(self,payload,userId):
-        razorPayManagerService=RazorPayManagerService()
-        """secret = os.getenv("RAZORPAY_SECRET_KEY")"""
+    def verifyPaymentSignatureWebHook(self, payload, userId):
+        razorPayManagerService = RazorPayManagerService()
         print("inside verifyPaymentSignatureWebHook after backgroundprocess")
-        razorpay_order_id=payload.razorpay_order_id
-        razorpay_payment_id=payload.razorpay_payment_id
+        razorpay_order_id = payload.get("order_id")
+        razorpay_payment_id = payload.get("id")
+        if not razorpay_order_id:
+            print(f"Webhook: order_id is null for payment {razorpay_payment_id}, skipping DB update")
+            return None
         is_authentic = razorPayManagerService.invokeCallToDatabase(
             razorpay_order_id=razorpay_order_id,
             razorpay_payment_id=razorpay_payment_id,
             userId=userId,
         )
         print("All authentication is in process")
-        return is_authentic     
+        return is_authentic

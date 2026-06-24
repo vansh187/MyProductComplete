@@ -24,41 +24,47 @@ def verifyFundPayments(payload:VeriFyTransaction,background_tasks: BackgroundTas
 
 @router.post("/v1/razorpay-webhook", status_code=status.HTTP_200_OK)
 async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = Header(None)):
-    
+        payload_bytes = await request.body()
+
         try:
-                     payload_bytes = await request.body()
-                     razorPay=Razorpay()
-                     print("getting to test webhook")
-                     isValid=razorPay.verifyWebhookSignature(payload_bytes,x_razorpay_signature)
-                     print("after verify webhook in verifyfund trsaction"+isValid)
-                     if not isValid:
-                        raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid webhook signature"
-                        )    
-            
-                     payload_dict = json.loads(payload_bytes.decode('utf-8'))
+            payload_dict = json.loads(payload_bytes.decode('utf-8'))
         except Exception:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Malformed JSON body"
-                    ) 
-        print("before process webhook data in background") 
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Malformed JSON body"
+            )
+
+        razorPay = Razorpay()
+        print("getting to test webhook")
+        isValid = razorPay.verifyWebhookSignature(payload_bytes, x_razorpay_signature)
+        print("after verify webhook in verifyfund transaction: " + str(isValid))
+        if not isValid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid webhook signature"
+            )
+
+        print("before process webhook data in background")
         process_webhook_data_in_background(payload_dict)
-        print("after process webhook data in background") 
-        return {"status": "accepted", "message": "Webhook authenticated and queued"}         
-            
+        print("after process webhook data in background")
+        return {"status": "accepted", "message": "Webhook authenticated and queued"}
+
+
 def process_webhook_data_in_background(event_data: dict):
-        try:    
+        try:
             event_type = event_data.get("event")
-            if event_type == "payment.captured":
+            if event_type in ("payment.captured", "payment.authorized"):
                 payment_entity = event_data["payload"]["payment"]["entity"]
-                # Convert paisa to INR
-                user_id = payment_entity["user_id"]
-                razorPay=Razorpay()
-                razorPay.verifyPaymentSignatureWebHook(payment_entity,user_id)
-        
+                notes = payment_entity.get("notes") or {}
+                user_id = notes.get("user_id")
+                if not user_id:
+                    print("Webhook: user_id missing from payment notes, skipping wallet update")
+                    return
+                razorPay = Razorpay()
+                razorPay.verifyPaymentSignatureWebHook(payment_entity, user_id)
+
         except Exception as ex:
+            print(f"Exception occurred while processing webhook: {ex}")
             raise Exception("Exception Occured while verifying webhooks")
 class VeriFyTransaction(BaseModel):
     razorpay_order_id: str=None
