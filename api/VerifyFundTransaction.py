@@ -24,11 +24,9 @@ def verifyFundPayments(payload:VeriFyTransaction,background_tasks: BackgroundTas
         }
 
 @router.post("/v1/razorpay-webhook", status_code=status.HTTP_200_OK)
-async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = Header(None),current_user = Depends(get_current_user)):
+async def verifyRazorPayWebhook(request: Request, x_razorpay_signature: str = Header(None)):
         payload_bytes = await request.body()
-        userId=current_user["user_id"]
-        print(userId)
-        print("going to update database")
+
         try:
             payload_dict = json.loads(payload_bytes.decode('utf-8'))
         except Exception:
@@ -38,7 +36,6 @@ async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = H
             )
 
         razorPay = Razorpay()
-        print("getting to test webhook")
         isValid = razorPay.verifyWebhookSignature(payload_bytes, x_razorpay_signature)
         print("after verify webhook in verifyfund transaction: " + str(isValid))
         if not isValid:
@@ -48,24 +45,25 @@ async def verifyRazorPayWebhook(request: Request,  x_razorpay_signature: str = H
             )
 
         print("before process webhook data in background")
-        process_webhook_data_in_background(payload_dict,userId)
+        process_webhook_data_in_background(payload_dict)
         print("after process webhook data in background")
         return {"status": "accepted", "message": "Webhook authenticated and queued"}
 
 
-def process_webhook_data_in_background(event_data: dict,userId):
+def process_webhook_data_in_background(event_data: dict):
         try:
             event_type = event_data.get("event")
             if event_type in ("payment.captured", "payment.authorized"):
                 payment_entity = event_data["payload"]["payment"]["entity"]
-                print(str(payment_entity))
-                print(str(userId))
-                if not userId:
+                notes = payment_entity.get("notes") or {}
+                user_id = notes.get("user_id")
+                print("webhook user_id from notes: " + str(user_id))
+                if not user_id:
                     print("Webhook: user_id missing from payment notes, skipping wallet update")
                     return
                 razorPay = Razorpay()
-                razorPay.verifyPaymentSignatureWebHook(payment_entity, userId)
-                
+                razorPay.verifyPaymentSignatureWebHook(payment_entity, user_id)
+
         except Exception as ex:
             print(f"Exception occurred while processing webhook: {ex}")
             raise Exception("Exception Occured while verifying webhooks")
