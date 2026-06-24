@@ -44,7 +44,7 @@ class RazorPayPersistence:
                      os.getenv("MYSQLPORT", 3306))
             cursor = conn.cursor()
             cursor.execute(INSERT_RAZORPAY_LEDGER,(userId,razonrPayOrder.get("id"),
-                                                 razonrPayOrder.get("amount"), razonrPayOrder.get("currency"),
+                                                 walletLedger.amount, razonrPayOrder.get("currency"),
                                                   TransactionType.WALLET_FUNDING,TransactionStatus.PENDING
                                                    ))
             conn.commit()
