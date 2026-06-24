@@ -53,7 +53,7 @@ async def verifyRazorPayWebhook(request: Request, x_razorpay_signature: str = He
 def process_webhook_data_in_background(event_data: dict):
         try:
             event_type = event_data.get("event")
-            if event_type in ("payment.captured", "payment.authorized"):
+            if event_type == "payment.captured":
                 payment_entity = event_data["payload"]["payment"]["entity"]
                 notes = payment_entity.get("notes") or {}
                 user_id = notes.get("user_id")
