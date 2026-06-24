@@ -1,26 +1,35 @@
-from fastapi import APIRouter, BackgroundTasks,Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field, condecimal
 from utils.auth_dependency import get_current_user
 from fastapi import APIRouter
 from decimal import Decimal
-from service.razorpay.Razorypay import Razorpay 
+from service.razorpay.Razorypay import Razorpay
+from service.walletbalance.WalletBalanceService import WalletBalanceService
 
 router = APIRouter()
 
 @router.post("/v1/addFundsToWallet")
-def addFundsToWallet(walletLedger: WalletLedger, background_tasks: BackgroundTasks,current_user=Depends(get_current_user) ):
-    print ("Adding funds")
-    """msg = "order_T3DvWN54raoa0B|pay_MOCK_SUCCESS_12345"
-    
-    secret = "0odiqmdsQKqMnZ2lLSUos0fn" 
-    test_signature = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    print(f"Your Test Signature: {test_signature}")"""
-    userId=current_user["user_id"]
+def addFundsToWallet(walletLedger: WalletLedger, background_tasks: BackgroundTasks, current_user=Depends(get_current_user)):
+    print("Adding funds")
+    userId = current_user["user_id"]
     razorpay = Razorpay()
-    return razorpay.invokeRazorPayintegration(walletLedger,userId,background_tasks= background_tasks)
-    
+    return razorpay.invokeRazorPayintegration(walletLedger, userId, background_tasks=background_tasks)
+
+
+@router.post("/v1/getWalletBalance")
+def getWalletBalance(current_user=Depends(get_current_user)):
+    try:
+        userId = current_user["user_id"]
+        walletBalanceService = WalletBalanceService()
+        walletBalance = walletBalanceService.getWalletBalance(userId)
+        if walletBalance is None:
+            return {"user_id": userId, "balance": 0.0}
+        return {"user_id": walletBalance["user_id"], "balance": walletBalance["balance"]}
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch wallet balance: {str(ex)}")
+
 
 class WalletLedger(BaseModel):
-     amount:float=0.0
-     currency: str=None      
+    amount: Decimal = Decimal("0.0")
+    currency: str = None
 
