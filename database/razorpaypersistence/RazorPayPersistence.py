@@ -1,157 +1,135 @@
-from database.ConnectionFactory import ConnectionFactory
-import os
+from database.PostgresConnectionFactory import PostgresConnectionFactory
+from utils.query_loader import QueryLoader
+import psycopg2.extras
 from dotenv import load_dotenv
 from enum import Enum
 
 load_dotenv()
-class RazorPayPersistence:
-    def __init__(self,walletLedger=None,razorPayOrder=None,userId=None):
-        self.walletLedger=walletLedger
-        self.razorPayOrder=razorPayOrder
-        self.userId=userId
-    
 
-    
-    
-    def inssertPendingstatusOfAddFunds(self, walletLedger,razonrPayOrder,userId):
+
+class RazorPayPersistence:
+
+    def __init__(self, walletLedger=None, razorPayOrder=None, userId=None):
+        self.walletLedger = walletLedger
+        self.razorPayOrder = razorPayOrder
+        self.userId = userId
+
+    def inssertPendingstatusOfAddFunds(self, walletLedger, razonrPayOrder, userId):
         conn = None
         cursor = None
-        INSERT_RAZORPAY_LEDGER = """INSERT INTO wallet_ledger (
-                                    user_id, 
-                                    razorpay_order_id, 
-                                    razorpay_payment_id, 
-                                    amount, 
-                                    currency, 
-                                    transaction_type, 
-                                    status, 
-                                    created_at
-                                ) VALUES (
-                                    %s,                         
-                                     %s,     
-                                    NULL,                       
-                                     %s,                      
-                                     %s,                   
-                                     %s,          
-                                     %s,                 
-                                    NOW()                       
-                                )"""
-        
         try:
-            conn = ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
-                     os.getenv("MYSQLUSER"),
-                     os.getenv("MYSQLPASSWORD"),
-                     os.getenv("MYSQLDATABASE"),
-                     os.getenv("MYSQLPORT", 3306))
+            conn = PostgresConnectionFactory.create_connection()
             cursor = conn.cursor()
-            cursor.execute(INSERT_RAZORPAY_LEDGER,(userId,razonrPayOrder.get("id"),
-                                                 walletLedger.amount, razonrPayOrder.get("currency"),
-                                                  TransactionType.WALLET_FUNDING,TransactionStatus.PENDING
-                                                   ))
+            cursor.execute(
+                QueryLoader.get('razorpay.yaml', 'insert_wallet_ledger'),
+                (userId, razonrPayOrder.get("id"), walletLedger.amount,
+                 razonrPayOrder.get("currency"),
+                 TransactionType.WALLET_FUNDING, TransactionStatus.PENDING)
+            )
             conn.commit()
             print("Insert Success")
-        
         except Exception as ex:
-            raise Exception("Error in inserting into wallet Ledger"+ex)    
-        
+            if conn:
+                conn.rollback()
+            raise Exception(f"Error in inserting into wallet Ledger: {str(ex)}")
         finally:
             if conn is not None:
                 conn.close()
-            
             if cursor is not None:
-                cursor.close()    
+                cursor.close()
 
-    
-    
-    def updatePaymentStatus(self,razorpay_order_id,razorpay_payment_id,userId):
-        conn=None
-        cursor=None
-        UPDATE_PAYMENT_STATUS="""UPDATE wallet_ledger 
-                                SET status = %s, 
-                                    razorpay_payment_id = %s 
-                                WHERE user_id = %s 
-                                AND razorpay_order_id = %s 
-                                AND status = %s"""
+    def updatePaymentStatus(self, razorpay_order_id, razorpay_payment_id, userId):
+        conn = None
+        cursor = None
         try:
-           conn= ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
-                     os.getenv("MYSQLUSER"),
-                     os.getenv("MYSQLPASSWORD"),
-                     os.getenv("MYSQLDATABASE"),
-                     os.getenv("MYSQLPORT", 3306) )
-           cursor=conn.cursor()
-           cursor.execute(UPDATE_PAYMENT_STATUS,(TransactionStatus.SUCCESS,razorpay_payment_id,userId,razorpay_order_id,TransactionStatus.PENDING))
-           conn.commit()
-           print("Transaction update is success")
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                QueryLoader.get('razorpay.yaml', 'update_payment_status'),
+                (TransactionStatus.SUCCESS, razorpay_payment_id,
+                 userId, razorpay_order_id, TransactionStatus.PENDING)
+            )
+            conn.commit()
+            print("Transaction update is success")
         except Exception as ex:
-           print("Error in updating status"+ex)     
-
+            if conn:
+                conn.rollback()
+            print(f"Error in updating status: {str(ex)}")
         finally:
             if conn is not None:
                 conn.close()
             if cursor is not None:
-                cursor.close()    
+                cursor.close()
 
-    def insertUpdateWallet(self,userId,razorpay_order_id):
-        conn=None
-        cursor=None
-        newWalletBalance=0.0
-        UPDATE_WALLET_STATEMENT=""" UPDATE wallets 
-                                    SET balance = %s 
-                                    WHERE user_id = %s; """
-                                
-        SELECT_WALLET_STATEMENT="""
-                                      SELECT 
-                                        w.wallet_id,
-                                        -- If the wallet doesn't exist yet, return 0.00 instead of NULL
-                                        COALESCE(w.balance, 0.00) AS balance, 
-                                        wl.amount AS transaction_amount,
-                                        wl.status AS transaction_status
-                                    FROM wallets w
-                                    RIGHT JOIN wallet_ledger wl ON w.user_id = wl.user_id
-                                    WHERE wl.razorpay_order_id = %s
-                                    AND wl.user_id = %s
-
-                                """
-        INSERT_WALLET_STATEMENT="""INSERT INTO wallets (user_id, balance) 
-                                    VALUES (%s, %s);"""
-        
+    def insertUpdateWallet(self, userId, razorpay_order_id):
+        conn = None
+        cursor = None
         try:
-           conn= ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
-                     os.getenv("MYSQLUSER"),
-                     os.getenv("MYSQLPASSWORD"),
-                     os.getenv("MYSQLDATABASE"),
-                     os.getenv("MYSQLPORT", 3306) )
-           cursor=conn.cursor(dictionary=True)
-           cursor.execute(SELECT_WALLET_STATEMENT,(razorpay_order_id,userId))
-           walletRecord=cursor.fetchone()
-           if walletRecord["wallet_id"] is None:
-               cursor.execute(INSERT_WALLET_STATEMENT,(userId,walletRecord["transaction_amount"])) 
-               conn.commit()
-               print("insert wallet record with new funds")
-           else:    
-                    oldBalance=walletRecord["balance"]
-                    amountToAdd=walletRecord["transaction_amount"]
-                    newWalletBalance=oldBalance+amountToAdd
-                    cursor.execute(UPDATE_WALLET_STATEMENT,(newWalletBalance,userId))
-                    conn.commit()
-                    print("Transaction update is success")
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                QueryLoader.get('razorpay.yaml', 'select_wallet_for_update'),
+                (razorpay_order_id, userId)
+            )
+            walletRecord = cursor.fetchone()
+            if walletRecord is None:
+                print(f"No wallet_ledger record found for order {razorpay_order_id}, skipping wallet update")
+                return
+            if walletRecord["wallet_id"] is None:
+                cursor.execute(
+                    QueryLoader.get('razorpay.yaml', 'insert_wallet'),
+                    (userId, walletRecord["transaction_amount"])
+                )
+                conn.commit()
+                print("insert wallet record with new funds")
+            else:
+                newWalletBalance = walletRecord["balance"] + walletRecord["transaction_amount"]
+                cursor.execute(
+                    QueryLoader.get('razorpay.yaml', 'update_wallet_balance'),
+                    (newWalletBalance, userId)
+                )
+                conn.commit()
+                print("Transaction update is success")
         except Exception as ex:
-           print("Error in updating status"+ex)     
-
+            if conn:
+                conn.rollback()
+            print(f"Error in updating wallet: {str(ex)}")
         finally:
             if conn is not None:
                 conn.close()
             if cursor is not None:
-                cursor.close()    
-    
-    
-    
-class TransactionType(str,Enum):
+                cursor.close()
+
+    def get_user_id_by_order_id(self, razorpay_order_id):
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                QueryLoader.get('razorpay.yaml', 'get_user_id_by_order'),
+                (razorpay_order_id,)
+            )
+            row = cursor.fetchone()
+            return row["user_id"] if row else None
+        except Exception as ex:
+            print(f"Error fetching user_id by order_id: {str(ex)}")
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+            if cursor is not None:
+                cursor.close()
+
+
+class TransactionType(str, Enum):
     WALLET_FUNDING = "1"
     WITHDRAWAL = "2"
     ASSET_PURCHASE = "3"
     ASSET_SALE = "4"
 
-class TransactionStatus(str,Enum):
+
+class TransactionStatus(str, Enum):
     PENDING = "1"
     SUCCESS = "2"
-    FAILED = "3"           
+    FAILED = "3"

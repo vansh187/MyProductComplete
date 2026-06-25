@@ -1,8 +1,10 @@
-from database.ConnectionFactory import ConnectionFactory
-import os
+from database.PostgresConnectionFactory import PostgresConnectionFactory
+from utils.query_loader import QueryLoader
+import psycopg2.extras
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 class WalletBalancePersistence:
 
@@ -12,21 +14,13 @@ class WalletBalancePersistence:
     def getWalletBalance(self, userId):
         conn = None
         cursor = None
-        SELECT_WALLET_BALANCE = """SELECT user_id, balance FROM wallets WHERE user_id = %s"""
         try:
-            conn = ConnectionFactory.create_connection(
-                os.getenv("MYSQLHOST"),
-                os.getenv("MYSQLUSER"),
-                os.getenv("MYSQLPASSWORD"),
-                os.getenv("MYSQLDATABASE"),
-                os.getenv("MYSQLPORT", 3306)
-            )
+            conn = PostgresConnectionFactory.create_connection()
             if conn is None:
                 raise Exception("Database connection could not be established")
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(SELECT_WALLET_BALANCE, (userId,))
-            row = cursor.fetchone()
-            return row
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(QueryLoader.get('wallet.yaml', 'get_wallet_balance'), (userId,))
+            return cursor.fetchone()
         except Exception as ex:
             raise Exception(f"Exception while fetching wallet balance: {str(ex)}")
         finally:

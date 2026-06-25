@@ -1,0 +1,24 @@
+create_order: |
+  INSERT INTO orders (user_id, symbol, side, quantity, price, status, created_at)
+  VALUES (%s, %s, %s, %s, %s, %s, NOW())
+  RETURNING id
+
+get_orders: |
+  SELECT id, symbol, side, quantity, price, status
+  FROM orders
+  WHERE user_id = %s
+
+get_order_by_id: |
+  SELECT id, symbol, side, quantity, price, status
+  FROM orders
+  WHERE user_id = %s AND id = %s
+
+cancel_order: |
+  UPDATE orders
+  SET status = %s
+  WHERE user_id = %s AND id = %s AND status = %s
+
+update_order_status: |
+  UPDATE orders
+  SET status = %s
+  WHERE id IN (%s, %s)

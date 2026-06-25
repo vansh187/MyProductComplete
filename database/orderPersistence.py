@@ -1,90 +1,90 @@
-from database.ConnectionFactory import ConnectionFactory
+from database.PostgresConnectionFactory import PostgresConnectionFactory
+from utils.query_loader import QueryLoader
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
-def create_order(order, user_id):
-    # Here you would implement the logic to save the order to the database
-    # For demonstration, we will just print the order and user_id
-    INSERT_ORDER_QUERY = "INSERT INTO orders (user_id, symbol, side, quantity, price, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())"
-    conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
-            os.getenv("MYSQLUSER"),
-            os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE"),
-            os.getenv("MYSQLPORT", 3306)
 
-    )
-    cursor = conn.cursor()
-    cursor.execute(INSERT_ORDER_QUERY, (user_id, order.symbol, order.side, order.quantity, order.price, order.status))
-    conn.commit()
-    id= cursor.lastrowid
-    print(f"Creating order for user_id: {user_id}")
-    print(f"Order details: {order}")
-    cursor.close()
-    conn.close()
-    return id
+def create_order(order, user_id):
+    conn = None
+    cursor = None
+    try:
+        conn = PostgresConnectionFactory.create_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            QueryLoader.get('orders.yaml', 'create_order'),
+            (user_id, order.symbol, order.side, order.quantity, order.price, order.status)
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        print(f"Creating order for user_id: {user_id}")
+        return row[0]
+    except Exception as ex:
+        if conn:
+            conn.rollback()
+        raise Exception(f"Error creating order: {str(ex)}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
 
 def get_orders(user_id):
-    # Here you would implement the logic to retrieve orders from the database
-    # For demonstration, we will just return a dummy list of orders
-    SELECT_ORDERS_QUERY = "SELECT id, symbol, side, quantity, price, status FROM orders WHERE user_id = %s"
-    conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
-            os.getenv("MYSQLUSER"),
-            os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE"),
-            os.getenv("MYSQLPORT", 3306)
-
-    )
-    cursor = conn.cursor()
-    cursor.execute(SELECT_ORDERS_QUERY, (user_id,))
-    orders = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    
-    print(f"Retrieving orders for user_id: {user_id}")
-    return orders
+    conn = None
+    cursor = None
+    try:
+        conn = PostgresConnectionFactory.create_connection()
+        cursor = conn.cursor()
+        cursor.execute(QueryLoader.get('orders.yaml', 'get_orders'), (user_id,))
+        orders = cursor.fetchall()
+        return orders
+    except Exception as ex:
+        raise Exception(f"Error fetching orders: {str(ex)}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 
-def getOrderById(userId,orderId):
-     ORDER_BY_ID="SELECT id, symbol, side, quantity, price, status FROM orders WHERE user_id = %s and id=%s"
-     conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
-            os.getenv("MYSQLUSER"),
-            os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE"),
-            os.getenv("MYSQLPORT", 3306)
+def getOrderById(userId, orderId):
+    conn = None
+    cursor = None
+    try:
+        conn = PostgresConnectionFactory.create_connection()
+        cursor = conn.cursor()
+        cursor.execute(QueryLoader.get('orders.yaml', 'get_order_by_id'), (userId, orderId))
+        return cursor.fetchone()
+    except Exception as ex:
+        raise Exception(f"Error fetching order by id: {str(ex)}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
+
+def cancelOrderById(userId, orderId):
+    conn = None
+    cursor = None
+    try:
+        conn = PostgresConnectionFactory.create_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            QueryLoader.get('orders.yaml', 'cancel_order'),
+            ("CANCELLED", userId, orderId, "PENDING")
         )
-     cursor = conn.cursor()
-     cursor.execute(ORDER_BY_ID,(userId,orderId))
-     order=cursor.fetchone()
-     cursor.close()
-     conn.close()
-     return order
-
-def cancelOrderById(userId,orderId):
-    CANCELLED="CANCELLED"
-    CANCEL_ORDER_ID="UPDATE orders SET status=%s WHERE user_id=%s AND id=%s and status =%s"
-    conn = ConnectionFactory.create_connection( os.getenv("MYSQLHOST"),
-            os.getenv("MYSQLUSER"),
-            os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE"),
-            os.getenv("MYSQLPORT", 3306)
-
-        )
-    cursor = conn.cursor()
-    cursor.execute(CANCEL_ORDER_ID,(CANCELLED,userId,orderId,"PENDING"))
-   
-    if cursor.rowcount == 0:
         conn.commit()
-        cursor.close()
-        conn.close()
-        return
-    else:
-        conn.commit()
-        cursor.close()
-        conn.close()
+        if cursor.rowcount == 0:
+            return
         return "Cancel Success"
-        print(f"order cancelled with order id: {userId}")
-    
-
+    except Exception as ex:
+        if conn:
+            conn.rollback()
+        raise Exception(f"Error cancelling order: {str(ex)}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()

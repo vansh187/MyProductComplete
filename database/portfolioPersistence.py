@@ -1,245 +1,176 @@
+from database.PostgresConnectionFactory import PostgresConnectionFactory
+from utils.query_loader import QueryLoader
+import psycopg2.extras
 from dotenv import load_dotenv
-from database.ConnectionFactory import ConnectionFactory
-import os
 from decimal import Decimal
 
 load_dotenv()
-class portfolioPersistence:
-    
-    
-    def process_buyer(userId,symbol,quantity,price,cursor):
-        SELECT_HOLDINGS="SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
-        UPDATE_HOLDINGS="UPDATE holdings SET quantity = %s, avg_price = %s WHERE user_id = %s AND symbol = %s"
-        INSERT_HOLDINGS="INSERT INTO holdings (user_id, symbol, quantity, avg_price) VALUES (%s, %s, %s, %s)"
-        try:
-            
 
+
+class portfolioPersistence:
+
+    def process_buyer(userId, symbol, quantity, price, cursor):
+        try:
             if price <= 0:
-                 return{
-                       "userId":userId,
-                       "Message":"Trade did not happened for negative price"
-                   }
-            
-            cursor.execute(SELECT_HOLDINGS,(userId,symbol))
-            holdings=cursor.fetchone()
+                return {"userId": userId, "Message": "Trade did not happened for negative price"}
+
+            cursor.execute(QueryLoader.get('portfolio.yaml', 'select_holdings'), (userId, symbol))
+            holdings = cursor.fetchone()
             if not holdings:
-                cursor.execute(INSERT_HOLDINGS,(userId,symbol,quantity,price))
+                cursor.execute(
+                    QueryLoader.get('portfolio.yaml', 'insert_holdings'),
+                    (userId, symbol, quantity, price)
+                )
                 print("HOLDINGS INSERTED")
             else:
-                old_qty=holdings["quantity"]
-                old_price=holdings["avg_price"]
+                old_qty = holdings["quantity"]
+                old_price = holdings["avg_price"]
                 if old_qty <= 0:
-                     return{
-                       "userId":userId,
-                       "Message":"Trade did not happened for negative quantity"
-                   }
-            
+                    return {"userId": userId, "Message": "Trade did not happened for negative quantity"}
                 new_qty = old_qty + quantity
                 new_avg = ((old_qty * old_price) + (quantity * price)) / new_qty
-                cursor.execute(UPDATE_HOLDINGS, (new_qty, new_avg, userId, symbol))
-                
-        ##try:
-        ##    portfolioPersistence.updateorderStatus(conn, userId, symbol)
-       ## except:
-           ## raise Exception("Exception in calling updateorderStatus") 
+                cursor.execute(
+                    QueryLoader.get('portfolio.yaml', 'update_holdings'),
+                    (new_qty, new_avg, userId, symbol)
+                )
         except Exception as ex:
             raise Exception("Exception in inserting holdings")
         finally:
-              print("Execute finally block process buy")
-            
+            print("Execute finally block process buy")
 
-
-    
-    def process_seller(userId,symbol,quantity,price,cursor):   
-         SELECT_SELL_PROCESS=" SELECT quantity, avg_price FROM holdings WHERE user_id = %s AND symbol = %s"
-         UPDATE_ORDER_QUANTITY="UPDATE holdings SET quantity = %s WHERE user_id = %s AND symbol = %s"
-         INSERT_HOLDINGS="INSERT INTO holdings (user_id, symbol, quantity, avg_price,updated_at) VALUES (%s, %s, %s, %s,NOW())"
-         if quantity <= 0:
+    def process_seller(userId, symbol, quantity, price, cursor):
+        if quantity <= 0:
             raise Exception("Quantity must be greater than zero")
-         try:
-           
-            cursor.execute(SELECT_SELL_PROCESS,(userId,symbol))
-            sellHolding=cursor.fetchone()
-
+        try:
+            cursor.execute(QueryLoader.get('portfolio.yaml', 'select_holdings'), (userId, symbol))
+            sellHolding = cursor.fetchone()
             if not sellHolding:
-                cursor.execute(INSERT_HOLDINGS,(userId,symbol,quantity,price))
+                cursor.execute(
+                    QueryLoader.get('portfolio.yaml', 'insert_holdings_with_time'),
+                    (userId, symbol, quantity, price)
+                )
                 print("HOLDINGS INSERTED")
-            else:    
-                old_qty=sellHolding["quantity"]
-                avg_price=sellHolding["avg_price"]     
-                if quantity <= 0:
-                   return{
-                       "userId":userId,
-                       "Message":"Trade did not happened for negative quantity"
-                   }
+            else:
+                old_qty = sellHolding["quantity"]
                 if quantity > old_qty:
-                     return{
-                       "userId":userId,
-                       "Message":"quantity you have is less than trade quantity"
-                   }
-            
+                    return {"userId": userId, "Message": "quantity you have is less than trade quantity"}
                 new_qty = old_qty - quantity
-
-                cursor.execute(UPDATE_ORDER_QUANTITY, (new_qty, userId, symbol))
-        ## try:
-              ##  portfolioPersistence.updateorderStatus(conn, userId, symbol)
-        ## except Exception as exc:
-         ##    raise Exception("Exception in calling updateorderStatus") from exc
-         except Exception as e:
-             raise Exception(f"Exception in process_seller: {str(e)}")
-         
-         finally:
+                cursor.execute(
+                    QueryLoader.get('portfolio.yaml', 'update_order_quantity'),
+                    (new_qty, userId, symbol)
+                )
+        except Exception as e:
+            raise Exception(f"Exception in process_seller: {str(e)}")
+        finally:
             print("Executing finally for process sell")
-         
-         
-    
-    
-    def updateorderStatus(cursor,userId,symbol,status,buy_order_id, sell_order_id) :
-        UPDATE_ORDER_STATUS="UPDATE orders SET status=%s WHERE id in (%s,%s) "
-        if status is None:
-             cursor.execute(UPDATE_ORDER_STATUS,("EXECUTED",buy_order_id, sell_order_id))
-        else:
-            cursor.execute(UPDATE_ORDER_STATUS,(status,buy_order_id, sell_order_id))
+
+    def updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id):
+        value = status if status is not None else "EXECUTED"
+        cursor.execute(
+            QueryLoader.get('orders.yaml', 'update_order_status'),
+            (value, buy_order_id, sell_order_id)
+        )
         print("order status update success")
 
+    def updateStatus(userId, symbol, status, buy_order_id, sell_order_id, cursor):
+        portfolioPersistence.updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id)
 
-  
-    def updateStatus(userId,symbol,status,buy_order_id, sell_order_id,cursor):
-            
-            portfolioPersistence.updateorderStatus(cursor, userId, symbol,status,buy_order_id, sell_order_id)
-           
-
-    
-    def createUserHolding(order,userId):
-         CREATE_HOLDINGS_ORDER="INSERT INTO holdings (user_id, symbol, quantity, avg_price,updated_at) VALUES (%s, %s, %s, %s,NOW())"
-         try:
-            conn=ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
-            os.getenv("MYSQLUSER"),
-            os.getenv("MYSQLPASSWORD"),
-            os.getenv("MYSQLDATABASE"),
-            os.getenv("MYSQLPORT", 3306))
-            cursor=conn.cursor()
-            cursor.execute(CREATE_HOLDINGS_ORDER,(userId,order.symbol,order.quantity,order.avg_price))
-            
-         except Exception as Ex:
-            raise Exception("Error in inserting holdings") from Ex
-         finally:
-             cursor.close()
-             conn.commit()
-         
-    
-    def updateUserHoldings(order,userId,new_qty,round,new_avg):
-         UPDATE_USER_HOLDINGS="UPDATE holdings set quantity=%s,avg_price=%s,updated_at=NOW() where user_id=%s and symbol=%s"
-         try:
-            conn=ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
-             os.getenv("MYSQLUSER"),
-             os.getenv("MYSQLPASSWORD"),
-             os.getenv("MYSQLDATABASE"),
-             os.getenv("MYSQLPORT", 3306))
-            cursor=conn.cursor()
-            cursor.execute(UPDATE_USER_HOLDINGS,(new_qty,new_avg,userId,order.symbol))
-            
-         except Exception as ex:
-              raise Exception("Error in holdings update") from ex
-         finally:
-             cursor.close()
-             conn.commit()
-
-   
-    def getPortfolioServiceforLoggedInUser(userId):
-        SELECT_USER_PORTFOLIO="SELECT symbol,quantity,avg_price,updated_at from holdings where user_id=%s and quantity > 0"
-        conn=None
-        cursor=None
+    def createUserHolding(order, userId):
+        conn = None
+        cursor = None
         try:
-            conn=ConnectionFactory.create_connection(os.getenv("MYSQLHOST"),
-             os.getenv("MYSQLUSER"),
-             os.getenv("MYSQLPASSWORD"),
-             os.getenv("MYSQLDATABASE"),
-             os.getenv("MYSQLPORT", 3306))
-            cursor=conn.cursor(dictionary=True)
-            cursor.execute(SELECT_USER_PORTFOLIO,(userId,))
-            portfolio=cursor.fetchall()
-            return portfolio
-
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'insert_holdings_with_time'),
+                (userId, order.symbol, order.quantity, order.avg_price)
+            )
+            conn.commit()
         except Exception as ex:
-            raise Exception("Error in getting portfolion for logged in user")
-
-        finally: 
+            if conn:
+                conn.rollback()
+            raise Exception("Error in inserting holdings") from ex
+        finally:
             if cursor is not None:
                 cursor.close()
             if conn is not None:
                 conn.close()
-                  
-   
-    def getPortfolioOfLoggedInUserWithProfitLoss(userId):
-        conn=None
-        cursor=None
-        UserProfitLossdto=None
-        SELECT_PORTFOLIO_QUERY="SELECT h.symbol, h.quantity, h.avg_price, COALESCE(mp.current_price, h.avg_price) as current_price FROM holdings h LEFT JOIN market_prices mp ON h.symbol = mp.symbol WHERE h.user_id = %s AND h.quantity > 0"
+
+    def updateUserHoldings(order, userId, new_qty, round, new_avg):
+        conn = None
+        cursor = None
         try:
-            conn=ConnectionFactory.create_connection(
-                os.getenv("MYSQLHOST"),
-             os.getenv("MYSQLUSER"),
-             os.getenv("MYSQLPASSWORD"),
-             os.getenv("MYSQLDATABASE"),
-             os.getenv("MYSQLPORT", 3306)
-                
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'update_user_holdings'),
+                (new_qty, new_avg, userId, order.symbol)
             )
-            cursor=conn.cursor(dictionary=True)
-            cursor.execute(SELECT_PORTFOLIO_QUERY,(userId,))
-            userPortfolio=cursor.fetchall()
-            return userPortfolio
-            
-        except Exception as Ex:
-            raise Exception("Error in fetching data for Profit and Loss") from Ex
-                
+            conn.commit()
+        except Exception as ex:
+            if conn:
+                conn.rollback()
+            raise Exception("Error in holdings update") from ex
         finally:
             if cursor is not None:
                 cursor.close()
-            if conn is not None:           
+            if conn is not None:
                 conn.close()
- 
-       
-    def createTradeinOrderBook(conn,cursor,order,userId,orderId):
-        INSERT_ORDER_BOOK= """
-            INSERT INTO order_book
-            (user_id, symbol, side, order_type,
-            quantity, remaining_quantity, price, status, created_at, updated_at,order_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(),%s)
-         """
-    
+
+    def getPortfolioServiceforLoggedInUser(userId):
+        conn = None
+        cursor = None
         try:
-            
-            cursor.execute(INSERT_ORDER_BOOK,(
-                userId,
-                order.symbol,
-                order.side,
-                'LIMIT',
-                order.quantity,
-                order.quantity,
-                order.price,
-                'PENDING'
-                ,orderId
-                ))
-            orderId = cursor.lastrowid
-            return orderId
-        except Exception  as ex:
-                Exception("Error in Inserting Data") 
-            
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(QueryLoader.get('portfolio.yaml', 'select_user_portfolio'), (userId,))
+            return cursor.fetchall()
+        except Exception as ex:
+            raise Exception("Error in getting portfolio for logged in user")
         finally:
-                print("finally block of order book")
-            
-    
-    
-    def updateOrderBookQuantity(quantity,oredrBookId,status,buy_order_id, sell_order_id,cursor):
-        UPDATE_ORDER_BOOK_QUANTITY="update order_book set remaining_quantity=%s, status=%s where id in (%s,%s)"
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+    def getPortfolioOfLoggedInUserWithProfitLoss(userId):
+        conn = None
+        cursor = None
         try:
-            cursor.execute(UPDATE_ORDER_BOOK_QUANTITY,(quantity,status,buy_order_id,sell_order_id))
-            print("trade executed")    
-            
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(QueryLoader.get('portfolio.yaml', 'select_portfolio_with_pnl'), (userId,))
+            return cursor.fetchall()
+        except Exception as ex:
+            raise Exception("Error in fetching data for Profit and Loss") from ex
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+    def createTradeinOrderBook(conn, cursor, order, userId, orderId):
+        try:
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'insert_order_book'),
+                (userId, order.symbol, order.side, 'LIMIT',
+                 order.quantity, order.quantity, order.price, 'PENDING', orderId)
+            )
+            row = cursor.fetchone()
+            return row['id']
+        except Exception as ex:
+            raise Exception("Error in Inserting Data")
+        finally:
+            print("finally block of order book")
+
+    def updateOrderBookQuantity(quantity, orderBookId, status, buy_order_id, sell_order_id, cursor):
+        try:
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'update_order_book_quantity'),
+                (quantity, status, buy_order_id, sell_order_id)
+            )
+            print("trade executed")
         except Exception as ex:
             raise Exception("Error in updating orderBook")
-        
         finally:
             print("final block of update Order book")
-                  

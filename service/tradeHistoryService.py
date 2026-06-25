@@ -12,9 +12,10 @@ class TradeHistoryService:
                             quantity,
                             execution_price,
                             trade_value,
-                            cursor):
-        
-        
+                            cursor,
+                            user_id,
+                            side):
+
        return tradeHist.insertTradeHistoryOrders(buy_order_id,
                             sell_order_id,
                             buy_user_id,
@@ -23,7 +24,9 @@ class TradeHistoryService:
                             quantity,
                             execution_price,
                             trade_value,
-                            cursor)
+                            cursor,
+                            user_id,
+                            side)
         
 
     def getTradeOrdersById(userId):
