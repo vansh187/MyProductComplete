@@ -20,20 +20,24 @@ from marketengine.BreezeSessionManager import schedule_daily_refresh
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("App starting... Establishing Breeze session")
-    breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
-    breeze.generate_session(
-        api_secret=Config.BREEZE_SECRET_KEY,
-        session_token=Config.BREEZE_SESSION_TOKEN
-    )
-    app.state.breeze = breeze
-    print("Breeze session ready.")
-
-    # Daily background task: re-reads .env at 8:45 AM IST and refreshes session
-    refresh_task = asyncio.create_task(schedule_daily_refresh(app))
+    refresh_task = None
+    try:
+        breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
+        breeze.generate_session(
+            api_secret=Config.BREEZE_SECRET_KEY,
+            session_token=Config.BREEZE_SESSION_TOKEN
+        )
+        app.state.breeze = breeze
+        print("Breeze session ready.")
+        refresh_task = asyncio.create_task(schedule_daily_refresh(app))
+    except Exception as e:
+        app.state.breeze = None
+        print(f"[WARNING] Breeze session failed — market data endpoints will return 503: {e}")
 
     yield
 
-    refresh_task.cancel()
+    if refresh_task:
+        refresh_task.cancel()
     print("Server shutting down.")
 
 
