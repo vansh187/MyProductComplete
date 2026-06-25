@@ -1,0 +1,12 @@
+insert_trade_history: |
+  INSERT INTO trade_history
+    (user_id, symbol, side, quantity, execution_price, executed_at,
+     buy_order_id, sell_order_id, buy_user_id, sell_user_id, trade_value)
+  VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
+  RETURNING id
+
+get_trade_history_by_user: |
+  SELECT id, user_id, symbol, quantity, execution_price, executed_at
+  FROM trade_history
+  WHERE user_id = %s
+  ORDER BY executed_at DESC

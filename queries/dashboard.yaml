@@ -1,0 +1,34 @@
+select_order_counts: |
+  SELECT
+    COUNT(*) AS total_orders,
+    COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pending_orders,
+    COALESCE(SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END), 0) AS executed_orders,
+    COALESCE(SUM(CASE WHEN status = 'PARTIALLY_EXECUTED' THEN 1 ELSE 0 END), 0) AS partially_executed_orders,
+    COALESCE(SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled_orders,
+    COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed_orders
+  FROM orders
+  WHERE user_id = %s
+
+select_trade_counts: |
+  SELECT
+    COUNT(*) AS total_trades,
+    COALESCE(SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END), 0) AS buy_trades,
+    COALESCE(SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END), 0) AS sell_trades
+  FROM orders
+  WHERE user_id = %s
+
+select_holdings_summary: |
+  SELECT
+    COALESCE(SUM(p.quantity * p.avg_price), 0) AS total_invested,
+    COALESCE(SUM(p.quantity * mp.current_price), 0) AS total_holdings,
+    COALESCE(SUM((mp.current_price - p.avg_price) * p.quantity), 0) AS unrealized_pnl,
+    COALESCE(
+      (SUM(p.quantity * mp.current_price) - SUM(p.quantity * p.avg_price)) * 100.0
+      / NULLIF(SUM(p.quantity * p.avg_price), 0),
+      0
+    ) AS return_percentage,
+    COUNT(*) AS total_positions,
+    MAX(mp.updated_at) AS last_updated
+  FROM holdings p
+  INNER JOIN market_prices mp ON p.symbol = mp.symbol
+  WHERE p.user_id = %s AND p.quantity > 0

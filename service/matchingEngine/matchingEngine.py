@@ -9,16 +9,14 @@ class MatchingEngine:
     
     def execute(self,order, userId,cursor):
         matchingService=MatchingEngineService(order,userId,cursor)
-        ##this call will be replaced by real time NSE market
         if order.side == 'BUY':
-            print("NEW MATCHING ENGINE IMPORT LOADED")
             matchFound = matchingService.matchtradeOrderforUser(order, userId, 'SELL',cursor)
         elif order.side == 'SELL':
-             print("NEW MATCHING ENGINE IMPORT LOADED")
-             matchFound = matchingService.matchtradeOrderforUser(order, userId, 'BUY',cursor)
-        
-                
+            matchFound = matchingService.matchtradeOrderforUser(order, userId, 'BUY',cursor)
+        else:
+            return {"userId": userId, "tradeExcecution": []}
+
         if matchFound is None:
-                return None
-        elif matchFound :
-                return matchFound
+            return None
+        elif matchFound:
+            return matchFound

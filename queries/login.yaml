@@ -1,0 +1,4 @@
+get_user_by_email: |
+  SELECT *
+  FROM users
+  WHERE email = %(email)s

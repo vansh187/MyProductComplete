@@ -1,18 +1,18 @@
-from supabase import create_client, Client
+import psycopg2
+import psycopg2.extras
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
 class PostgresConnectionFactory:
-        @staticmethod
-        def test_connection():
-                SUPABASE_URL = os.getenv("SUPABASE_URL")
-                SUPABASE_KEY = os.getenv("POSTGRES_PUBLIC_KEY")
-                try:
-                        # Initialize the client
-                        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-                        print("Connection successful!")
-                        return supabase
-                except Exception as e:
-                        print("Connection failed!")
-                        print("Error details:", e)
+    @staticmethod
+    def create_connection():
+        conn = psycopg2.connect(
+            host=os.getenv("PGHOST", "localhost"),
+            port=int(os.getenv("PGPORT", 5432)),
+            user=os.getenv("PGUSER"),
+            password=os.getenv("PGPASSWORD"),
+            dbname=os.getenv("PGDATABASE")
+        )
+        return conn

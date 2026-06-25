@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -43,14 +43,13 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
 
 
 class OrderCreate(BaseModel):
-    
-    id:Optional[int]=None
+    id: Optional[int] = None
     symbol: str
-    side: str
+    side: Literal["BUY", "SELL"]
     quantity: int
     price: Decimal
     status: str
-    remainingQty:Optional[int]=None
+    remainingQty: Optional[int] = None
 
 @router.get("/getOrderById/{orderId}")
 def getOrderById(orderId:int,current_user=Depends(get_current_user)):

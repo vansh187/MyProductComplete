@@ -14,26 +14,23 @@ class OrderService:
             print(f"Order details: {order}")
             return a
 
-        def getorders(user_id):
-            # Here you would implement the logic to retrieve orders from the database
-            # For demonstration, we will just return a dummy list of orders
-            orders =orderPersistence.get_orders(user_id)
-            
+        def getorders(self, user_id):
+            orders = orderPersistence.get_orders(user_id)
             print(f"Retrieving orders for user_id: {user_id}")
             return orders
 
-        def getOrderById(userId,orderId):
-            order=orderPersistence.getOrderById(userId,orderId)
+        def getOrderById(self, userId, orderId):
+            order = orderPersistence.getOrderById(userId, orderId)
             print(f"Retrieving orders for user_id: {userId}")
-            return order  
+            return order
 
-        def cancelOrderById(userId,orderId):
-            order=orderPersistence.cancelOrderById(userId,orderId)
+        def cancelOrderById(self, userId, orderId):
+            order = orderPersistence.cancelOrderById(userId, orderId)
             if order is None:
-                print(f"only pending orders are allowed: {userId}") 
+                print(f"only pending orders are allowed: {userId}")
             else:
                 print(f"order cancelled for user_id: {userId}")
-            return order 
+            return order
 
         def updateStatus(self,user_id, symbol, status,buy_order_id, sell_order_id,cursor):
             portfolioPersistence.updateStatus(user_id, symbol, status,buy_order_id, sell_order_id,cursor)
