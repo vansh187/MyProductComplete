@@ -12,27 +12,39 @@ from api.Dashboard import router as dashboardRouter
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
 from fastapi.middleware.cors import CORSMiddleware
-from breeze_connect import BreezeConnect
-from marketengine.config import Config
-from marketengine.BreezeSessionManager import schedule_daily_refresh
+try:
+    from breeze_connect import BreezeConnect
+    from marketengine.config import Config
+    from marketengine.BreezeSessionManager import schedule_daily_refresh
+    _BREEZE_IMPORTABLE = True
+except Exception as _breeze_import_err:
+    BreezeConnect = None
+    Config = None
+    schedule_daily_refresh = None
+    _BREEZE_IMPORTABLE = False
+    print(f"[WARNING] breeze_connect import failed — market data disabled: {_breeze_import_err}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("App starting... Establishing Breeze session")
     refresh_task = None
-    try:
-        breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
-        breeze.generate_session(
-            api_secret=Config.BREEZE_SECRET_KEY,
-            session_token=Config.BREEZE_SESSION_TOKEN
-        )
-        app.state.breeze = breeze
-        print("Breeze session ready.")
-        refresh_task = asyncio.create_task(schedule_daily_refresh(app))
-    except Exception as e:
-        app.state.breeze = None
-        print(f"[WARNING] Breeze session failed — market data endpoints will return 503: {e}")
+    app.state.breeze = None
+
+    if _BREEZE_IMPORTABLE:
+        print("App starting... Establishing Breeze session")
+        try:
+            breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
+            breeze.generate_session(
+                api_secret=Config.BREEZE_SECRET_KEY,
+                session_token=Config.BREEZE_SESSION_TOKEN
+            )
+            app.state.breeze = breeze
+            print("Breeze session ready.")
+            refresh_task = asyncio.create_task(schedule_daily_refresh(app))
+        except Exception as e:
+            print(f"[WARNING] Breeze session failed — market data endpoints will return 503: {e}")
+    else:
+        print("App starting... Breeze unavailable, market data endpoints will return 503.")
 
     yield
 

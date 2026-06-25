@@ -136,12 +136,55 @@ def _get_breeze(request: Request):
     return breeze
 
 
-async def _fetch_sensex(loop) -> tuple[dict | None, dict | None]:
-    """Fetches Sensex via yfinance (^BSESN) — Breeze does not support BSE historical data."""
+async def _fetch_sensex(breeze, loop) -> tuple[dict | None, dict | None]:
+    """
+    Fetches Sensex via Breeze get_historical_data_v2 (supports BSE).
+    Falls back to yfinance if Breeze returns no data.
+    Breeze stock_code for Sensex is BSESEN (from breeze_connect config.py).
+    """
+    trading_day = _last_trading_day()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: breeze.get_historical_data_v2(
+                interval="1minute",
+                from_date=f"{trading_day}T09:15:00.000Z",
+                to_date=f"{trading_day}T15:30:00.000Z",
+                stock_code="BSESEN",
+                exchange_code="BSE",
+                product_type="cash"
+            )
+        )
+
+        if response and response.get("Status") == 200:
+            data = response.get("Success") or []
+            if data:
+                latest     = data[-1]
+                open_val   = _safe_float(latest.get("open"))
+                close_val  = _safe_float(latest.get("close"))
+                change     = round(close_val - open_val, 2)
+                change_pct = round((change / open_val) * 100, 2) if open_val else 0.0
+                return {
+                    "name":        "Sensex",
+                    "stock_code":  "BSESEN",
+                    "exchange":    "BSE",
+                    "value":       close_val,
+                    "open":        open_val,
+                    "high":        _safe_float(latest.get("high")),
+                    "low":         _safe_float(latest.get("low")),
+                    "change":      change,
+                    "change_pct":  change_pct,
+                    "as_of":       latest.get("datetime"),
+                }, None
+
+        print(f"[Breeze] Sensex BSESEN fallback to yfinance: {response}")
+
+    except Exception as e:
+        print(f"[Breeze] Sensex BSESEN exception, falling back to yfinance: {e}")
+
+    # Fallback: yfinance
     def _get() -> dict:
         fi = yf.Ticker("^BSESN").fast_info
-        # Access all attributes inside the executor — fast_info is lazily loaded
-        # and touching attributes outside would block the event loop thread.
         return {
             "last_price":     fi.last_price,
             "previous_close": fi.previous_close,
@@ -157,7 +200,6 @@ async def _fetch_sensex(loop) -> tuple[dict | None, dict | None]:
         open_val   = _safe_float(raw["open"])
         change     = round(ltp - prev_close, 2)
         change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
-
         return {
             "name":        "Sensex",
             "stock_code":  "^BSESN",
@@ -172,8 +214,8 @@ async def _fetch_sensex(loop) -> tuple[dict | None, dict | None]:
         }, None
 
     except Exception as e:
-        print(f"[yfinance] Exception for Sensex: {e}")
-        return None, {"index": "Sensex", "stock_code": "^BSESN", "reason": str(e)}
+        print(f"[yfinance] Sensex fallback also failed: {e}")
+        return None, {"index": "Sensex", "stock_code": "BSESEN", "reason": str(e)}
 
 
 async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
@@ -233,8 +275,8 @@ async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
             print(f"[Breeze] Exception for index {stock_code}: {e}")
             errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": str(e)})
 
-    # Fetch Sensex via yfinance — Breeze does not support BSE exchange
-    sensex, sensex_err = await _fetch_sensex(loop)
+    # Fetch Sensex via Breeze get_historical_data_v2 (BSE supported) with yfinance fallback
+    sensex, sensex_err = await _fetch_sensex(breeze, loop)
     if sensex:
         results.insert(1, sensex)   # slot it after Nifty 50
     if sensex_err:
