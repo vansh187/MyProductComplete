@@ -12,11 +12,12 @@ class LoginService:
         user = self._persistence.login_user(login_request)
         if user is None:
             raise ValueError("Invalid credentials")
-        elif not verify_password(login_request.password, user['password']):
+        if user['password'] == 'GOOGLE_AUTH':
+            raise ValueError("This account was created with Google Sign-In. Please use the Google login button.")
+        if not verify_password(login_request.password, user['password']):
             raise ValueError("Invalid credentials")
-        else:
-            usertoken = create_access_token({
-                "sub": login_request.email,
-                "user_id": user['user_id']
-            })
-            return usertoken
+        usertoken = create_access_token({
+            "sub": login_request.email,
+            "user_id": user['user_id']
+        })
+        return usertoken
