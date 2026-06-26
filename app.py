@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from api.Dashboard import router as dashboardRouter
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
+from api.auth_google import router as googleAuthRouter
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -63,6 +64,7 @@ app.include_router(dashboardRouter)
 app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)
 app.include_router(marketQuotesRouter)
+app.include_router(googleAuthRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],

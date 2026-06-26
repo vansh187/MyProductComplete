@@ -2,6 +2,7 @@ select_holdings: |
   SELECT quantity, avg_price
   FROM holdings
   WHERE user_id = %s AND symbol = %s
+  FOR UPDATE NOWAIT
 
 update_holdings: |
   UPDATE holdings
@@ -45,7 +46,12 @@ insert_order_book: |
   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
   RETURNING id
 
-update_order_book_quantity: |
+update_counterparty_order_book: |
   UPDATE order_book
-  SET remaining_quantity = %s, status = %s
-  WHERE id IN (%s, %s)
+  SET remaining_quantity = %s, status = %s, updated_at = NOW()
+  WHERE order_id = %s
+
+update_incoming_order_book: |
+  UPDATE order_book
+  SET remaining_quantity = %s, status = %s, updated_at = NOW()
+  WHERE id = %s
