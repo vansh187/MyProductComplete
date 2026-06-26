@@ -4,5 +4,5 @@ insert_user: |
 
 insert_google_user: |
   INSERT INTO users (first_name, last_name, email, password, phone_number, created_at)
-  VALUES (%s, %s, %s, NULL, '', NOW())
+  VALUES (%s, %s, %s, 'GOOGLE_AUTH', '', NOW())
   RETURNING user_id
