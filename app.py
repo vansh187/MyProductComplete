@@ -72,6 +72,6 @@ app.add_middleware(
 )
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"Message": "Finnaly I am able to run my first API"}

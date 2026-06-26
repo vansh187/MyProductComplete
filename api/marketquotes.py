@@ -5,7 +5,6 @@ from typing import List
 import asyncio
 import json
 import math
-import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -121,8 +120,9 @@ def _build_response(stocks: list[dict], errors: list[dict] | None = None) -> dic
     }
 
 
-_INDICES = [
+_ALL_INDICES = [
     {"display_name": "Nifty 50",   "stock_code": "NIFTY",   "exchange_code": "NSE"},
+    {"display_name": "Sensex",     "stock_code": "BSESEN",  "exchange_code": "BSE"},
     {"display_name": "Bank Nifty", "stock_code": "CNXBAN",  "exchange_code": "NSE"},
     {"display_name": "India VIX",  "stock_code": "INDVIX",  "exchange_code": "NSE"},
 ]
@@ -136,86 +136,56 @@ def _get_breeze(request: Request):
     return breeze
 
 
-async def _fetch_sensex(breeze, loop) -> tuple[dict | None, dict | None]:
+def _parse_get_quotes(q: dict) -> dict | None:
     """
-    Fetches Sensex via Breeze get_historical_data_v2 (supports BSE).
-    Falls back to yfinance if Breeze returns no data.
-    Breeze stock_code for Sensex is BSESEN (from breeze_connect config.py).
+    Parse a Breeze get_quotes record.
+    Returns None when ltp is zero (Breeze returned no real data, e.g. BSESEN on BSE).
+    Correct field names from live response: ltp, open, high, low, previous_close, ltp_percent_change.
     """
-    trading_day = _last_trading_day()
-    try:
-        response = await loop.run_in_executor(
-            None,
-            lambda: breeze.get_historical_data_v2(
-                interval="1minute",
-                from_date=f"{trading_day}T09:15:00.000Z",
-                to_date=f"{trading_day}T15:30:00.000Z",
-                stock_code="BSESEN",
-                exchange_code="BSE",
-                product_type="cash"
-            )
-        )
+    ltp = _safe_float(q.get("ltp"))
+    if ltp == 0:
+        return None
+    prev_close = _safe_float(q.get("previous_close"))
+    change     = round(ltp - prev_close, 2)
+    raw_pct    = q.get("ltp_percent_change")
+    change_pct = round(float(raw_pct) if raw_pct not in (None, "") else ((change / prev_close * 100) if prev_close else 0.0), 2)
+    return {
+        "ltp":        ltp,
+        "open":       _safe_float(q.get("open")),
+        "high":       _safe_float(q.get("high")),
+        "low":        _safe_float(q.get("low")),
+        "change":     change,
+        "change_pct": change_pct,
+        "as_of":      q.get("ltt"),
+    }
 
-        if response and response.get("Status") == 200:
-            data = response.get("Success") or []
-            if data:
-                latest     = data[-1]
-                open_val   = _safe_float(latest.get("open"))
-                close_val  = _safe_float(latest.get("close"))
-                change     = round(close_val - open_val, 2)
-                change_pct = round((change / open_val) * 100, 2) if open_val else 0.0
-                return {
-                    "name":        "Sensex",
-                    "stock_code":  "BSESEN",
-                    "exchange":    "BSE",
-                    "value":       close_val,
-                    "open":        open_val,
-                    "high":        _safe_float(latest.get("high")),
-                    "low":         _safe_float(latest.get("low")),
-                    "change":      change,
-                    "change_pct":  change_pct,
-                    "as_of":       latest.get("datetime"),
-                }, None
 
-        print(f"[Breeze] Sensex BSESEN fallback to yfinance: {response}")
-
-    except Exception as e:
-        print(f"[Breeze] Sensex BSESEN exception, falling back to yfinance: {e}")
-
-    # Fallback: yfinance
-    def _get() -> dict:
-        fi = yf.Ticker("^BSESN").fast_info
-        return {
-            "last_price":     fi.last_price,
-            "previous_close": fi.previous_close,
-            "open":           fi.open,
-            "day_high":       fi.day_high,
-            "day_low":        fi.day_low,
-        }
-
-    try:
-        raw        = await loop.run_in_executor(None, _get)
-        ltp        = _safe_float(raw["last_price"])
-        prev_close = _safe_float(raw["previous_close"])
-        open_val   = _safe_float(raw["open"])
-        change     = round(ltp - prev_close, 2)
-        change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
-        return {
-            "name":        "Sensex",
-            "stock_code":  "^BSESN",
-            "exchange":    "BSE",
-            "value":       ltp,
-            "open":        open_val,
-            "high":        _safe_float(raw["day_high"]),
-            "low":         _safe_float(raw["day_low"]),
-            "change":      change,
-            "change_pct":  change_pct,
-            "as_of":       None,
-        }, None
-
-    except Exception as e:
-        print(f"[yfinance] Sensex fallback also failed: {e}")
-        return None, {"index": "Sensex", "stock_code": "BSESEN", "reason": str(e)}
+def _parse_historical(data: list) -> dict | None:
+    """
+    Parse Breeze get_historical_data 1-minute candles into a quote dict.
+    Uses the first candle's open as day open, last candle's close as current price,
+    and max/min across all candles for day high/low.
+    """
+    if not data:
+        return None
+    day_open  = _safe_float(data[0].get("open"))
+    close_val = _safe_float(data[-1].get("close"))
+    if close_val == 0:
+        return None
+    day_high   = max((_safe_float(c.get("high")) for c in data), default=0.0)
+    low_vals   = [_safe_float(c.get("low")) for c in data if _safe_float(c.get("low")) > 0]
+    day_low    = min(low_vals) if low_vals else 0.0
+    change     = round(close_val - day_open, 2)
+    change_pct = round((change / day_open) * 100, 2) if day_open else 0.0
+    return {
+        "ltp":        close_val,
+        "open":       day_open,
+        "high":       day_high,
+        "low":        day_low,
+        "change":     change,
+        "change_pct": change_pct,
+        "as_of":      data[-1].get("datetime"),
+    }
 
 
 async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
@@ -224,63 +194,61 @@ async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
     results     = []
     errors      = []
 
-    for idx in _INDICES:
+    for idx in _ALL_INDICES:
         stock_code    = idx["stock_code"]
         exchange_code = idx["exchange_code"]
+        quote         = None
         try:
-            response = await loop.run_in_executor(
+            # Primary: get_quotes (single call, returns day OHLC + ltp)
+            resp = await loop.run_in_executor(
                 None,
-                lambda sc=stock_code, ex=exchange_code: breeze.get_historical_data(
-                    interval="1minute",
-                    from_date=f"{trading_day}T09:15:00.000Z",
-                    to_date=f"{trading_day}T15:30:00.000Z",
-                    stock_code=sc,
-                    exchange_code=ex,
-                    product_type="cash"
+                lambda sc=stock_code, ex=exchange_code: breeze.get_quotes(
+                    stock_code=sc, exchange_code=ex, product_type="cash"
                 )
             )
-
-            if not response or response.get("Status") != 200:
-                reason = (response or {}).get("Error") or f"Status {(response or {}).get('Status')}"
-                print(f"[Breeze] Non-200 for index {stock_code}: {response}")
-                errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": reason})
-                continue
-
-            data = response.get("Success") or []
-            if not data:
-                print(f"[Breeze] Empty data for index {stock_code} on {trading_day}")
-                errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": "no_data"})
-                continue
-
-            latest     = data[-1]
-            open_val   = _safe_float(latest.get("open"))
-            close_val  = _safe_float(latest.get("close"))
-            change     = round(close_val - open_val, 2)
-            change_pct = round((change / open_val) * 100, 2) if open_val else 0.0
-
-            results.append({
-                "name":        idx["display_name"],
-                "stock_code":  stock_code,
-                "exchange":    exchange_code,
-                "value":       close_val,
-                "open":        open_val,
-                "high":        _safe_float(latest.get("high")),
-                "low":         _safe_float(latest.get("low")),
-                "change":      change,
-                "change_pct":  change_pct,
-                "as_of":       latest.get("datetime"),
-            })
-
+            data = (resp or {}).get("Success") or [] if (resp or {}).get("Status") == 200 else []
+            if data:
+                quote = _parse_get_quotes(data[0])
         except Exception as e:
-            print(f"[Breeze] Exception for index {stock_code}: {e}")
-            errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": str(e)})
+            print(f"[Breeze] get_quotes failed for {stock_code}: {e}")
 
-    # Fetch Sensex via Breeze get_historical_data_v2 (BSE supported) with yfinance fallback
-    sensex, sensex_err = await _fetch_sensex(breeze, loop)
-    if sensex:
-        results.insert(1, sensex)   # slot it after Nifty 50
-    if sensex_err:
-        errors.append(sensex_err)
+        # Fallback for NSE indices: get_historical_data 1-minute candles
+        if quote is None and exchange_code == "NSE":
+            try:
+                print(f"[Breeze] Falling back to historical for {stock_code}")
+                resp2 = await loop.run_in_executor(
+                    None,
+                    lambda sc=stock_code: breeze.get_historical_data(
+                        interval="1minute",
+                        from_date=f"{trading_day}T09:15:00.000Z",
+                        to_date=f"{trading_day}T15:30:00.000Z",
+                        stock_code=sc,
+                        exchange_code="NSE",
+                        product_type="cash"
+                    )
+                )
+                hist = (resp2 or {}).get("Success") or [] if (resp2 or {}).get("Status") == 200 else []
+                quote = _parse_historical(hist)
+            except Exception as e:
+                print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
+
+        if quote is None:
+            print(f"[Breeze] No data for {stock_code}, omitting from response")
+            errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": "no_data"})
+            continue
+
+        results.append({
+            "name":       idx["display_name"],
+            "stock_code": stock_code,
+            "exchange":   exchange_code,
+            "value":      quote["ltp"],
+            "open":       quote["open"],
+            "high":       quote["high"],
+            "low":        quote["low"],
+            "change":     quote["change"],
+            "change_pct": quote["change_pct"],
+            "as_of":      quote.get("as_of"),
+        })
 
     return results, errors
 
