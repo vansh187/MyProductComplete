@@ -8,6 +8,10 @@ from service.walletbalance.WalletBalanceService import WalletBalanceService
 
 router = APIRouter()
 
+class WalletLedger(BaseModel):
+    amount: Decimal = Decimal("0.0")
+    currency: str = None
+
 @router.post("/v1/addFundsToWallet")
 def addFundsToWallet(walletLedger: WalletLedger, background_tasks: BackgroundTasks, current_user=Depends(get_current_user)):
     print("Adding funds")
@@ -27,9 +31,4 @@ def getWalletBalance(current_user=Depends(get_current_user)):
         return {"user_id": walletBalance["user_id"], "balance": walletBalance["balance"]}
     except Exception as ex:
         raise HTTPException(status_code=500, detail=f"Failed to fetch wallet balance: {str(ex)}")
-
-
-class WalletLedger(BaseModel):
-    amount: Decimal = Decimal("0.0")
-    currency: str = None
 

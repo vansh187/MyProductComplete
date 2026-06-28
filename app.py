@@ -1,6 +1,5 @@
 import asyncio
 from fastapi import FastAPI
-from pydantic import BaseModel
 from api.signup import router as signup_router
 from api.login import router as login_router
 from api.orders import router as orders_router
@@ -12,6 +11,7 @@ from api.Dashboard import router as dashboardRouter
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
 from api.auth_google import router as googleAuthRouter
+from api.admin_shoonya import router as adminShoonyaRouter
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -25,12 +25,45 @@ except Exception as _breeze_import_err:
     _BREEZE_IMPORTABLE = False
     print(f"[WARNING] breeze_connect import failed — market data disabled: {_breeze_import_err}")
 
+try:
+    from marketengine.ShoonyaConnection import ShoonyaConnection, schedule_daily_refresh as shoonya_daily_refresh
+    _SHOONYA_IMPORTABLE = True
+except Exception as _shoonya_import_err:
+    ShoonyaConnection = None
+    shoonya_daily_refresh = None
+    _SHOONYA_IMPORTABLE = False
+    print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    refresh_task = None
-    app.state.breeze = None
+    refresh_task        = None
+    shoonya_refresh_task = None
+    app.state.breeze    = None
+    app.state.shoonya   = None
 
+    # ── Shoonya (primary indices provider) ───────────────────────────
+    if _SHOONYA_IMPORTABLE:
+        try:
+            shoonya = ShoonyaConnection()
+            if shoonya.connect():
+                app.state.shoonya = shoonya
+            else:
+                print("[WARNING] Shoonya stored token invalid — attempting auto-login...")
+                loop = asyncio.get_running_loop()
+                ok   = await loop.run_in_executor(None, shoonya.auto_login)
+                if ok:
+                    app.state.shoonya = shoonya
+                else:
+                    print("[WARNING] Shoonya auto-login failed — indices will fall back to Breeze")
+            if app.state.shoonya:
+                shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
+        except Exception as e:
+            print(f"[WARNING] Shoonya init error: {e}")
+    else:
+        print("App starting... Shoonya unavailable.")
+
+    # ── Breeze (secondary / stock quotes) ────────────────────────────
     if _BREEZE_IMPORTABLE:
         print("App starting... Establishing Breeze session")
         try:
@@ -43,14 +76,16 @@ async def lifespan(app: FastAPI):
             print("Breeze session ready.")
             refresh_task = asyncio.create_task(schedule_daily_refresh(app))
         except Exception as e:
-            print(f"[WARNING] Breeze session failed — market data endpoints will return 503: {e}")
+            print(f"[WARNING] Breeze session failed — stock quotes will be unavailable: {e}")
     else:
-        print("App starting... Breeze unavailable, market data endpoints will return 503.")
+        print("App starting... Breeze unavailable.")
 
     yield
 
     if refresh_task:
         refresh_task.cancel()
+    if shoonya_refresh_task:
+        shoonya_refresh_task.cancel()
     print("Server shutting down.")
 
 
@@ -65,6 +100,7 @@ app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)
 app.include_router(marketQuotesRouter)
 app.include_router(googleAuthRouter)
+app.include_router(adminShoonyaRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],

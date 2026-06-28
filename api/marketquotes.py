@@ -121,11 +121,36 @@ def _build_response(stocks: list[dict], errors: list[dict] | None = None) -> dic
 
 
 _ALL_INDICES = [
-    {"display_name": "Nifty 50",   "stock_code": "NIFTY",   "exchange_code": "NSE"},
-    {"display_name": "Sensex",     "stock_code": "BSESEN",  "exchange_code": "BSE"},
-    {"display_name": "Bank Nifty", "stock_code": "CNXBAN",  "exchange_code": "NSE"},
-    {"display_name": "India VIX",  "stock_code": "INDVIX",  "exchange_code": "NSE"},
+    {
+        "display_name": "Nifty 50",
+        "stock_code": "NIFTY", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26000",
+    },
+    {
+        "display_name": "Sensex",
+        "stock_code": "BSESEN", "exchange_code": "BSE",
+        "shoonya_exchange": "BSE", "shoonya_token": "1",
+    },
+    {
+        "display_name": "Bank Nifty",
+        "stock_code": "CNXBAN", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26009",
+    },
+    {
+        "display_name": "India VIX",
+        "stock_code": "INDVIX", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26017",
+    },
 ]
+
+
+def _get_market_clients(request: Request) -> tuple:
+    """Returns (shoonya, breeze). Raises 503 only when both are unavailable."""
+    shoonya = getattr(request.app.state, "shoonya", None)
+    breeze  = getattr(request.app.state, "breeze", None)
+    if shoonya is None and breeze is None:
+        raise HTTPException(status_code=503, detail="Market data service is not ready. Try again shortly.")
+    return shoonya, breeze
 
 
 def _get_breeze(request: Request):
@@ -188,7 +213,7 @@ def _parse_historical(data: list) -> dict | None:
     }
 
 
-async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
+async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
     trading_day = _last_trading_day()
     loop        = asyncio.get_running_loop()
     results     = []
@@ -198,22 +223,40 @@ async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
         stock_code    = idx["stock_code"]
         exchange_code = idx["exchange_code"]
         quote         = None
-        try:
-            # Primary: get_quotes (single call, returns day OHLC + ltp)
-            resp = await loop.run_in_executor(
-                None,
-                lambda sc=stock_code, ex=exchange_code: breeze.get_quotes(
-                    stock_code=sc, exchange_code=ex, product_type="cash"
-                )
-            )
-            data = (resp or {}).get("Success") or [] if (resp or {}).get("Status") == 200 else []
-            if data:
-                quote = _parse_get_quotes(data[0])
-        except Exception as e:
-            print(f"[Breeze] get_quotes failed for {stock_code}: {e}")
+        source        = None
 
-        # Fallback for NSE indices: get_historical_data 1-minute candles
-        if quote is None and exchange_code == "NSE":
+        # ── Primary: Shoonya ──────────────────────────────────────────
+        if shoonya is not None and shoonya.is_connected:
+            try:
+                quote = await loop.run_in_executor(
+                    None,
+                    lambda ex=idx["shoonya_exchange"], tk=idx["shoonya_token"]:
+                        shoonya.get_index_quote(ex, tk)
+                )
+                if quote:
+                    source = "shoonya"
+            except Exception as e:
+                print(f"[Shoonya] Exception for {stock_code}: {e}")
+
+        # ── Fallback 1: Breeze get_quotes ─────────────────────────────
+        if quote is None and breeze is not None:
+            try:
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda sc=stock_code, ex=exchange_code: breeze.get_quotes(
+                        stock_code=sc, exchange_code=ex, product_type="cash"
+                    )
+                )
+                data = (resp or {}).get("Success") or [] if (resp or {}).get("Status") == 200 else []
+                if data:
+                    quote = _parse_get_quotes(data[0])
+                    if quote:
+                        source = "breeze"
+            except Exception as e:
+                print(f"[Breeze] get_quotes failed for {stock_code}: {e}")
+
+        # ── Fallback 2: Breeze historical (NSE only) ──────────────────
+        if quote is None and breeze is not None and exchange_code == "NSE":
             try:
                 print(f"[Breeze] Falling back to historical for {stock_code}")
                 resp2 = await loop.run_in_executor(
@@ -229,11 +272,13 @@ async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
                 )
                 hist = (resp2 or {}).get("Success") or [] if (resp2 or {}).get("Status") == 200 else []
                 quote = _parse_historical(hist)
+                if quote:
+                    source = "breeze_historical"
             except Exception as e:
                 print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
 
         if quote is None:
-            print(f"[Breeze] No data for {stock_code}, omitting from response")
+            print(f"No data for {stock_code} from any provider")
             errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": "no_data"})
             continue
 
@@ -248,6 +293,7 @@ async def _fetch_indices(breeze) -> tuple[list[dict], list[dict]]:
             "change":     quote["change"],
             "change_pct": quote["change_pct"],
             "as_of":      quote.get("as_of"),
+            "source":     source,
         })
 
     return results, errors
@@ -277,10 +323,10 @@ def _normalize_stock(item: dict) -> dict:
 async def get_market_indices(request: Request):
     """
     Returns the latest values for Nifty 50, Sensex, Bank Nifty, and India VIX.
-    When market is closed, returns the last available candle from the previous session.
+    Shoonya is the primary provider; Breeze is the fallback.
     """
-    breeze = _get_breeze(request)
-    indices, errors = await _fetch_indices(breeze)
+    shoonya, breeze = _get_market_clients(request)
+    indices, errors = await _fetch_indices(shoonya, breeze)
     return {
         "market_status": "open" if _is_market_open() else "closed",
         "indices":       indices,
@@ -303,13 +349,13 @@ async def get_marquee(
     GET /api/market/marquee
     GET /api/market/marquee?symbols=RELIANCE&symbols=INFY&symbols=HDFCBANK
     """
-    breeze = _get_breeze(request)
+    shoonya, breeze = _get_market_clients(request)
 
     async def _no_stocks():
         return [], []
 
-    index_task = _fetch_indices(breeze)
-    stock_task = _fetch_quotes(breeze, symbols) if symbols else _no_stocks()
+    index_task = _fetch_indices(shoonya, breeze)
+    stock_task = _fetch_quotes(breeze, symbols) if (symbols and breeze) else _no_stocks()
 
     results = await asyncio.gather(index_task, stock_task, return_exceptions=True)
 
