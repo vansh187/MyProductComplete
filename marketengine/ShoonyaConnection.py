@@ -281,10 +281,14 @@ class ShoonyaConnection:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--log-level=3")
+        # --no-sandbox is required on Linux servers (GCP/Azure/Render); safe to add on all platforms
+        if os.name != "nt":
+            options.add_argument("--no-sandbox")
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
-        # Use D: drive for ChromeDriver cache to avoid filling C:
-        wdm_root = os.environ.get("WDM_CACHE_PATH", "D:\\webdriver_cache")
+        # Cache path: D: drive on Windows (C: full), /tmp on Linux
+        default_cache = "D:\\webdriver_cache" if os.name == "nt" else "/tmp/webdriver_cache"
+        wdm_root = os.environ.get("WDM_CACHE_PATH", default_cache)
         os.makedirs(wdm_root, exist_ok=True)
         _cache = DriverCacheManager(root_dir=wdm_root)
 
