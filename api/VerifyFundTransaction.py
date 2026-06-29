@@ -6,6 +6,11 @@ import json
 from utils.auth_dependency import get_current_user
 router=APIRouter()
 
+class VeriFyTransaction(BaseModel):
+    razorpay_order_id: str=None
+    razorpay_payment_id: str=None
+    razorpay_signature: str=None
+
 @router.post("/v1/VerifyFundPayements")
 def verifyFundPayments(payload:VeriFyTransaction,background_tasks: BackgroundTasks,currentUser=Depends(get_current_user)):
     userId=currentUser["user_id"]
@@ -67,9 +72,3 @@ def process_webhook_data_in_background(event_data: dict):
         except Exception as ex:
             print(f"Exception occurred while processing webhook: {ex}")
             raise Exception("Exception Occured while verifying webhooks")
-
-
-class VeriFyTransaction(BaseModel):
-    razorpay_order_id: str=None
-    razorpay_payment_id: str=None
-    razorpay_signature: str=None

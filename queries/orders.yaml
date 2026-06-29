@@ -22,3 +22,8 @@ update_order_status: |
   UPDATE orders
   SET status = %s
   WHERE id IN (%s, %s)
+
+update_order_status_single: |
+  UPDATE orders
+  SET status = %s
+  WHERE id = %s

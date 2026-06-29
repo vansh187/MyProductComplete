@@ -14,6 +14,15 @@ from decimal import Decimal
 #from service.portfolioService import process_buy as service_process_sell
 router = APIRouter()
 
+class OrderCreate(BaseModel):
+    id: Optional[int] = None
+    symbol: str
+    side: Literal["BUY", "SELL"]
+    quantity: int
+    price: Decimal
+    status: str
+    remainingQty: Optional[int] = None
+
 @router.get("/orders")
 def get_orders(current_user=Depends(get_current_user)):
     user_id = current_user["user_id"]
@@ -41,15 +50,6 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
    
     return status
 
-
-class OrderCreate(BaseModel):
-    id: Optional[int] = None
-    symbol: str
-    side: Literal["BUY", "SELL"]
-    quantity: int
-    price: Decimal
-    status: str
-    remainingQty: Optional[int] = None
 
 @router.get("/getOrderById/{orderId}")
 def getOrderById(orderId:int,current_user=Depends(get_current_user)):

@@ -22,6 +22,8 @@ cycler==0.12.1
 deprecation==2.1.0
 ecdsa==0.19.2
 fastapi==0.136.3
+google-auth==2.55.1
+pyasn1-modules==0.4.2
 fonttools==4.63.0
 frozenlist==1.8.0
 h11==0.16.0
@@ -62,6 +64,10 @@ python-jose==3.5.0
 python-socketio==5.16.3
 pytz==2026.2
 PyYAML==6.0.3
+NorenRestApiOAuth==0.0.38
+pyotp==2.10.0
+selenium>=4.15.0
+webdriver-manager>=4.0.0
 razorpay==2.0.1
 realtime==2.31.0
 redis==8.0.0

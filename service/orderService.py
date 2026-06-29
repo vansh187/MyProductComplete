@@ -35,3 +35,6 @@ class OrderService:
         def updateStatus(self,user_id, symbol, status,buy_order_id, sell_order_id,cursor):
             portfolioPersistence.updateStatus(user_id, symbol, status,buy_order_id, sell_order_id,cursor)
 
+        def updateOrderStatusSingle(self, status, order_id, cursor):
+            portfolioPersistence.updateOrderStatusSingle(status, order_id, cursor)
+

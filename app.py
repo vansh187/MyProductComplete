@@ -1,5 +1,5 @@
-from fastapi import FastAPI,HTTPException
-from pydantic import BaseModel
+import asyncio
+from fastapi import FastAPI
 from api.signup import router as signup_router
 from api.login import router as login_router
 from api.orders import router as orders_router
@@ -7,74 +7,91 @@ from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
 from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
-from scheduler.marketPriceSchedular import MarketPriceScheduler
-#from database.redisConnection import RedisConnection
 from api.Dashboard import router as dashboardRouter
-from marketengine.AlphaVantageprovider import AlphaVantageProvider
-from marketengine.BreezeProvider import BreezeMarketProvider
-import asyncio
-from repository.MarketRepository import MarketRepository as market_repo
 from api.AddfundstoWallet import router as razorPayPaymentRouter
+from api.marketquotes import router as marketQuotesRouter
+from api.auth_google import router as googleAuthRouter
+from api.admin_shoonya import router as adminShoonyaRouter
 from fastapi.middleware.cors import CORSMiddleware
+try:
+    from breeze_connect import BreezeConnect
+    from marketengine.config import Config
+    from marketengine.BreezeSessionManager import schedule_daily_refresh
+    _BREEZE_IMPORTABLE = True
+except Exception as _breeze_import_err:
+    BreezeConnect = None
+    Config = None
+    schedule_daily_refresh = None
+    _BREEZE_IMPORTABLE = False
+    print(f"[WARNING] breeze_connect import failed — market data disabled: {_breeze_import_err}")
 
-
-async def on_market_tick_received(tick: dict):
-    symbol = tick.get("stock_code")
-    if symbol:
-        # Save straight to our shared memory map component
-        payload ={
-            "exchange_code": tick["exchange_code"],
-            "volume": tick["volume"],
-            "open" : tick["open"],
-            "close" : tick["close"],
-            "timestamp": tick["timestamp"]
-        }
-        
-        
-        """{
-            "ltp": 23560.75,         
-            "volume": 4520,           
-            "timestamp": 1781811984   
-        }"""
-        
-        await market_repo.save_live_tick(symbol, payload)
-        print(f"[Memory Cached] {symbol} -> {tick['exchange_code']}")
+try:
+    from marketengine.ShoonyaConnection import ShoonyaConnection, schedule_daily_refresh as shoonya_daily_refresh
+    _SHOONYA_IMPORTABLE = True
+except Exception as _shoonya_import_err:
+    ShoonyaConnection = None
+    shoonya_daily_refresh = None
+    _SHOONYA_IMPORTABLE = False
+    print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("App starting... Initializing Market Engine Background Services")
-    engine = AlphaVantageProvider()
-    await engine.connect()
-    # 1. Register your internal adapter method reference cleanly
-    engine.on_tick(on_market_tick_received)
+    refresh_task        = None
+    shoonya_refresh_task = None
+    app.state.breeze    = None
+    app.state.shoonya   = None
 
-    watchlist = ["RELIND", "INFTEC","TANCAM"]
+    # ── Shoonya (primary indices provider) ───────────────────────────
+    if _SHOONYA_IMPORTABLE:
+        try:
+            shoonya = ShoonyaConnection()
+            if shoonya.connect():
+                app.state.shoonya = shoonya
+            else:
+                print("[WARNING] Shoonya stored token invalid — attempting auto-login...")
+                loop = asyncio.get_running_loop()
+                ok   = await loop.run_in_executor(None, shoonya.auto_login)
+                if ok:
+                    app.state.shoonya = shoonya
+                else:
+                    print("[WARNING] Shoonya auto-login failed — indices will fall back to Breeze")
+            if app.state.shoonya:
+                shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
+        except Exception as e:
+            print(f"[WARNING] Shoonya init error: {e}")
+    else:
+        print("App starting... Shoonya unavailable.")
 
-    market_task = asyncio.create_task(engine.subscribe(watchlist))
-    
+    # ── Breeze (secondary / stock quotes) ────────────────────────────
+    if app.state.shoonya is not None:
+        print("App starting... Breeze skipped (Shoonya is primary).")
+    elif _BREEZE_IMPORTABLE:
+        print("App starting... Establishing Breeze session")
+        try:
+            breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
+            breeze.generate_session(
+                api_secret=Config.BREEZE_SECRET_KEY,
+                session_token=Config.BREEZE_SESSION_TOKEN
+            )
+            app.state.breeze = breeze
+            print("Breeze session ready.")
+            refresh_task = asyncio.create_task(schedule_daily_refresh(app))
+        except Exception as e:
+            print(f"[WARNING] Breeze session failed — stock quotes will be unavailable: {e}")
+    else:
+        print("App starting... Breeze unavailable.")
+
     yield
-    print("Terminating background HTTP data sessions...")
-    if engine._session and not engine._session.closed:
-        await engine._session.close()
-    
-    try:
-        # Wait for the task to acknowledge the cancellation cleanly
-        await market_task
-    except asyncio.CancelledError:
-        print("Background market task safely terminated.")
-    except Exception as e:
-        print(f"Unexpected error while tearing down engine: {e}")
-        
-    print("Cleanup complete. Server offline.")
-    
-    """#MarketPriceScheduler.start()
-    print("App starting... Scheduler initialized")
-    yield
-    # ---- shutdown ----
-    print("App shutting down...")"""
 
-app=FastAPI(lifespan=lifespan)
+    if refresh_task:
+        refresh_task.cancel()
+    if shoonya_refresh_task:
+        shoonya_refresh_task.cancel()
+    print("Server shutting down.")
+
+
+app = FastAPI(lifespan=lifespan)
 app.include_router(orders_router)
 app.include_router(signup_router)
 app.include_router(login_router)
@@ -83,21 +100,25 @@ app.include_router(user_portfolio)
 app.include_router(dashboardRouter)
 app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)
+app.include_router(marketQuotesRouter)
+app.include_router(googleAuthRouter)
+app.include_router(adminShoonyaRouter)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","https://myproductreact.onrender.com","https://primepiptrade.com","https://www.primepiptrade.com"], # Your React dev server URL
+    allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],
     allow_credentials=True,
-    allow_methods=["*"], # Allows all HTTP methods (GET, POST, etc.)
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-@app.get("/")
+
+
+@app.middleware("http")
+async def add_coop_header(request, call_next):
+    response = await call_next(request)
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    return response
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-   ##redisConnection=RedisConnection()
-    ##redisObject=redisConnection.createRedisConnection()
-    ##print(redisObject)
-    return {"Message":"Finnaly I am able to run my first API"}
-
-
-
-
-
+    return {"Message": "Finnaly I am able to run my first API"}

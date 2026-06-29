@@ -5,7 +5,8 @@ select_sell_orders: |
     AND side = 'SELL'
     AND status IN ('PENDING', 'PARTIALLY_EXECUTED')
     AND remaining_quantity > 0
-  ORDER BY price ASC, created_at DESC
+  ORDER BY price ASC, created_at ASC
+  FOR UPDATE NOWAIT
 
 select_buy_orders: |
   SELECT *
@@ -14,4 +15,5 @@ select_buy_orders: |
     AND side = 'BUY'
     AND status IN ('PENDING', 'PARTIALLY_EXECUTED')
     AND remaining_quantity > 0
-  ORDER BY price ASC, created_at ASC
+  ORDER BY price DESC, created_at ASC
+  FOR UPDATE NOWAIT

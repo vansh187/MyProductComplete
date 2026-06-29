@@ -21,11 +21,10 @@ class portfolioPersistence:
                     QueryLoader.get('portfolio.yaml', 'insert_holdings'),
                     (userId, symbol, quantity, price)
                 )
-                print("HOLDINGS INSERTED")
             else:
                 old_qty = holdings["quantity"]
                 old_price = holdings["avg_price"]
-                if old_qty <= 0:
+                if old_qty < 0:
                     return {"userId": userId, "Message": "Trade did not happened for negative quantity"}
                 new_qty = old_qty + quantity
                 new_avg = ((old_qty * old_price) + (quantity * price)) / new_qty
@@ -34,9 +33,7 @@ class portfolioPersistence:
                     (new_qty, new_avg, userId, symbol)
                 )
         except Exception as ex:
-            raise Exception("Exception in inserting holdings")
-        finally:
-            print("Execute finally block process buy")
+            raise Exception(f"Exception in process_buyer: {str(ex)}") from ex
 
     def process_seller(userId, symbol, quantity, price, cursor):
         if quantity <= 0:
@@ -45,24 +42,23 @@ class portfolioPersistence:
             cursor.execute(QueryLoader.get('portfolio.yaml', 'select_holdings'), (userId, symbol))
             sellHolding = cursor.fetchone()
             if not sellHolding:
-                cursor.execute(
-                    QueryLoader.get('portfolio.yaml', 'insert_holdings_with_time'),
-                    (userId, symbol, quantity, price)
-                )
-                print("HOLDINGS INSERTED")
-            else:
-                old_qty = sellHolding["quantity"]
-                if quantity > old_qty:
-                    return {"userId": userId, "Message": "quantity you have is less than trade quantity"}
-                new_qty = old_qty - quantity
-                cursor.execute(
-                    QueryLoader.get('portfolio.yaml', 'update_order_quantity'),
-                    (new_qty, userId, symbol)
-                )
+                raise Exception(f"No holdings found for user {userId} symbol {symbol}")
+            old_qty = sellHolding["quantity"]
+            if quantity > old_qty:
+                raise Exception(f"Insufficient holdings: have {old_qty}, need {quantity}")
+            new_qty = old_qty - quantity
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'update_order_quantity'),
+                (new_qty, userId, symbol)
+            )
         except Exception as e:
-            raise Exception(f"Exception in process_seller: {str(e)}")
-        finally:
-            print("Executing finally for process sell")
+            raise Exception(f"Exception in process_seller: {str(e)}") from e
+
+    def updateOrderStatusSingle(status, order_id, cursor):
+        cursor.execute(
+            QueryLoader.get('orders.yaml', 'update_order_status_single'),
+            (status, order_id)
+        )
 
     def updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id):
         value = status if status is not None else "EXECUTED"
@@ -70,10 +66,29 @@ class portfolioPersistence:
             QueryLoader.get('orders.yaml', 'update_order_status'),
             (value, buy_order_id, sell_order_id)
         )
-        print("order status update success")
 
     def updateStatus(userId, symbol, status, buy_order_id, sell_order_id, cursor):
         portfolioPersistence.updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id)
+
+    def updateCounterpartyOrderBook(remaining_qty, status, counterparty_order_id, cursor):
+        """Update the counterparty's order_book row by orders.id FK."""
+        try:
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'update_counterparty_order_book'),
+                (remaining_qty, status, counterparty_order_id)
+            )
+        except Exception as ex:
+            raise Exception(f"Error updating counterparty order book: {str(ex)}") from ex
+
+    def updateIncomingOrderBook(remaining_qty, status, order_book_id, cursor):
+        """Update the incoming order's order_book row by order_book.id PK."""
+        try:
+            cursor.execute(
+                QueryLoader.get('portfolio.yaml', 'update_incoming_order_book'),
+                (remaining_qty, status, order_book_id)
+            )
+        except Exception as ex:
+            raise Exception(f"Error updating incoming order book: {str(ex)}") from ex
 
     def createUserHolding(order, userId):
         conn = None
@@ -126,7 +141,7 @@ class portfolioPersistence:
             cursor.execute(QueryLoader.get('portfolio.yaml', 'select_user_portfolio'), (userId,))
             return cursor.fetchall()
         except Exception as ex:
-            raise Exception("Error in getting portfolio for logged in user")
+            raise Exception("Error in getting portfolio for logged in user") from ex
         finally:
             if cursor is not None:
                 cursor.close()
@@ -159,18 +174,4 @@ class portfolioPersistence:
             row = cursor.fetchone()
             return row['id']
         except Exception as ex:
-            raise Exception("Error in Inserting Data")
-        finally:
-            print("finally block of order book")
-
-    def updateOrderBookQuantity(quantity, orderBookId, status, buy_order_id, sell_order_id, cursor):
-        try:
-            cursor.execute(
-                QueryLoader.get('portfolio.yaml', 'update_order_book_quantity'),
-                (quantity, status, buy_order_id, sell_order_id)
-            )
-            print("trade executed")
-        except Exception as ex:
-            raise Exception("Error in updating orderBook")
-        finally:
-            print("final block of update Order book")
+            raise Exception("Error in Inserting Data") from ex
