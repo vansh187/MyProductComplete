@@ -112,6 +112,13 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_coop_header(request, call_next):
+    response = await call_next(request)
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    return response
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"Message": "Finnaly I am able to run my first API"}
