@@ -64,7 +64,9 @@ async def lifespan(app: FastAPI):
         print("App starting... Shoonya unavailable.")
 
     # ── Breeze (secondary / stock quotes) ────────────────────────────
-    if _BREEZE_IMPORTABLE and app.state.shoonya is None:
+    if app.state.shoonya is not None:
+        print("App starting... Breeze skipped (Shoonya is primary).")
+    elif _BREEZE_IMPORTABLE:
         print("App starting... Establishing Breeze session")
         try:
             breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
