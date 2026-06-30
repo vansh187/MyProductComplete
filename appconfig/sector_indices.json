@@ -1,0 +1,10 @@
+[
+  {"sector": "IT",      "exchange": "NSE", "token": "26042"},
+  {"sector": "Banking", "exchange": "NSE", "token": "26009"},
+  {"sector": "Energy",  "exchange": "NSE", "token": "26033"},
+  {"sector": "FMCG",    "exchange": "NSE", "token": "26035"},
+  {"sector": "Pharma",  "exchange": "NSE", "token": "26013"},
+  {"sector": "Auto",    "exchange": "NSE", "token": "26008"},
+  {"sector": "Realty",  "exchange": "NSE", "token": "26054"},
+  {"sector": "Metal",   "exchange": "NSE", "token": "26012"}
+]
