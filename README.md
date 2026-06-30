@@ -13,12 +13,14 @@ Market data APIs
 Using:
 
 FastAPI
-MySQL
-Your existing service layer
+PostgreSQL (psycopg2)
+Shoonya / Breeze for live market data
+Razorpay for payments
+Redis for caching
 
-final deployment will go to
+Deployment:
 
-Vercel(React)
-render (Python Webservice)
-Mysql dgitalOcean 
-domain need to check
+Vercel / Render (React frontend) — https://www.primepiptrade.com
+GCP / Azure VM (FastAPI backend) — https://api.primepiptrade.com
+PostgreSQL (cloud-hosted, SSL)
+Redis Cloud
