@@ -55,8 +55,16 @@ class TopMoversFetcher:
         valid = [r for r in raw if r is not None]
 
         valid.sort(key=lambda x: x["change_pct"], reverse=True)
-        gainers = valid[:self._top_n]
-        losers  = list(reversed(valid[-self._top_n:]))
+        n = self._top_n
+        if len(valid) >= 2 * n:
+            gainers = valid[:n]
+            losers  = list(reversed(valid[-n:]))
+        elif len(valid) > n:
+            gainers = valid[:n]
+            losers  = list(reversed(valid[n:]))
+        else:
+            gainers = valid[:]
+            losers  = []
 
         return {
             "market_status": "open" if is_open else "closed",
