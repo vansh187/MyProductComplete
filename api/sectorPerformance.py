@@ -83,7 +83,7 @@ async def stream_sector_performance(request: Request):
             except Exception as exc:
                 print(f"[SSE/sectors] Error: {exc}")
 
-            await asyncio.sleep(10 if is_open else 60)
+            await asyncio.sleep(5 if is_open else 60)
 
     return StreamingResponse(
         _event_generator(),

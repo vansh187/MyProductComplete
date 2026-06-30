@@ -335,6 +335,58 @@ async def get_market_indices(request: Request):
     }
 
 
+@router.get("/indices/stream")
+async def stream_market_indices(request: Request):
+    """
+    SSE endpoint — pushes live Nifty 50, Sensex, Bank Nifty, and India VIX
+    to the frontend automatically.
+      - Market open:   every 10 seconds
+      - Market closed: every 60 seconds (keeps connection alive)
+
+    Frontend:
+        const es = new EventSource('/api/market/indices/stream');
+        es.onmessage = (e) => {
+            const { market_status, indices } = JSON.parse(e.data);
+        };
+    """
+    async def _event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+
+            is_open = _is_market_open()
+
+            shoonya = getattr(request.app.state, "shoonya", None)
+            breeze  = getattr(request.app.state, "breeze",  None)
+            if shoonya is None and breeze is None:
+                yield f"data: {json.dumps({'market_status': 'open' if is_open else 'closed', 'indices': [], 'errors': [{'reason': 'market_data_unavailable'}], 'last_updated': datetime.now(timezone.utc).isoformat()})}\n\n"
+                await asyncio.sleep(30)
+                continue
+
+            try:
+                indices, errors = await _fetch_indices(shoonya, breeze)
+                payload = json.dumps({
+                    "market_status": "open" if is_open else "closed",
+                    "indices":       indices,
+                    "errors":        errors,
+                    "last_updated":  datetime.now(timezone.utc).isoformat(),
+                })
+                yield f"data: {payload}\n\n"
+            except Exception as exc:
+                print(f"[SSE/indices] Error: {exc}")
+
+            await asyncio.sleep(5 if is_open else 60)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/marquee")
 async def get_marquee(
     request: Request,
