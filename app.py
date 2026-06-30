@@ -13,6 +13,7 @@ from api.marketquotes import router as marketQuotesRouter
 from api.auth_google import router as googleAuthRouter
 from api.admin_shoonya import router as adminShoonyaRouter
 from api.sectorPerformance import router as sectorPerformanceRouter
+from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -38,10 +39,11 @@ except Exception as _shoonya_import_err:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    refresh_task        = None
+    refresh_task         = None
     shoonya_refresh_task = None
-    app.state.breeze    = None
-    app.state.shoonya   = None
+    top_movers_task      = None
+    app.state.breeze     = None
+    app.state.shoonya    = None
 
     # ── Shoonya (primary indices provider) ───────────────────────────
     if _SHOONYA_IMPORTABLE:
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
                     print("[WARNING] Shoonya auto-login failed — indices will fall back to Breeze")
             if app.state.shoonya:
                 shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
+                top_movers_task      = asyncio.create_task(top_movers_refresh(app))
         except Exception as e:
             print(f"[WARNING] Shoonya init error: {e}")
     else:
@@ -89,6 +92,8 @@ async def lifespan(app: FastAPI):
         refresh_task.cancel()
     if shoonya_refresh_task:
         shoonya_refresh_task.cancel()
+    if top_movers_task:
+        top_movers_task.cancel()
     print("Server shutting down.")
 
 
@@ -105,6 +110,7 @@ app.include_router(marketQuotesRouter)
 app.include_router(googleAuthRouter)
 app.include_router(adminShoonyaRouter)
 app.include_router(sectorPerformanceRouter)
+app.include_router(topMoversRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],
