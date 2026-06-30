@@ -1,17 +1,14 @@
 from typing import Optional, Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from utils.auth_dependency import get_current_user
-#from service.orderService import create_order as service_create_order
 from service.orderService import OrderService
-#from service.orderService import getorders as service_get_orders
-#from service.orderService import getOrderById as service_get_OrderById
-#from service.orderService import cancelOrderById as service_cancelOrderById
 from service.portfolioService import portfolioService
 from service.executionEngine import ExecutionEngine
+from service.walletbalance.WalletBalanceService import WalletBalanceService
 from decimal import Decimal
-#from service.portfolioService import process_buy as service_process_sell
+
 router = APIRouter()
 
 class OrderCreate(BaseModel):
@@ -28,7 +25,7 @@ def get_orders(current_user=Depends(get_current_user)):
     user_id = current_user["user_id"]
     orderSerive=OrderService()
     orders = orderSerive.getorders(user_id)
-    return {            "Message": "Orders retrieved successfully", 
+    return {            "Message": "Orders retrieved successfully",
                 "User": current_user,
                 "Orders": orders
             }
@@ -37,17 +34,22 @@ def get_orders(current_user=Depends(get_current_user)):
 @router.post("/orders")
 def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
     user_id = current_user["user_id"]
-    orderSerive=OrderService()
-    id=orderSerive.create_order(order, user_id)
-    order.id=id
-    executionEngine=ExecutionEngine(order);
-    status=executionEngine.executeOrder(order,user_id)
-   ## if order.side == "BUY":
-     ##   portfolioService.process_buyer(user_id, order.symbol, order.quantity, order.price)
 
-##    elif order.side == "SELL":
-  ##    portfolioService.process_seller(user_id, order.symbol, order.quantity,order.price)
-   
+    if order.side == "BUY":
+        required = Decimal(str(order.quantity)) * order.price
+        wallet = WalletBalanceService().getWalletBalance(user_id)
+        balance = Decimal(str(wallet["balance"])) if wallet and wallet.get("balance") is not None else Decimal("0")
+        if balance < required:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient balance. Required: ₹{required:.2f}, Available: ₹{balance:.2f}"
+            )
+
+    orderSerive = OrderService()
+    id = orderSerive.create_order(order, user_id)
+    order.id = id
+    executionEngine = ExecutionEngine(order)
+    status = executionEngine.executeOrder(order, user_id)
     return status
 
 
