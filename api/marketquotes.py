@@ -141,6 +141,16 @@ _ALL_INDICES = [
         "stock_code": "INDVIX", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26017",
     },
+    {
+        "display_name": "Fin Nifty",
+        "stock_code": "NIFFIN", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26037",
+    },
+    {
+        "display_name": "Midcap Nifty",
+        "stock_code": "NIFSEL", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26074",
+    },
 ]
 
 
@@ -322,7 +332,8 @@ def _normalize_stock(item: dict) -> dict:
 @router.get("/indices")
 async def get_market_indices(request: Request):
     """
-    Returns the latest values for Nifty 50, Sensex, Bank Nifty, and India VIX.
+    Returns the latest values for Nifty 50, Sensex, Bank Nifty, India VIX,
+    Fin Nifty, and Midcap Nifty.
     Shoonya is the primary provider; Breeze is the fallback.
     """
     shoonya, breeze = _get_market_clients(request)
@@ -338,8 +349,8 @@ async def get_market_indices(request: Request):
 @router.get("/indices/stream")
 async def stream_market_indices(request: Request):
     """
-    SSE endpoint — pushes live Nifty 50, Sensex, Bank Nifty, and India VIX
-    to the frontend automatically.
+    SSE endpoint — pushes live Nifty 50, Sensex, Bank Nifty, India VIX,
+    Fin Nifty, and Midcap Nifty to the frontend automatically.
       - Market open:   every 10 seconds
       - Market closed: every 60 seconds (keeps connection alive)
 
@@ -394,8 +405,8 @@ async def get_marquee(
 ):
     """
     Single call for the ticker marquee.
-    Always returns Nifty 50, Sensex, Bank Nifty, and India VIX first,
-    followed by any additional stock symbols passed as query params.
+    Always returns Nifty 50, Sensex, Bank Nifty, India VIX, Fin Nifty,
+    and Midcap Nifty first, followed by any additional stock symbols passed as query params.
     Both are fetched concurrently.
 
     GET /api/market/marquee
