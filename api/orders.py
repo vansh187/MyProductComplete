@@ -126,6 +126,42 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
 
         logger.info(f"Order created: ID={order_id}, User={user_id}, Symbol={order.symbol}")
 
+        # For BUY orders: Deduct balance from wallet (funds are blocked)
+        if order.side == OrderSide.BUY:
+            try:
+                blocked_amount = Decimal(str(order.quantity)) * Decimal(str(order.price))
+                wallet_service = WalletBalanceService()
+                wallet = wallet_service.getWalletBalance(user_id)
+                current_balance = Decimal(str(wallet.get("balance", 0)))
+                new_balance = current_balance - blocked_amount
+
+                # Update wallet in database
+                from database.PostgresConnectionFactory import PostgresConnectionFactory
+                from utils.query_loader import QueryLoader
+                conn = None
+                try:
+                    conn = PostgresConnectionFactory.create_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        QueryLoader.get('wallet.yaml', 'update_wallet_balance'),
+                        (new_balance, user_id)
+                    )
+                    conn.commit()
+                    logger.info(f"Wallet deducted: user={user_id}, amount={blocked_amount}, new_balance={new_balance}")
+                except Exception as ex:
+                    if conn:
+                        conn.rollback()
+                    logger.error(f"Error deducting wallet balance: {str(ex)}")
+                    # Don't fail the order if wallet deduction fails - log and continue
+                finally:
+                    if cursor:
+                        cursor.close()
+                    if conn:
+                        conn.close()
+            except Exception as ex:
+                logger.error(f"Error in wallet deduction logic: {str(ex)}")
+                # Don't fail the order due to wallet error
+
         # Execute order
         execution_engine = ExecutionEngine(order, order_id)
         execution_result = execution_engine.execute_order(user_id)
