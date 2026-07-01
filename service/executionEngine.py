@@ -306,6 +306,7 @@ class ExecutionEngine:
             order_service = OrderService()
             portfolio_service = portfolioService()
             transaction_id = None
+            total_matched_qty = 0
 
             self.logger.info(f"Processing {len(trade_executions)} matched trades")
 
@@ -313,6 +314,18 @@ class ExecutionEngine:
                 if match_found is None:
                     self.logger.warning("Received None match")
                     continue
+
+                # Verify user ownership of trades
+                if match_found.buy_user_id == user_id or match_found.sell_user_id == user_id:
+                    # Current user is one of the parties - acceptable
+                    pass
+                else:
+                    # Security violation - user is executing trade not involving them
+                    self.logger.error(f"Auth violation: user {user_id} attempted to execute trade between {match_found.buy_user_id} and {match_found.sell_user_id}")
+                    raise ValueError(f"User {user_id} not authorized for this trade")
+
+                # Track total matched quantity for incoming order
+                total_matched_qty += match_found.quantity
 
                 # Insert trade record
                 transaction_id = tradeService.insertTradeOrders(
@@ -346,12 +359,9 @@ class ExecutionEngine:
                     counterparty_remaining, counterparty_status, counterparty_order_id, cursor
                 )
 
-                # Update incoming order book
-                # Note: order.status is set by matching engine
-                incoming_status = self.order.status if hasattr(self.order, 'status') else "EXECUTED"
-                incoming_remaining = (
-                    self.order.quantity if incoming_status == "PARTIALLY_EXECUTED" else 0
-                )
+                # Update incoming order book - determine status from total matched vs order quantity
+                incoming_remaining = self.order.quantity - total_matched_qty
+                incoming_status = "PARTIALLY_EXECUTED" if incoming_remaining > 0 else "EXECUTED"
 
                 portfolio_service.updateIncomingOrderBook(
                     incoming_remaining, incoming_status, order_book_id, cursor

@@ -7,10 +7,10 @@ class portfolioService:
     def __init__(self):
         pass
 
-    def process_buyer(userId, symbol, quantity, price, cursor):
+    def process_buyer(self, userId, symbol, quantity, price, cursor):
         return portfolioPersistence.process_buyer(userId, symbol, quantity, price, cursor)
 
-    def process_seller(userId, symbol, quantity, price, cursor):
+    def process_seller(self, userId, symbol, quantity, price, cursor):
         return portfolioPersistence.process_seller(userId, symbol, quantity, price, cursor)
 
     def updateCounterpartyOrderBook(self, remaining_qty, status, counterparty_order_id, cursor):

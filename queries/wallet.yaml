@@ -2,3 +2,9 @@ get_wallet_balance: |
   SELECT user_id, balance
   FROM wallets
   WHERE user_id = %s
+
+get_wallet_balance_for_update: |
+  SELECT user_id, balance
+  FROM wallets
+  WHERE user_id = %s
+  FOR UPDATE

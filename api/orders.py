@@ -85,6 +85,10 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
             raise HTTPException(status_code=400, detail="Order cannot be None")
 
         # BUY order: Check wallet balance
+        # IMPORTANT: This check is done outside a transaction lock. Between this check
+        # and order creation, another request could reduce the wallet balance (race condition).
+        # TODO: Implement transaction-level wallet locking using SELECT...FOR UPDATE in a database transaction
+        # to prevent wallet double-spend attacks from concurrent orders.
         if order.side == OrderSide.BUY:
             if order.price is None or order.price <= 0:
                 raise HTTPException(
@@ -92,7 +96,7 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
                     detail="BUY orders require a valid price"
                 )
 
-            required_balance = Decimal(str(order.quantity)) * order.price
+            required_balance = Decimal(str(order.quantity)) * Decimal(str(order.price))
 
             wallet_service = WalletBalanceService()
             wallet = wallet_service.getWalletBalance(user_id)
