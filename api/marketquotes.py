@@ -255,15 +255,16 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
                 ),
                 timeout=3.0
             )
+            print(f"[Shoonya] {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {quote}")
             if quote:
                 source = "shoonya"
                 # Cache successful live price
                 _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                 return quote, source
         except asyncio.TimeoutError:
-            print(f"[Shoonya] Timeout for {stock_code}")
+            print(f"[Shoonya] Timeout for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']})")
         except Exception as e:
-            print(f"[Shoonya] Exception for {stock_code}: {e}")
+            print(f"[Shoonya] Exception for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {e}")
 
     # ── Fallback 1: Breeze get_quotes with 2s timeout ──────────────────
     if breeze is not None:
