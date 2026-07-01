@@ -149,7 +149,9 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
 
     except Exception as ex:
         logger.error(f"Error creating order: {str(ex)}")
-        raise HTTPException(status_code=500, detail="Failed to create order")
+        logger.error(f"Exception type: {type(ex).__name__}")
+        logger.error(f"Full traceback:", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create order: {str(ex)}")
 
 
 @router.get("/orders/{order_id}")
