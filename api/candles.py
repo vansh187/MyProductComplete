@@ -136,3 +136,38 @@ async def get_finnifty_candles(
         "errors": errors,
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@router.get("/sensex/candles")
+async def get_sensex_candles(
+    request: Request,
+    timeframe: str = Query("1m", description="1m, 3m, 5m, 15m, 1h, 1d"),
+    limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
+):
+    """
+    Returns OHLC candle data for Sensex (BSE) at the specified timeframe.
+
+    Timeframes: 1m, 3m, 5m, 15m, 1h, 1d
+    Limit: 1-500 candles (default 100)
+    """
+    if timeframe not in ("1m", "3m", "5m", "15m", "1h", "1d"):
+        raise HTTPException(status_code=400, detail=f"Invalid timeframe: {timeframe}")
+
+    shoonya = _get_shoonya(request)
+
+    candles, errors = await _candleService.get_index_candles(
+        shoonya,
+        exchange="BSE",
+        token="1",  # Sensex
+        timeframe=timeframe,
+        limit=limit,
+    )
+
+    return {
+        "symbol": "SENSEX",
+        "exchange": "BSE",
+        "timeframe": timeframe,
+        "candles": candles,
+        "errors": errors,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }

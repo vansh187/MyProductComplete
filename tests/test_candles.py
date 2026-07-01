@@ -272,6 +272,56 @@ class TestFinNiftyCandles:
         assert resp.json()["timeframe"] == "1d"
 
 
+# ── GET /api/market/sensex/candles ──────────────────────────────────────────
+
+class TestSensexCandles:
+
+    def test_sensex_candles_returns_correct_symbol_and_exchange(self):
+        """Sensex endpoint returns symbol='SENSEX' and exchange='BSE'"""
+        app = _make_app()
+
+        with patch("api.candles._candleService.get_index_candles", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = (
+                [{"timestamp": "2026-07-01T09:15:00+05:30", "open": 76545.21, "high": 77019.8, "low": 76538.37, "close": 76967.87, "volume": 200000}],
+                []
+            )
+
+            with patch("api.candles._get_shoonya") as mock_shoonya:
+                mock_shoonya_conn = MagicMock()
+                mock_shoonya_conn.is_connected = True
+                mock_shoonya.return_value = mock_shoonya_conn
+
+                client = TestClient(app)
+                resp = client.get("/api/market/sensex/candles?timeframe=5m&limit=50")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["symbol"] == "SENSEX"
+        assert data["exchange"] == "BSE"
+        assert data["timeframe"] == "5m"
+        assert len(data["candles"]) == 1
+        assert data["errors"] == []
+
+    def test_sensex_candles_multiple_timeframes(self):
+        """Sensex supports all timeframes"""
+        app = _make_app()
+
+        for timeframe in ["1m", "3m", "5m", "15m", "1h", "1d"]:
+            with patch("api.candles._candleService.get_index_candles", new_callable=AsyncMock) as mock_fetch:
+                mock_fetch.return_value = ([], [])
+
+                with patch("api.candles._get_shoonya") as mock_shoonya:
+                    mock_shoonya_conn = MagicMock()
+                    mock_shoonya_conn.is_connected = True
+                    mock_shoonya.return_value = mock_shoonya_conn
+
+                    client = TestClient(app)
+                    resp = client.get(f"/api/market/sensex/candles?timeframe={timeframe}")
+
+            assert resp.status_code == 200
+            assert resp.json()["timeframe"] == timeframe
+
+
 # ── Response structure validation ────────────────────────────────────────────
 
 class TestCandlesResponseStructure:
