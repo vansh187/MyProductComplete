@@ -235,6 +235,62 @@ class ShoonyaConnection:
             print(f"[Shoonya] get_index_quote error {exchange}:{token}: {exc}")
             return None
 
+    def get_time_price_series(self, exchange: str, token: str, interval: str, days: int = 1) -> list[dict] | None:
+        """
+        Fetch OHLC candle data from Shoonya for a given timeframe.
+
+        Args:
+            exchange: 'NSE' or 'BSE'
+            token: Security token (e.g. '26000' for Nifty 50)
+            interval: Candle interval ('1minute', '3minute', '5minute', '15minute', '1hour', '1day')
+            days: Number of days of history to fetch (default 1 = today)
+
+        Returns:
+            List of dicts with keys: timestamp, open, high, low, close, volume
+            OR None on failure
+        """
+        if not self._connected or self._api is None:
+            return None
+
+        try:
+            ret = self._api.get_time_price_series(
+                exchange=exchange,
+                token=token,
+                starttime=0,
+                interval=interval,
+                lastn=500  # Get last 500 candles (covers ~8 hours of 1m data)
+            )
+
+            if not ret or ret.get("stat") != "Ok":
+                print(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
+                return None
+
+            candles = ret.get("jdata", [])
+            if not candles:
+                return None
+
+            # Parse Shoonya's timestamp format and normalize
+            result = []
+            for candle in candles:
+                try:
+                    result.append({
+                        "timestamp": candle.get("time"),  # Already ISO-8601 from Shoonya
+                        "open":      _safe_float(candle.get("o")),
+                        "high":      _safe_float(candle.get("h")),
+                        "low":       _safe_float(candle.get("l")),
+                        "close":     _safe_float(candle.get("c")),
+                        "volume":    int(candle.get("v", 0)) if candle.get("v") else 0,
+                    })
+                except Exception as e:
+                    print(f"[Shoonya] Error parsing candle {candle}: {e}")
+                    continue
+
+            return result if result else None
+
+        except Exception as exc:
+            print(f"[Shoonya] get_time_price_series error {exchange}:{token} interval={interval}: {exc}")
+            return None
+
     # ------------------------------------------------------------------
     # Automated headless login (no browser interaction needed)
     # ------------------------------------------------------------------

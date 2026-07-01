@@ -14,6 +14,7 @@ from api.auth_google import router as googleAuthRouter
 from api.admin_shoonya import router as adminShoonyaRouter
 from api.sectorPerformance import router as sectorPerformanceRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
+from api.candles import router as candlesRouter
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -111,6 +112,7 @@ app.include_router(googleAuthRouter)
 app.include_router(adminShoonyaRouter)
 app.include_router(sectorPerformanceRouter)
 app.include_router(topMoversRouter)
+app.include_router(candlesRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],
