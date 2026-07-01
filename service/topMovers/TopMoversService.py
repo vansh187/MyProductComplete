@@ -56,17 +56,33 @@ class TopMoversFetcher:
                 print(f"[TopMovers] Error for {stock['symbol']} ({stock['token']}): {e}")
                 return None
 
-        # Fetch in batches of 5 to avoid overwhelming Shoonya with 40 concurrent requests
+        # Fetch in batches of 10 to reduce total time while managing load
         stocks = self._watchlist.stocks()
         valid = []
+        failed = []
 
-        for i in range(0, len(stocks), 5):
-            batch = stocks[i:i+5]
+        for i in range(0, len(stocks), 10):
+            batch = stocks[i:i+10]
             raw = await asyncio.gather(*[_fetch_one(s) for s in batch])
-            valid.extend([r for r in raw if r is not None])
-            # Small delay between batches to prevent overwhelming Shoonya
-            if i + 5 < len(stocks):
-                await asyncio.sleep(0.1)
+
+            for stock, result in zip(batch, raw):
+                if result is not None:
+                    valid.append(result)
+                else:
+                    failed.append(stock)
+
+            # No delay needed with larger batches
+
+        # Retry failed stocks with sequential calls (less aggressive)
+        if failed:
+            print(f"[TopMovers] Retrying {len(failed)} failed stocks...")
+            for stock in failed[:5]:  # Retry up to 5 failed stocks
+                try:
+                    result = await _fetch_one(stock)
+                    if result is not None:
+                        valid.append(result)
+                except Exception:
+                    pass
 
         valid.sort(key=lambda x: x["change_pct"], reverse=True)
         n = self._top_n
