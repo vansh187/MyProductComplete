@@ -25,7 +25,7 @@ def _get_shoonya(request: Request):
 @router.get("/nifty/candles")
 async def get_nifty_candles(
     request: Request,
-    timeframe: str = Query("1m", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
@@ -71,7 +71,7 @@ async def get_nifty_candles(
 @router.get("/banknifty/candles")
 async def get_banknifty_candles(
     request: Request,
-    timeframe: str = Query("1m", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
@@ -106,7 +106,7 @@ async def get_banknifty_candles(
 @router.get("/finnifty/candles")
 async def get_finnifty_candles(
     request: Request,
-    timeframe: str = Query("1m", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
@@ -141,7 +141,7 @@ async def get_finnifty_candles(
 @router.get("/sensex/candles")
 async def get_sensex_candles(
     request: Request,
-    timeframe: str = Query("1m", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
