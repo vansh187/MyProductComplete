@@ -31,9 +31,10 @@ class SectorPerformanceFetcher:
                         lambda ex=sector["exchange"], tk=sector["token"]:
                             shoonya.get_index_quote(ex, tk)
                     ),
-                    timeout=8.0
+                    timeout=10.0
                 )
                 if quote is None:
+                    print(f"[SectorPerf] No data for {sector['sector']} ({sector['token']})")
                     return None, {"sector": sector["sector"], "reason": "no_data"}
                 return {
                     "sector":     sector["sector"],
@@ -42,8 +43,10 @@ class SectorPerformanceFetcher:
                     "ltp":        quote["ltp"],
                 }, None
             except asyncio.TimeoutError:
+                print(f"[SectorPerf] Timeout for {sector['sector']} ({sector['token']})")
                 return None, {"sector": sector["sector"], "reason": "timeout"}
             except Exception as exc:
+                print(f"[SectorPerf] Error for {sector['sector']} ({sector['token']}): {exc}")
                 return None, {"sector": sector["sector"], "reason": str(exc)}
 
         pairs = await asyncio.gather(*[_fetch_one(s) for s in self._registry.sectors()])
