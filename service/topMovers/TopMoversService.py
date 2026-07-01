@@ -91,10 +91,11 @@ class TopMoversCache:
         self._condition                    = asyncio.Condition()
 
     def get(self) -> dict | None:
-        """Get current cache, fallback to last valid if current is None."""
-        if self._data is not None:
+        """Get current cache, fallback to last valid if current has no data."""
+        # Return current data only if it has gainers or losers
+        if self._data is not None and (self._data.get("gainers") or self._data.get("losers")):
             return self._data
-        # Fallback to last valid data when current cache is empty (market closed, etc)
+        # Fallback to last valid data when current is empty/None (market closed, etc)
         return self._last_valid_data
 
     @property
