@@ -311,8 +311,8 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
         except Exception as e:
             print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
 
-    # ── Last Resort: Return cached last price (for closed market) ────────
-    if stock_code in _LAST_PRICE_CACHE:
+    # ── Last Resort: Return cached last price ONLY when market is closed ──
+    if stock_code in _LAST_PRICE_CACHE and not _is_market_open():
         cached = _LAST_PRICE_CACHE[stock_code]
         return cached["quote"], f"{cached['source']} (cached)"
 
