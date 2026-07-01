@@ -311,6 +311,7 @@ class ExecutionEngine:
         try:
             order_service = OrderService()
             portfolio_service = portfolioService()
+            trade_service = tradeService()
             transaction_id = None
             total_matched_qty = 0
 
@@ -334,7 +335,7 @@ class ExecutionEngine:
                 total_matched_qty += match_found.quantity
 
                 # Insert trade record
-                transaction_id = tradeService.insertTradeOrders(
+                transaction_id = trade_service.insertTradeOrders(
                     match_found.buy_order_id,
                     match_found.sell_order_id,
                     match_found.buy_user_id,
