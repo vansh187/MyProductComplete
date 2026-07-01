@@ -31,7 +31,7 @@ class SectorPerformanceFetcher:
                         lambda ex=sector["exchange"], tk=sector["token"]:
                             shoonya.get_index_quote(ex, tk)
                     ),
-                    timeout=5.0
+                    timeout=8.0
                 )
                 if quote is None:
                     return None, {"sector": sector["sector"], "reason": "no_data"}
