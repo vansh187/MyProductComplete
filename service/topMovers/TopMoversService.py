@@ -36,7 +36,7 @@ class TopMoversFetcher:
                         lambda ex=stock["exchange"], tk=stock["token"]:
                             shoonya.get_index_quote(ex, tk)
                     ),
-                    timeout=10.0
+                    timeout=8.0
                 )
                 if quote is None:
                     print(f"[TopMovers] No data for {stock['symbol']} ({stock['token']})")
@@ -56,8 +56,17 @@ class TopMoversFetcher:
                 print(f"[TopMovers] Error for {stock['symbol']} ({stock['token']}): {e}")
                 return None
 
-        raw = await asyncio.gather(*[_fetch_one(s) for s in self._watchlist.stocks()])
-        valid = [r for r in raw if r is not None]
+        # Fetch in batches of 5 to avoid overwhelming Shoonya with 40 concurrent requests
+        stocks = self._watchlist.stocks()
+        valid = []
+
+        for i in range(0, len(stocks), 5):
+            batch = stocks[i:i+5]
+            raw = await asyncio.gather(*[_fetch_one(s) for s in batch])
+            valid.extend([r for r in raw if r is not None])
+            # Small delay between batches to prevent overwhelming Shoonya
+            if i + 5 < len(stocks):
+                await asyncio.sleep(0.1)
 
         valid.sort(key=lambda x: x["change_pct"], reverse=True)
         n = self._top_n
