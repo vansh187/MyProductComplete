@@ -403,6 +403,12 @@ async def get_market_indices(request: Request):
     """
     shoonya, breeze = _get_market_clients(request)
     indices, errors = await _fetch_indices(shoonya, breeze)
+
+    # Log for debugging data fluctuation
+    print(f"[API] /indices response: {len(indices)} indices, {len(errors)} errors")
+    for idx in indices:
+        print(f"  - {idx.get('name')}: {idx.get('value')} ({idx.get('source')})")
+
     return {
         "market_status": "open" if _is_market_open() else "closed",
         "indices":       indices,
