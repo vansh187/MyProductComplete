@@ -31,10 +31,10 @@ class MatchingEngineService:
 
 
    
-    def matchtradeOrderforUser( self,order, userId, status,cursor):
+    def matchtradeOrderforUser(self, order, userId, status, cursor, order_id):
 
-        matchingPersistence=MatchingPersistence()
-        matchFoundOrderResponse = matchingPersistence.matchtradingOrderforUser( order,status,cursor)
+        matchingPersistence = MatchingPersistence()
+        matchFoundOrderResponse = matchingPersistence.matchtradingOrderforUser(order, status, cursor)
 
         if matchFoundOrderResponse is None:
             return {
@@ -42,7 +42,7 @@ class MatchingEngineService:
                 "message": "No MatchFound Order still in order Book"
             }
 
-        trades = self.matchingOrder(order, matchFoundOrderResponse,userId)
+        trades = self.matchingOrder(order, matchFoundOrderResponse, userId, order_id)
 
         return {
             "userId": userId,
@@ -51,13 +51,13 @@ class MatchingEngineService:
 
 
 
-    def matchingOrder( self,incomingOrder, matchFoundOrderResponse,userId):
+    def matchingOrder(self, incomingOrder, matchFoundOrderResponse, userId, order_id):
 
         trades = []
 
         try:
             # FIX 1: safe access
-            if len(matchFoundOrderResponse)>0 :
+            if len(matchFoundOrderResponse) > 0:
                 incoming_qty = incomingOrder.quantity
 
                 for response in matchFoundOrderResponse:
@@ -74,19 +74,19 @@ class MatchingEngineService:
                         continue
 
                     trade_qty = min(incoming_qty, opp_remaining_qty)
-                    remainingQty=opp_remaining_qty-trade_qty
-                    #opp one is which is in order book and incoming one is order from person
+                    remainingQty = opp_remaining_qty - trade_qty
+                    # opp one is which is in order book and incoming one is order from person
                     execution_price = Decimal(str(response.get("price", 0)))
 
                     # Decide BUY/SELL mapping
                     if incomingOrder.side.upper() == "BUY":
-                        buy_order_id = incomingOrder.id
+                        buy_order_id = order_id
                         sell_order_id = response["order_id"]
                         buy_user_id = userId
                         sell_user_id = response["user_id"]
                     else:
                         buy_order_id = response["order_id"]
-                        sell_order_id = incomingOrder.id
+                        sell_order_id = order_id
                         buy_user_id = response["user_id"]
                         sell_user_id = userId
 

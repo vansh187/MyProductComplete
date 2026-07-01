@@ -221,7 +221,7 @@ class ExecutionEngine:
                 if matching_engine is None:
                     raise Exception("Failed to initialize matching engine")
 
-                match_result = matching_engine.execute(self.order, user_id, cursor)
+                match_result = matching_engine.execute(self.order, user_id, cursor, self.order_id)
 
                 if match_result is None:
                     raise Exception("Matching engine returned None")
