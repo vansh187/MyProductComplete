@@ -244,7 +244,7 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
     quote         = None
     source        = None
 
-    # ── Primary: Shoonya with 3s timeout ──────────────────────────────
+    # ── Primary: Shoonya with 8s timeout ──────────────────────────────
     if shoonya is not None and shoonya.is_connected:
         try:
             quote = await asyncio.wait_for(
@@ -253,7 +253,7 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
                     lambda ex=idx["shoonya_exchange"], tk=idx["shoonya_token"]:
                         shoonya.get_index_quote(ex, tk)
                 ),
-                timeout=3.0
+                timeout=8.0
             )
             print(f"[Shoonya] {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {quote}")
             if quote:
@@ -329,7 +329,13 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
 
 
 async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
-    """Fetch ALL indices in parallel with per-call timeouts."""
+    """Fetch ALL indices in parallel with per-call timeouts.
+
+    Timeout strategy:
+    - Shoonya (primary): 8s per index
+    - Breeze (fallback): 2s per call
+    All 6 indices fetched in parallel, so wall-clock time ~8s max.
+    """
     trading_day = _last_trading_day()
     loop        = asyncio.get_running_loop()
     results     = []
