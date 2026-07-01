@@ -48,7 +48,7 @@ class ExchangeType(str, Enum):
 # ORDER CREATE MODEL
 # ============================================
 class OrderCreate(BaseModel):
-    symbol: str = Field(..., min_length=1, max_length=20, description="Stock symbol")
+    symbol: str = Field(..., min_length=1, max_length=50, description="Stock symbol (up to 50 chars for derivatives like NIFTY07JUL2623800CE)")
     exchange: ExchangeType = Field(default=ExchangeType.NSE, description="Stock exchange")
     side: OrderSide = Field(..., description="BUY or SELL")
     quantity: int = Field(..., gt=0, description="Order quantity (must be > 0)")
