@@ -135,10 +135,16 @@ class ExecutionEngine:
             raise Exception(f"Order execution failed: {str(ex)}") from ex
 
         finally:
-            if cursor is not None:
-                cursor.close()
-            if conn is not None:
-                conn.close()
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception as e:
+                self.logger.warning(f"Error closing cursor: {str(e)}")
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception as e:
+                self.logger.warning(f"Error closing connection: {str(e)}")
 
     def _create_order_book_entry(self, conn, cursor, portfolio_service, user_id: int) -> int:
         """
@@ -377,13 +383,13 @@ class ExecutionEngine:
 
                 # Update holdings
                 if self.order.side == OrderSide.BUY:
-                    portfolioService.process_buyer(
+                    portfolio_service.process_buyer(
                         user_id, self.order.symbol,
                         match_found.quantity, match_found.execution_price,
                         cursor
                     )
                 elif self.order.side == OrderSide.SELL:
-                    portfolioService.process_seller(
+                    portfolio_service.process_seller(
                         user_id, self.order.symbol,
                         match_found.quantity, match_found.execution_price,
                         cursor

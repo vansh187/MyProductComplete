@@ -109,14 +109,6 @@ class MatchingEngineService:
                     incoming_qty -= trade_qty
                     response["remaining_quantity"] = opp_remaining_qty - trade_qty
 
-                # update incoming order state
-                incomingOrder.remainingQty = incoming_qty
-
-                if incoming_qty == 0:
-                    incomingOrder.status = "EXECUTED"
-                else:
-                    incomingOrder.status = "PARTIALLY_EXECUTED"
-
         except Exception as ex:
                 # FIX 4: don't hide real error
             raise Exception(f"Exception in matching trade with incoming order: {str(ex)}")
