@@ -75,21 +75,33 @@ class RazorPayPersistence:
             if walletRecord is None:
                 print(f"No wallet_ledger record found for order {razorpay_order_id}, skipping wallet update")
                 return
+
+            # FIX: Convert transaction_amount from display units to proper currency
+            # Ensure amount is treated as a float/decimal for proper calculations
+            transaction_amount = float(walletRecord["transaction_amount"])
+            current_balance = float(walletRecord["balance"]) if walletRecord["balance"] is not None else 0.0
+
+            print(f"DEBUG: userId={userId}, current_balance={current_balance}, transaction_amount={transaction_amount}")
+
             if walletRecord["wallet_id"] is None:
+                # Create new wallet with funds
+                new_balance = transaction_amount
                 cursor.execute(
                     QueryLoader.get('razorpay.yaml', 'insert_wallet'),
-                    (userId, walletRecord["transaction_amount"])
+                    (userId, new_balance)
                 )
                 conn.commit()
-                print("insert wallet record with new funds")
+                print(f"insert wallet record with new funds: balance={new_balance}")
             else:
-                newWalletBalance = walletRecord["balance"] + walletRecord["transaction_amount"]
+                # Update existing wallet - ADD the transaction amount to current balance
+                newWalletBalance = current_balance + transaction_amount
+                print(f"DEBUG: newWalletBalance={newWalletBalance} (was {current_balance}, added {transaction_amount})")
                 cursor.execute(
                     QueryLoader.get('razorpay.yaml', 'update_wallet_balance'),
                     (newWalletBalance, userId)
                 )
                 conn.commit()
-                print("Transaction update is success")
+                print(f"Transaction update is success: new balance={newWalletBalance}")
         except Exception as ex:
             if conn:
                 conn.rollback()
