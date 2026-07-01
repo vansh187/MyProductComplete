@@ -128,31 +128,37 @@ _ALL_INDICES = [
         "display_name": "Nifty 50",
         "stock_code": "NIFTY", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26000",
+        "breeze_code": "NIFTY",
     },
     {
         "display_name": "Sensex",
-        "stock_code": "BSESEN", "exchange_code": "BSE",
+        "stock_code": "SENSEX", "exchange_code": "BSE",
         "shoonya_exchange": "BSE", "shoonya_token": "1",
+        "breeze_code": "SENSEX",
     },
     {
         "display_name": "Bank Nifty",
-        "stock_code": "CNXBAN", "exchange_code": "NSE",
+        "stock_code": "BANKNIFTY", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26009",
+        "breeze_code": "BANKNIFTY",
     },
     {
         "display_name": "India VIX",
-        "stock_code": "INDVIX", "exchange_code": "NSE",
+        "stock_code": "INDIAVIX", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26017",
+        "breeze_code": "INDIAVIX",
     },
     {
         "display_name": "Fin Nifty",
-        "stock_code": "NIFFIN", "exchange_code": "NSE",
+        "stock_code": "FINNIFTY", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26037",
+        "breeze_code": "FINNIFTY",
     },
     {
         "display_name": "Midcap Nifty",
-        "stock_code": "NIFSEL", "exchange_code": "NSE",
+        "stock_code": "MIDCAPNIFTY", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26074",
+        "breeze_code": "MIDCAPNIFTY",
     },
 ]
 
@@ -230,8 +236,10 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
     """Fetch a single index quote with fallback logic. Returns (quote_dict, source_name).
 
     Caches successful quotes for display when market is closed.
+    Uses breeze_code for Breeze API calls (may differ from cache key stock_code).
     """
     stock_code    = idx["stock_code"]
+    breeze_code   = idx.get("breeze_code", stock_code)
     exchange_code = idx["exchange_code"]
     quote         = None
     source        = None
@@ -263,7 +271,7 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
             resp = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda sc=stock_code, ex=exchange_code: breeze.get_quotes(
+                    lambda sc=breeze_code, ex=exchange_code: breeze.get_quotes(
                         stock_code=sc, exchange_code=ex, product_type="cash"
                     )
                 ),
@@ -288,7 +296,7 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
             resp2 = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda sc=stock_code: breeze.get_historical_data(
+                    lambda sc=breeze_code: breeze.get_historical_data(
                         interval="1minute",
                         from_date=f"{trading_day}T09:15:00.000Z",
                         to_date=f"{trading_day}T15:30:00.000Z",
