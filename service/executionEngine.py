@@ -400,16 +400,6 @@ class ExecutionEngine:
             conn.commit()
             self.logger.info(f"All trades committed successfully")
 
-            # Determine final status
-            if hasattr(self.order, 'status') and self.order.status == "PARTIALLY_EXECUTED":
-                return {
-                    "success": True,
-                    "status": "PARTIALLY_EXECUTED",
-                    "message": "Order partially executed",
-                    "order_id": self.order_id,
-                    "trade_id": transaction_id
-                }
-
             return {
                 "success": True,
                 "status": "EXECUTED",
