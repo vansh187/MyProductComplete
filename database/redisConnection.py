@@ -19,7 +19,7 @@ class RedisConnection:
         Redis client instance that manages its own warm internal connection pool.
         """
         if cls._redis_client is None:
-            print(f"Establishing secure connection to cloud Redis: {os.getenv("REDIS_HOST_URL")}")
+            print(f"Establishing secure connection to cloud Redis: {os.getenv('REDIS_HOST_URL')}")
             
             # Safe parsing of host and port variables from your centralized config properties
             try:
