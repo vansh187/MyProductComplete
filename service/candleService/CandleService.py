@@ -16,6 +16,8 @@ class CandleService:
     def _normalize_interval(timeframe: str) -> str:
         """Convert API timeframe param to Shoonya interval format."""
         mapping = {
+            "5s": "5second",
+            "10s": "10second",
             "1m": "1minute",
             "3m": "3minute",
             "5m": "5minute",
