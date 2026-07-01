@@ -16,6 +16,9 @@ class QuoteRequest(BaseModel):
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# ── Last Traded Price Cache (for closed market display) ──────────────
+_LAST_PRICE_CACHE = {}
+
 
 def _is_market_open() -> bool:
     now = datetime.now(IST)
@@ -224,7 +227,10 @@ def _parse_historical(data: list) -> dict | None:
 
 
 async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop) -> tuple[dict | None, str | None]:
-    """Fetch a single index quote with fallback logic. Returns (quote_dict, source_name)."""
+    """Fetch a single index quote with fallback logic. Returns (quote_dict, source_name).
+
+    Caches successful quotes for display when market is closed.
+    """
     stock_code    = idx["stock_code"]
     exchange_code = idx["exchange_code"]
     quote         = None
@@ -243,6 +249,8 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
             )
             if quote:
                 source = "shoonya"
+                # Cache successful live price
+                _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                 return quote, source
         except asyncio.TimeoutError:
             print(f"[Shoonya] Timeout for {stock_code}")
@@ -266,6 +274,8 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
                 quote = _parse_get_quotes(data[0])
                 if quote:
                     source = "breeze"
+                    # Cache successful live price
+                    _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                     return quote, source
         except asyncio.TimeoutError:
             print(f"[Breeze] get_quotes timeout for {stock_code}")
@@ -293,11 +303,18 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
             quote = _parse_historical(hist)
             if quote:
                 source = "breeze_historical"
+                # Cache successful price
+                _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                 return quote, source
         except asyncio.TimeoutError:
             print(f"[Breeze] Historical timeout for {stock_code}")
         except Exception as e:
             print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
+
+    # ── Last Resort: Return cached last price (for closed market) ────────
+    if stock_code in _LAST_PRICE_CACHE:
+        cached = _LAST_PRICE_CACHE[stock_code]
+        return cached["quote"], f"{cached['source']} (cached)"
 
     return None, None
 
