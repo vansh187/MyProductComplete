@@ -79,23 +79,35 @@ class TopMoversCache:
     """
     Thread-safe in-memory cache for top movers data.
     Uses asyncio.Condition so SSE clients wake up exactly when cache is refreshed.
+
+    Also maintains a persistent "last valid data" cache for closed-market display,
+    so users see the last-known top movers even when market is closed.
     """
 
     def __init__(self):
-        self._data:       dict | None = None
-        self._generation: int         = 0
-        self._condition               = asyncio.Condition()
+        self._data:            dict | None = None
+        self._last_valid_data: dict | None = None  # Persistent cache for closed market
+        self._generation:      int         = 0
+        self._condition                    = asyncio.Condition()
 
     def get(self) -> dict | None:
-        return self._data
+        """Get current cache, fallback to last valid if current is None."""
+        if self._data is not None:
+            return self._data
+        # Fallback to last valid data when current cache is empty (market closed, etc)
+        return self._last_valid_data
 
     @property
     def generation(self) -> int:
         return self._generation
 
     async def update(self, data: dict) -> None:
+        """Update cache and persist to last_valid_data if gainers/losers exist."""
         async with self._condition:
             self._data       = data
+            # Store as last-valid if it has actual data (not just empty lists)
+            if data.get("gainers") or data.get("losers"):
+                self._last_valid_data = data
             self._generation += 1
             self._condition.notify_all()
 
@@ -103,4 +115,4 @@ class TopMoversCache:
         """Blocks until the cache is updated past `after_generation`."""
         async with self._condition:
             await self._condition.wait_for(lambda: self._generation > after_generation)
-            return self._data
+            return self.get()  # Return current, with fallback to last_valid
