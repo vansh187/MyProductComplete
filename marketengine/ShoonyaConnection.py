@@ -176,7 +176,7 @@ class ShoonyaConnection:
             test = self._api.get_quotes(exchange="NSE", token="26000")
             if test and test.get("stat") == "Ok":
                 self._connected = True
-                print(f"[Shoonya] Connected as {self._user_id}")
+                print(f"[Shoonya] Connected as {self._user_id} (pid={os.getpid()})")
                 return True
 
             print(f"[Shoonya] Token invalid or expired: {test}")
@@ -328,6 +328,8 @@ class ShoonyaConnection:
             print("[Shoonya] SHOONYA_TOTP_SECRET not set — cannot auto_login")
             return False
 
+        print(f"[Shoonya] auto_login starting (pid={os.getpid()})")
+
         login_url = (
             f"https://api.shoonya.com/OAuthlogin/investor-entry-level/login"
             f"?api_key={self._vendor_code}&route_to={self._user_id}"
@@ -362,6 +364,7 @@ class ShoonyaConnection:
 
         wait = WebDriverWait(driver, 30)
         auth_code = None
+        last_url  = login_url
 
         try:
             driver.get(login_url)
@@ -395,6 +398,7 @@ class ShoonyaConnection:
                 # Primary: check browser's current URL after redirect
                 try:
                     current_url = driver.current_url
+                    last_url    = current_url
                     if "code=" in current_url:
                         code = parse_qs(urlparse(current_url).query).get("code", [None])[0]
                         if code:
@@ -438,6 +442,15 @@ class ShoonyaConnection:
         except Exception as exc:
             print(f"[Shoonya] auto_login browser error: {exc}")
         finally:
+            if not auth_code:
+                try:
+                    print(f"[Shoonya] auto_login failure diagnostics — last URL: {last_url}")
+                    print(f"[Shoonya] auto_login failure diagnostics — page title: {driver.title!r}")
+                    screenshot_path = str(_ENV_FILE.parent / "shoonya_login_failure.png")
+                    driver.save_screenshot(screenshot_path)
+                    print(f"[Shoonya] auto_login failure diagnostics — screenshot saved to {screenshot_path}")
+                except Exception as diag_exc:
+                    print(f"[Shoonya] auto_login: failed to capture failure diagnostics: {diag_exc}")
             try:
                 driver.quit()
             except Exception:
@@ -516,7 +529,7 @@ async def schedule_daily_refresh(app):
             shoonya = ShoonyaConnection()
 
         while not shoonya.is_connected:
-            print("[Shoonya] Disconnected — attempting auto-login...")
+            print(f"[Shoonya] Disconnected — attempting auto-login... (pid={os.getpid()})")
             if await _auto_login(shoonya):
                 print(f"[Shoonya] Reconnected at {datetime.now(IST).strftime('%H:%M IST')}")
                 break
