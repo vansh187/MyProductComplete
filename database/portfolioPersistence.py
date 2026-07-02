@@ -11,7 +11,7 @@ class portfolioPersistence:
 
     @staticmethod
     def process_buyer(userId, symbol, quantity, price, cursor):
-        if price is None or not isinstance(price, (int, float)) or price <= 0:
+        if price is None or not isinstance(price, (int, float, Decimal)) or price <= 0:
             raise ValueError(f"Invalid price for buyer: {price}")
         try:
             cursor.execute(QueryLoader.get('portfolio.yaml', 'select_holdings'), (userId, symbol))
