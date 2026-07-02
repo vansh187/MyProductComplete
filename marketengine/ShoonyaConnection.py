@@ -351,10 +351,15 @@ class ShoonyaConnection:
         _cache = DriverCacheManager(root_dir=wdm_root)
 
         print("[Shoonya] Starting headless Chrome for auto-login...")
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager(cache_manager=_cache).install()),
-            options=options,
-        )
+        try:
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager(cache_manager=_cache).install()),
+                options=options,
+            )
+        except Exception as exc:
+            print(f"[Shoonya] auto_login: could not start Chrome — {exc}")
+            return False
+
         wait = WebDriverWait(driver, 30)
         auth_code = None
 
@@ -492,7 +497,14 @@ async def schedule_daily_refresh(app):
 
     async def _auto_login(shoonya) -> bool:
         loop = asyncio.get_running_loop()
-        ok   = await loop.run_in_executor(None, shoonya.auto_login)
+        try:
+            ok = await loop.run_in_executor(None, shoonya.auto_login)
+        except Exception as exc:
+            # Never let an unexpected auto_login exception kill this
+            # background task — that would silently stop all future
+            # reconnect attempts until the process is restarted.
+            print(f"[Shoonya] auto_login raised unexpectedly: {exc}")
+            ok = False
         if ok:
             app.state.shoonya = shoonya
         return ok

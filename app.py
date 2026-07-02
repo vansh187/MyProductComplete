@@ -60,14 +60,15 @@ async def lifespan(app: FastAPI):
                     app.state.shoonya = shoonya
                 else:
                     print("[WARNING] Shoonya auto-login failed — will keep retrying in the background")
-            # Always start the refresh loop, even if the connection above
-            # failed — it will retry auto_login on a short interval instead
-            # of leaving the app permanently disconnected until a manual
-            # restart or the next scheduled 8:30 AM slot.
-            shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
-            top_movers_task      = asyncio.create_task(top_movers_refresh(app))
         except Exception as e:
             print(f"[WARNING] Shoonya init error: {e}")
+
+        # Always start the refresh loop, even if the connection attempt
+        # above failed or raised — it will retry auto_login on a short
+        # interval instead of leaving the app permanently disconnected
+        # until a manual restart or the next scheduled 8:30 AM slot.
+        shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
+        top_movers_task      = asyncio.create_task(top_movers_refresh(app))
     else:
         print("App starting... Shoonya unavailable.")
 
