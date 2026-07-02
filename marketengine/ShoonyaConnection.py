@@ -139,6 +139,8 @@ class ShoonyaConnection:
         Connect using stored tokens from .env.
         Returns True if the session is valid and quotes work.
         """
+        self._connected = False
+
         if not _NOREN_AVAILABLE:
             print("[Shoonya] NorenRestApiOAuth missing.")
             return False
@@ -447,6 +449,11 @@ class ShoonyaConnection:
 
         return self.connect_with_token(token)
 
+    def invalidate(self) -> None:
+        """Marks the session as disconnected (e.g. right before a forced refresh),
+        so dependent endpoints correctly 503 instead of silently using a dead token."""
+        self._connected = False
+
     @property
     def is_connected(self) -> bool:
         return self._connected
@@ -469,29 +476,56 @@ def _next_refresh_delay() -> float:
 
 async def schedule_daily_refresh(app):
     """
-    Background task: every weekday at 8:30 AM IST, runs auto_login()
-    to silently refresh the Shoonya session using headless Chrome + TOTP.
-    Falls back to stored tokens if auto_login fails.
-    """
-    while True:
-        delay  = _next_refresh_delay()
-        next_at = datetime.now(IST) + timedelta(seconds=delay)
-        print(
-            f"[Shoonya] Next auto-refresh at "
-            f"{next_at.strftime('%Y-%m-%d %H:%M IST')} "
-            f"({delay / 3600:.1f}h from now)"
-        )
-        await asyncio.sleep(delay)
+    Background task that keeps the Shoonya session alive.
 
+    - If not currently connected (startup connect/auto_login failed, or a
+      previous scheduled refresh failed), retries auto_login() every
+      RETRY_DELAY seconds until it succeeds. This prevents a single
+      transient failure (Chrome crash, TOTP timing, etc.) from causing an
+      all-day outage — previously a failed 8:30 AM refresh wasn't retried
+      until the next weekday's 8:30 AM slot.
+    - Once connected, sleeps until the next weekday 8:30 AM IST (Shoonya
+      invalidates the previous session around market pre-open), marks the
+      session disconnected, and forces a fresh auto_login().
+    """
+    RETRY_DELAY = 300  # 5 minutes
+
+    async def _auto_login(shoonya) -> bool:
+        loop = asyncio.get_running_loop()
+        ok   = await loop.run_in_executor(None, shoonya.auto_login)
+        if ok:
+            app.state.shoonya = shoonya
+        return ok
+
+    while True:
         shoonya = getattr(app.state, "shoonya", None)
         if shoonya is None:
             from marketengine.ShoonyaConnection import ShoonyaConnection
             shoonya = ShoonyaConnection()
 
-        loop = asyncio.get_running_loop()
-        ok   = await loop.run_in_executor(None, shoonya.auto_login)
-        if ok:
-            app.state.shoonya = shoonya
-            print(f"[Shoonya] Auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
+        while not shoonya.is_connected:
+            print("[Shoonya] Disconnected — attempting auto-login...")
+            if await _auto_login(shoonya):
+                print(f"[Shoonya] Reconnected at {datetime.now(IST).strftime('%H:%M IST')}")
+                break
+            print(f"[Shoonya] Auto-login failed — retrying in {RETRY_DELAY // 60} min")
+            await asyncio.sleep(RETRY_DELAY)
+
+        delay   = _next_refresh_delay()
+        next_at = datetime.now(IST) + timedelta(seconds=delay)
+        print(
+            f"[Shoonya] Next scheduled refresh at "
+            f"{next_at.strftime('%Y-%m-%d %H:%M IST')} "
+            f"({delay / 3600:.1f}h from now)"
+        )
+        await asyncio.sleep(delay)
+
+        # Shoonya invalidates sessions around this time — mark disconnected
+        # immediately so endpoints correctly 503 (instead of silently using
+        # a dead token) until the refresh below completes or the retry loop
+        # above picks it back up.
+        shoonya.invalidate()
+        if await _auto_login(shoonya):
+            print(f"[Shoonya] Scheduled auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
         else:
-            print("[Shoonya] Auto-refresh failed — keeping existing session")
+            print("[Shoonya] Scheduled auto-refresh failed — entering retry mode")
