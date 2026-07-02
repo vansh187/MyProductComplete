@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from fastapi import FastAPI
 from api.signup import router as signup_router
 from api.login import router as login_router
@@ -17,13 +16,6 @@ from api.sectorPerformance import router as sectorPerformanceRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from api.candles import router as candlesRouter
 from fastapi.middleware.cors import CORSMiddleware
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
 try:
     from breeze_connect import BreezeConnect
     from marketengine.config import Config
@@ -34,7 +26,7 @@ except Exception as _breeze_import_err:
     Config = None
     schedule_daily_refresh = None
     _BREEZE_IMPORTABLE = False
-    logger.warning(f"breeze_connect import failed — market data disabled: {_breeze_import_err}")
+    print(f"[WARNING] breeze_connect import failed — market data disabled: {_breeze_import_err}")
 
 try:
     from marketengine.ShoonyaConnection import ShoonyaConnection, schedule_daily_refresh as shoonya_daily_refresh
@@ -43,7 +35,7 @@ except Exception as _shoonya_import_err:
     ShoonyaConnection = None
     shoonya_daily_refresh = None
     _SHOONYA_IMPORTABLE = False
-    logger.warning(f"ShoonyaConnection import failed: {_shoonya_import_err}")
+    print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
 
 
 @asynccontextmanager
@@ -61,15 +53,15 @@ async def lifespan(app: FastAPI):
             if shoonya.connect():
                 app.state.shoonya = shoonya
             else:
-                logger.warning("Shoonya stored token invalid — attempting auto-login...")
+                print("[WARNING] Shoonya stored token invalid — attempting auto-login...")
                 loop = asyncio.get_running_loop()
                 ok   = await loop.run_in_executor(None, shoonya.auto_login)
                 if ok:
                     app.state.shoonya = shoonya
                 else:
-                    logger.warning("Shoonya auto-login failed — will keep retrying in the background")
-        except Exception:
-            logger.error("Shoonya init error", exc_info=True)
+                    print("[WARNING] Shoonya auto-login failed — will keep retrying in the background")
+        except Exception as e:
+            print(f"[WARNING] Shoonya init error: {e}")
 
         # Always start the refresh loop, even if the connection attempt
         # above failed or raised — it will retry auto_login on a short
@@ -78,13 +70,13 @@ async def lifespan(app: FastAPI):
         shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
         top_movers_task      = asyncio.create_task(top_movers_refresh(app))
     else:
-        logger.info("App starting... Shoonya unavailable.")
+        print("App starting... Shoonya unavailable.")
 
     # ── Breeze (secondary / stock quotes) ────────────────────────────
     if app.state.shoonya is not None:
-        logger.info("App starting... Breeze skipped (Shoonya is primary).")
+        print("App starting... Breeze skipped (Shoonya is primary).")
     elif _BREEZE_IMPORTABLE:
-        logger.info("App starting... Establishing Breeze session")
+        print("App starting... Establishing Breeze session")
         try:
             breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
             breeze.generate_session(
@@ -92,12 +84,12 @@ async def lifespan(app: FastAPI):
                 session_token=Config.BREEZE_SESSION_TOKEN
             )
             app.state.breeze = breeze
-            logger.info("Breeze session ready.")
+            print("Breeze session ready.")
             refresh_task = asyncio.create_task(schedule_daily_refresh(app))
-        except Exception:
-            logger.error("Breeze session failed — stock quotes will be unavailable", exc_info=True)
+        except Exception as e:
+            print(f"[WARNING] Breeze session failed — stock quotes will be unavailable: {e}")
     else:
-        logger.info("App starting... Breeze unavailable.")
+        print("App starting... Breeze unavailable.")
 
     yield
 
@@ -107,7 +99,7 @@ async def lifespan(app: FastAPI):
         shoonya_refresh_task.cancel()
     if top_movers_task:
         top_movers_task.cancel()
-    logger.info("Server shutting down.")
+    print("Server shutting down.")
 
 
 app = FastAPI(lifespan=lifespan)
