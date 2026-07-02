@@ -1,7 +1,10 @@
+import logging
 from utils.query_loader import QueryLoader
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class matchtradeOrderforUser:
@@ -19,4 +22,4 @@ class matchtradeOrderforUser:
         except Exception as ex:
             raise Exception("Error in simulation of matching Order")
         finally:
-            print("in final block of create match order for user")
+            logger.debug("Matching engine query executed")

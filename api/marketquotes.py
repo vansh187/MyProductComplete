@@ -16,6 +16,9 @@ class QuoteRequest(BaseModel):
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# ── Last Traded Price Cache (for closed market display) ──────────────
+_LAST_PRICE_CACHE = {}
+
 
 def _is_market_open() -> bool:
     now = datetime.now(IST)
@@ -125,21 +128,37 @@ _ALL_INDICES = [
         "display_name": "Nifty 50",
         "stock_code": "NIFTY", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26000",
+        "breeze_code": "NIFTY",
     },
     {
         "display_name": "Sensex",
-        "stock_code": "BSESEN", "exchange_code": "BSE",
+        "stock_code": "SENSEX", "exchange_code": "BSE",
         "shoonya_exchange": "BSE", "shoonya_token": "1",
+        "breeze_code": "SENSEX",
     },
     {
         "display_name": "Bank Nifty",
-        "stock_code": "CNXBAN", "exchange_code": "NSE",
+        "stock_code": "BANKNIFTY", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26009",
+        "breeze_code": "BANKNIFTY",
     },
     {
         "display_name": "India VIX",
-        "stock_code": "INDVIX", "exchange_code": "NSE",
+        "stock_code": "INDIAVIX", "exchange_code": "NSE",
         "shoonya_exchange": "NSE", "shoonya_token": "26017",
+        "breeze_code": "INDIAVIX",
+    },
+    {
+        "display_name": "Fin Nifty",
+        "stock_code": "FINNIFTY", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26037",
+        "breeze_code": "FINNIFTY",
+    },
+    {
+        "display_name": "Midcap Nifty",
+        "stock_code": "MIDCAPNIFTY", "exchange_code": "NSE",
+        "shoonya_exchange": "NSE", "shoonya_token": "26074",
+        "breeze_code": "MIDCAPNIFTY",
     },
 ]
 
@@ -213,55 +232,72 @@ def _parse_historical(data: list) -> dict | None:
     }
 
 
-async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
-    trading_day = _last_trading_day()
-    loop        = asyncio.get_running_loop()
-    results     = []
-    errors      = []
+async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop) -> tuple[dict | None, str | None]:
+    """Fetch a single index quote with fallback logic. Returns (quote_dict, source_name).
 
-    for idx in _ALL_INDICES:
-        stock_code    = idx["stock_code"]
-        exchange_code = idx["exchange_code"]
-        quote         = None
-        source        = None
+    Caches successful quotes for display when market is closed.
+    Uses breeze_code for Breeze API calls (may differ from cache key stock_code).
+    """
+    stock_code    = idx["stock_code"]
+    breeze_code   = idx.get("breeze_code", stock_code)
+    exchange_code = idx["exchange_code"]
+    quote         = None
+    source        = None
 
-        # ── Primary: Shoonya ──────────────────────────────────────────
-        if shoonya is not None and shoonya.is_connected:
-            try:
-                quote = await loop.run_in_executor(
+    # ── Primary: Shoonya with 10s timeout ──────────────────────────────
+    if shoonya is not None and shoonya.is_connected:
+        try:
+            quote = await asyncio.wait_for(
+                loop.run_in_executor(
                     None,
                     lambda ex=idx["shoonya_exchange"], tk=idx["shoonya_token"]:
                         shoonya.get_index_quote(ex, tk)
-                )
-                if quote:
-                    source = "shoonya"
-            except Exception as e:
-                print(f"[Shoonya] Exception for {stock_code}: {e}")
+                ),
+                timeout=10.0
+            )
+            print(f"[Shoonya] {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {quote}")
+            if quote:
+                source = "shoonya"
+                # Cache successful live price
+                _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
+                return quote, source
+        except asyncio.TimeoutError:
+            print(f"[Shoonya] Timeout for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']})")
+        except Exception as e:
+            print(f"[Shoonya] Exception for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {e}")
 
-        # ── Fallback 1: Breeze get_quotes ─────────────────────────────
-        if quote is None and breeze is not None:
-            try:
-                resp = await loop.run_in_executor(
+    # ── Fallback 1: Breeze get_quotes with 2s timeout ──────────────────
+    if breeze is not None:
+        try:
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
                     None,
-                    lambda sc=stock_code, ex=exchange_code: breeze.get_quotes(
+                    lambda sc=breeze_code, ex=exchange_code: breeze.get_quotes(
                         stock_code=sc, exchange_code=ex, product_type="cash"
                     )
-                )
-                data = (resp or {}).get("Success") or [] if (resp or {}).get("Status") == 200 else []
-                if data:
-                    quote = _parse_get_quotes(data[0])
-                    if quote:
-                        source = "breeze"
-            except Exception as e:
-                print(f"[Breeze] get_quotes failed for {stock_code}: {e}")
+                ),
+                timeout=2.0
+            )
+            data = (resp or {}).get("Success") or [] if (resp or {}).get("Status") == 200 else []
+            if data:
+                quote = _parse_get_quotes(data[0])
+                if quote:
+                    source = "breeze"
+                    # Cache successful live price
+                    _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
+                    return quote, source
+        except asyncio.TimeoutError:
+            print(f"[Breeze] get_quotes timeout for {stock_code}")
+        except Exception as e:
+            print(f"[Breeze] get_quotes failed for {stock_code}: {e}")
 
-        # ── Fallback 2: Breeze historical (NSE only) ──────────────────
-        if quote is None and breeze is not None and exchange_code == "NSE":
-            try:
-                print(f"[Breeze] Falling back to historical for {stock_code}")
-                resp2 = await loop.run_in_executor(
+    # ── Fallback 2: Breeze historical (NSE only) with 2s timeout ──────────
+    if breeze is not None and exchange_code == "NSE":
+        try:
+            resp2 = await asyncio.wait_for(
+                loop.run_in_executor(
                     None,
-                    lambda sc=stock_code: breeze.get_historical_data(
+                    lambda sc=breeze_code: breeze.get_historical_data(
                         interval="1minute",
                         from_date=f"{trading_day}T09:15:00.000Z",
                         to_date=f"{trading_day}T15:30:00.000Z",
@@ -269,14 +305,60 @@ async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
                         exchange_code="NSE",
                         product_type="cash"
                     )
-                )
-                hist = (resp2 or {}).get("Success") or [] if (resp2 or {}).get("Status") == 200 else []
-                quote = _parse_historical(hist)
-                if quote:
-                    source = "breeze_historical"
-            except Exception as e:
-                print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
+                ),
+                timeout=2.0
+            )
+            hist = (resp2 or {}).get("Success") or [] if (resp2 or {}).get("Status") == 200 else []
+            quote = _parse_historical(hist)
+            if quote:
+                source = "breeze_historical"
+                # Cache successful price
+                _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
+                return quote, source
+        except asyncio.TimeoutError:
+            print(f"[Breeze] Historical timeout for {stock_code}")
+        except Exception as e:
+            print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
 
+    # ── Last Resort: Return cached last price ONLY when market is closed ──
+    if stock_code in _LAST_PRICE_CACHE and not _is_market_open():
+        cached = _LAST_PRICE_CACHE[stock_code]
+        return cached["quote"], f"{cached['source']} (cached)"
+
+    return None, None
+
+
+async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
+    """Fetch ALL indices in parallel with per-call timeouts.
+
+    Timeout strategy:
+    - Shoonya (primary): 10s per index
+    - Breeze (fallback): 2s per call
+    All 6 indices fetched in parallel, so wall-clock time ~10s max.
+    """
+    trading_day = _last_trading_day()
+    loop        = asyncio.get_running_loop()
+    results     = []
+    errors      = []
+
+    # Fetch all indices in parallel (not sequentially)
+    tasks = [
+        _fetch_index_quote(idx, shoonya, breeze, trading_day, loop)
+        for idx in _ALL_INDICES
+    ]
+
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for idx, response in zip(_ALL_INDICES, responses):
+        stock_code = idx["stock_code"]
+        exchange_code = idx["exchange_code"]
+
+        if isinstance(response, Exception):
+            print(f"[Exception] {stock_code}: {response}")
+            errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": str(response)})
+            continue
+
+        quote, source = response
         if quote is None:
             print(f"No data for {stock_code} from any provider")
             errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": "no_data"})
@@ -322,11 +404,18 @@ def _normalize_stock(item: dict) -> dict:
 @router.get("/indices")
 async def get_market_indices(request: Request):
     """
-    Returns the latest values for Nifty 50, Sensex, Bank Nifty, and India VIX.
+    Returns the latest values for Nifty 50, Sensex, Bank Nifty, India VIX,
+    Fin Nifty, and Midcap Nifty.
     Shoonya is the primary provider; Breeze is the fallback.
     """
     shoonya, breeze = _get_market_clients(request)
     indices, errors = await _fetch_indices(shoonya, breeze)
+
+    # Log for debugging data fluctuation
+    print(f"[API] /indices response: {len(indices)} indices, {len(errors)} errors")
+    for idx in indices:
+        print(f"  - {idx.get('name')}: {idx.get('value')} ({idx.get('source')})")
+
     return {
         "market_status": "open" if _is_market_open() else "closed",
         "indices":       indices,
@@ -338,8 +427,8 @@ async def get_market_indices(request: Request):
 @router.get("/indices/stream")
 async def stream_market_indices(request: Request):
     """
-    SSE endpoint — pushes live Nifty 50, Sensex, Bank Nifty, and India VIX
-    to the frontend automatically.
+    SSE endpoint — pushes live Nifty 50, Sensex, Bank Nifty, India VIX,
+    Fin Nifty, and Midcap Nifty to the frontend automatically.
       - Market open:   every 10 seconds
       - Market closed: every 60 seconds (keeps connection alive)
 
@@ -394,8 +483,8 @@ async def get_marquee(
 ):
     """
     Single call for the ticker marquee.
-    Always returns Nifty 50, Sensex, Bank Nifty, and India VIX first,
-    followed by any additional stock symbols passed as query params.
+    Always returns Nifty 50, Sensex, Bank Nifty, India VIX, Fin Nifty,
+    and Midcap Nifty first, followed by any additional stock symbols passed as query params.
     Both are fetched concurrently.
 
     GET /api/market/marquee

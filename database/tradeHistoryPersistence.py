@@ -27,11 +27,11 @@ class TradeHistoryPersistence:
                  buy_user_id, sell_user_id, trade_value)
             )
             row = cursor.fetchone()
+            if row is None:
+                raise Exception("Failed to insert trade record - no ID returned")
             return row['id']
         except Exception as ex:
             raise Exception(f"Error inserting trade history: {str(ex)}") from ex
-        finally:
-            print("finally block insert trade history")
 
     def getTradeOrdersById(userId):
         conn = None

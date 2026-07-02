@@ -9,11 +9,11 @@ load_dotenv()
 
 class portfolioPersistence:
 
+    @staticmethod
     def process_buyer(userId, symbol, quantity, price, cursor):
+        if price is None or not isinstance(price, (int, float, Decimal)) or price <= 0:
+            raise ValueError(f"Invalid price for buyer: {price}")
         try:
-            if price <= 0:
-                return {"userId": userId, "Message": "Trade did not happened for negative price"}
-
             cursor.execute(QueryLoader.get('portfolio.yaml', 'select_holdings'), (userId, symbol))
             holdings = cursor.fetchone()
             if not holdings:
@@ -35,6 +35,7 @@ class portfolioPersistence:
         except Exception as ex:
             raise Exception(f"Exception in process_buyer: {str(ex)}") from ex
 
+    @staticmethod
     def process_seller(userId, symbol, quantity, price, cursor):
         if quantity <= 0:
             raise Exception("Quantity must be greater than zero")
@@ -54,12 +55,14 @@ class portfolioPersistence:
         except Exception as e:
             raise Exception(f"Exception in process_seller: {str(e)}") from e
 
+    @staticmethod
     def updateOrderStatusSingle(status, order_id, cursor):
         cursor.execute(
             QueryLoader.get('orders.yaml', 'update_order_status_single'),
             (status, order_id)
         )
 
+    @staticmethod
     def updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id):
         value = status if status is not None else "EXECUTED"
         cursor.execute(
@@ -67,9 +70,11 @@ class portfolioPersistence:
             (value, buy_order_id, sell_order_id)
         )
 
+    @staticmethod
     def updateStatus(userId, symbol, status, buy_order_id, sell_order_id, cursor):
         portfolioPersistence.updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id)
 
+    @staticmethod
     def updateCounterpartyOrderBook(remaining_qty, status, counterparty_order_id, cursor):
         """Update the counterparty's order_book row by orders.id FK."""
         try:
@@ -80,6 +85,7 @@ class portfolioPersistence:
         except Exception as ex:
             raise Exception(f"Error updating counterparty order book: {str(ex)}") from ex
 
+    @staticmethod
     def updateIncomingOrderBook(remaining_qty, status, order_book_id, cursor):
         """Update the incoming order's order_book row by order_book.id PK."""
         try:
@@ -90,6 +96,7 @@ class portfolioPersistence:
         except Exception as ex:
             raise Exception(f"Error updating incoming order book: {str(ex)}") from ex
 
+    @staticmethod
     def createUserHolding(order, userId):
         conn = None
         cursor = None
@@ -111,6 +118,7 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
+    @staticmethod
     def updateUserHoldings(order, userId, new_qty, round, new_avg):
         conn = None
         cursor = None
@@ -132,6 +140,7 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
+    @staticmethod
     def getPortfolioServiceforLoggedInUser(userId):
         conn = None
         cursor = None
@@ -148,6 +157,7 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
+    @staticmethod
     def getPortfolioOfLoggedInUserWithProfitLoss(userId):
         conn = None
         cursor = None
@@ -168,10 +178,12 @@ class portfolioPersistence:
         try:
             cursor.execute(
                 QueryLoader.get('portfolio.yaml', 'insert_order_book'),
-                (userId, order.symbol, order.side, 'LIMIT',
+                (userId, order.symbol, order.side.value, 'LIMIT',
                  order.quantity, order.quantity, order.price, 'PENDING', orderId)
             )
             row = cursor.fetchone()
+            if row is None:
+                raise Exception("Failed to create order book entry - no ID returned")
             return row['id']
         except Exception as ex:
             raise Exception("Error in Inserting Data") from ex

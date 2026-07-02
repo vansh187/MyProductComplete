@@ -12,12 +12,14 @@ update_payment_status: |
 select_wallet_for_update: |
   SELECT
     w.wallet_id,
-    COALESCE(w.balance, 0.00) AS balance,
-    wl.amount AS transaction_amount,
+    COALESCE(w.balance, 0.00)::NUMERIC AS balance,
+    CAST(wl.amount AS NUMERIC) AS transaction_amount,
     wl.status AS transaction_status
   FROM wallets w
   RIGHT JOIN wallet_ledger wl ON w.user_id = wl.user_id::integer
   WHERE wl.razorpay_order_id = %s AND wl.user_id::integer = %s
+  ORDER BY wl.created_at DESC
+  LIMIT 1
 
 insert_wallet: |
   INSERT INTO wallets (user_id, balance)

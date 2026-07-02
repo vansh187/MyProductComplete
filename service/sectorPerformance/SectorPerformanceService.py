@@ -31,9 +31,10 @@ class SectorPerformanceFetcher:
                         lambda ex=sector["exchange"], tk=sector["token"]:
                             shoonya.get_index_quote(ex, tk)
                     ),
-                    timeout=5.0
+                    timeout=8.0
                 )
                 if quote is None:
+                    print(f"[SectorPerf] No data for {sector['sector']} ({sector['token']})")
                     return None, {"sector": sector["sector"], "reason": "no_data"}
                 return {
                     "sector":     sector["sector"],
@@ -42,11 +43,24 @@ class SectorPerformanceFetcher:
                     "ltp":        quote["ltp"],
                 }, None
             except asyncio.TimeoutError:
+                print(f"[SectorPerf] Timeout for {sector['sector']} ({sector['token']})")
                 return None, {"sector": sector["sector"], "reason": "timeout"}
             except Exception as exc:
+                print(f"[SectorPerf] Error for {sector['sector']} ({sector['token']}): {exc}")
                 return None, {"sector": sector["sector"], "reason": str(exc)}
 
-        pairs = await asyncio.gather(*[_fetch_one(s) for s in self._registry.sectors()])
-        results = [p[0] for p in pairs if p[0] is not None]
-        errors  = [p[1] for p in pairs if p[1] is not None]
+        # Fetch in batches of 2 to avoid overwhelming Shoonya with 8 concurrent requests
+        sectors = self._registry.sectors()
+        results = []
+        errors = []
+
+        for i in range(0, len(sectors), 2):
+            batch = sectors[i:i+2]
+            pairs = await asyncio.gather(*[_fetch_one(s) for s in batch])
+            results.extend([p[0] for p in pairs if p[0] is not None])
+            errors.extend([p[1] for p in pairs if p[1] is not None])
+            # Small delay between batches to prevent overwhelming Shoonya
+            if i + 2 < len(sectors):
+                await asyncio.sleep(0.2)
+
         return results, errors

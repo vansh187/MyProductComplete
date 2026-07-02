@@ -1,8 +1,13 @@
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 def create_access_token(data: dict):
-    SECRET_KEY = "mysecretkey123"
+    SECRET_KEY = os.getenv("SECRET_KEY")
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 30
     to_encode = data.copy()
@@ -13,7 +18,7 @@ def create_access_token(data: dict):
     return encoded_jwt
 
 def verify_token(token: str):
-    SECRET_KEY = "mysecretkey123"
+    SECRET_KEY = os.getenv("SECRET_KEY")
     ALGORITHM = "HS256"
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -21,7 +26,7 @@ def verify_token(token: str):
     except JWTError:
         return None
 def decode_token(token: str):
-    SECRET_KEY = "mysecretkey123"
+    SECRET_KEY = os.getenv("SECRET_KEY")
     ALGORITHM = "HS256" 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])

@@ -139,6 +139,8 @@ class ShoonyaConnection:
         Connect using stored tokens from .env.
         Returns True if the session is valid and quotes work.
         """
+        self._connected = False
+
         if not _NOREN_AVAILABLE:
             print("[Shoonya] NorenRestApiOAuth missing.")
             return False
@@ -174,7 +176,7 @@ class ShoonyaConnection:
             test = self._api.get_quotes(exchange="NSE", token="26000")
             if test and test.get("stat") == "Ok":
                 self._connected = True
-                print(f"[Shoonya] Connected as {self._user_id}")
+                print(f"[Shoonya] Connected as {self._user_id} (pid={os.getpid()})")
                 return True
 
             print(f"[Shoonya] Token invalid or expired: {test}")
@@ -235,6 +237,62 @@ class ShoonyaConnection:
             print(f"[Shoonya] get_index_quote error {exchange}:{token}: {exc}")
             return None
 
+    def get_time_price_series(self, exchange: str, token: str, interval: str, days: int = 1) -> list[dict] | None:
+        """
+        Fetch OHLC candle data from Shoonya for a given timeframe.
+
+        Args:
+            exchange: 'NSE' or 'BSE'
+            token: Security token (e.g. '26000' for Nifty 50)
+            interval: Candle interval ('1minute', '3minute', '5minute', '15minute', '1hour', '1day')
+            days: Number of days of history to fetch (default 1 = today)
+
+        Returns:
+            List of dicts with keys: timestamp, open, high, low, close, volume
+            OR None on failure
+        """
+        if not self._connected or self._api is None:
+            return None
+
+        try:
+            ret = self._api.get_time_price_series(
+                exchange=exchange,
+                token=token,
+                starttime=0,
+                interval=interval,
+                lastn=500  # Get last 500 candles (covers ~8 hours of 1m data)
+            )
+
+            if not ret or ret.get("stat") != "Ok":
+                print(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
+                return None
+
+            candles = ret.get("jdata", [])
+            if not candles:
+                return None
+
+            # Parse Shoonya's timestamp format and normalize
+            result = []
+            for candle in candles:
+                try:
+                    result.append({
+                        "timestamp": candle.get("time"),  # Already ISO-8601 from Shoonya
+                        "open":      _safe_float(candle.get("o")),
+                        "high":      _safe_float(candle.get("h")),
+                        "low":       _safe_float(candle.get("l")),
+                        "close":     _safe_float(candle.get("c")),
+                        "volume":    int(candle.get("v", 0)) if candle.get("v") else 0,
+                    })
+                except Exception as e:
+                    print(f"[Shoonya] Error parsing candle {candle}: {e}")
+                    continue
+
+            return result if result else None
+
+        except Exception as exc:
+            print(f"[Shoonya] get_time_price_series error {exchange}:{token} interval={interval}: {exc}")
+            return None
+
     # ------------------------------------------------------------------
     # Automated headless login (no browser interaction needed)
     # ------------------------------------------------------------------
@@ -270,6 +328,8 @@ class ShoonyaConnection:
             print("[Shoonya] SHOONYA_TOTP_SECRET not set — cannot auto_login")
             return False
 
+        print(f"[Shoonya] auto_login starting (pid={os.getpid()})")
+
         login_url = (
             f"https://api.shoonya.com/OAuthlogin/investor-entry-level/login"
             f"?api_key={self._vendor_code}&route_to={self._user_id}"
@@ -293,12 +353,18 @@ class ShoonyaConnection:
         _cache = DriverCacheManager(root_dir=wdm_root)
 
         print("[Shoonya] Starting headless Chrome for auto-login...")
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager(cache_manager=_cache).install()),
-            options=options,
-        )
+        try:
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager(cache_manager=_cache).install()),
+                options=options,
+            )
+        except Exception as exc:
+            print(f"[Shoonya] auto_login: could not start Chrome — {exc}")
+            return False
+
         wait = WebDriverWait(driver, 30)
         auth_code = None
+        last_url  = login_url
 
         try:
             driver.get(login_url)
@@ -332,6 +398,7 @@ class ShoonyaConnection:
                 # Primary: check browser's current URL after redirect
                 try:
                     current_url = driver.current_url
+                    last_url    = current_url
                     if "code=" in current_url:
                         code = parse_qs(urlparse(current_url).query).get("code", [None])[0]
                         if code:
@@ -375,6 +442,15 @@ class ShoonyaConnection:
         except Exception as exc:
             print(f"[Shoonya] auto_login browser error: {exc}")
         finally:
+            if not auth_code:
+                try:
+                    print(f"[Shoonya] auto_login failure diagnostics — last URL: {last_url}")
+                    print(f"[Shoonya] auto_login failure diagnostics — page title: {driver.title!r}")
+                    screenshot_path = str(_ENV_FILE.parent / "shoonya_login_failure.png")
+                    driver.save_screenshot(screenshot_path)
+                    print(f"[Shoonya] auto_login failure diagnostics — screenshot saved to {screenshot_path}")
+                except Exception as diag_exc:
+                    print(f"[Shoonya] auto_login: failed to capture failure diagnostics: {diag_exc}")
             try:
                 driver.quit()
             except Exception:
@@ -390,6 +466,11 @@ class ShoonyaConnection:
             return False
 
         return self.connect_with_token(token)
+
+    def invalidate(self) -> None:
+        """Marks the session as disconnected (e.g. right before a forced refresh),
+        so dependent endpoints correctly 503 instead of silently using a dead token."""
+        self._connected = False
 
     @property
     def is_connected(self) -> bool:
@@ -413,29 +494,63 @@ def _next_refresh_delay() -> float:
 
 async def schedule_daily_refresh(app):
     """
-    Background task: every weekday at 8:30 AM IST, runs auto_login()
-    to silently refresh the Shoonya session using headless Chrome + TOTP.
-    Falls back to stored tokens if auto_login fails.
-    """
-    while True:
-        delay  = _next_refresh_delay()
-        next_at = datetime.now(IST) + timedelta(seconds=delay)
-        print(
-            f"[Shoonya] Next auto-refresh at "
-            f"{next_at.strftime('%Y-%m-%d %H:%M IST')} "
-            f"({delay / 3600:.1f}h from now)"
-        )
-        await asyncio.sleep(delay)
+    Background task that keeps the Shoonya session alive.
 
+    - If not currently connected (startup connect/auto_login failed, or a
+      previous scheduled refresh failed), retries auto_login() every
+      RETRY_DELAY seconds until it succeeds. This prevents a single
+      transient failure (Chrome crash, TOTP timing, etc.) from causing an
+      all-day outage — previously a failed 8:30 AM refresh wasn't retried
+      until the next weekday's 8:30 AM slot.
+    - Once connected, sleeps until the next weekday 8:30 AM IST (Shoonya
+      invalidates the previous session around market pre-open), marks the
+      session disconnected, and forces a fresh auto_login().
+    """
+    RETRY_DELAY = 300  # 5 minutes
+
+    async def _auto_login(shoonya) -> bool:
+        loop = asyncio.get_running_loop()
+        try:
+            ok = await loop.run_in_executor(None, shoonya.auto_login)
+        except Exception as exc:
+            # Never let an unexpected auto_login exception kill this
+            # background task — that would silently stop all future
+            # reconnect attempts until the process is restarted.
+            print(f"[Shoonya] auto_login raised unexpectedly: {exc}")
+            ok = False
+        if ok:
+            app.state.shoonya = shoonya
+        return ok
+
+    while True:
         shoonya = getattr(app.state, "shoonya", None)
         if shoonya is None:
             from marketengine.ShoonyaConnection import ShoonyaConnection
             shoonya = ShoonyaConnection()
 
-        loop = asyncio.get_running_loop()
-        ok   = await loop.run_in_executor(None, shoonya.auto_login)
-        if ok:
-            app.state.shoonya = shoonya
-            print(f"[Shoonya] Auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
+        while not shoonya.is_connected:
+            print(f"[Shoonya] Disconnected — attempting auto-login... (pid={os.getpid()})")
+            if await _auto_login(shoonya):
+                print(f"[Shoonya] Reconnected at {datetime.now(IST).strftime('%H:%M IST')}")
+                break
+            print(f"[Shoonya] Auto-login failed — retrying in {RETRY_DELAY // 60} min")
+            await asyncio.sleep(RETRY_DELAY)
+
+        delay   = _next_refresh_delay()
+        next_at = datetime.now(IST) + timedelta(seconds=delay)
+        print(
+            f"[Shoonya] Next scheduled refresh at "
+            f"{next_at.strftime('%Y-%m-%d %H:%M IST')} "
+            f"({delay / 3600:.1f}h from now)"
+        )
+        await asyncio.sleep(delay)
+
+        # Shoonya invalidates sessions around this time — mark disconnected
+        # immediately so endpoints correctly 503 (instead of silently using
+        # a dead token) until the refresh below completes or the retry loop
+        # above picks it back up.
+        shoonya.invalidate()
+        if await _auto_login(shoonya):
+            print(f"[Shoonya] Scheduled auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
         else:
-            print("[Shoonya] Auto-refresh failed — keeping existing session")
+            print("[Shoonya] Scheduled auto-refresh failed — entering retry mode")

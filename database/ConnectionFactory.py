@@ -1,3 +1,8 @@
+# LEGACY — MySQL connection factory. No longer used by the production application.
+# All production persistence code uses database/PostgresConnectionFactory.py (PostgreSQL).
+# This file is retained only because scheduler/marketPriceSchedular.py and
+# SeedDataScript/marketPriceSeed.py still reference it. Do not use for new code.
+
 import os
 
 import mysql.connector

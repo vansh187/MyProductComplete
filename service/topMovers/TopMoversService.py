@@ -36,9 +36,10 @@ class TopMoversFetcher:
                         lambda ex=stock["exchange"], tk=stock["token"]:
                             shoonya.get_index_quote(ex, tk)
                     ),
-                    timeout=5.0
+                    timeout=8.0
                 )
                 if quote is None:
+                    print(f"[TopMovers] No data for {stock['symbol']} ({stock['token']})")
                     return None
                 return {
                     "symbol":     stock["symbol"],
@@ -48,11 +49,40 @@ class TopMoversFetcher:
                     "change_pct": quote["change_pct"],
                     "change":     quote["change"],
                 }
-            except (asyncio.TimeoutError, Exception):
+            except asyncio.TimeoutError:
+                print(f"[TopMovers] Timeout for {stock['symbol']} ({stock['token']})")
+                return None
+            except Exception as e:
+                print(f"[TopMovers] Error for {stock['symbol']} ({stock['token']}): {e}")
                 return None
 
-        raw = await asyncio.gather(*[_fetch_one(s) for s in self._watchlist.stocks()])
-        valid = [r for r in raw if r is not None]
+        # Fetch in batches of 10 to reduce total time while managing load
+        stocks = self._watchlist.stocks()
+        valid = []
+        failed = []
+
+        for i in range(0, len(stocks), 10):
+            batch = stocks[i:i+10]
+            raw = await asyncio.gather(*[_fetch_one(s) for s in batch])
+
+            for stock, result in zip(batch, raw):
+                if result is not None:
+                    valid.append(result)
+                else:
+                    failed.append(stock)
+
+            # No delay needed with larger batches
+
+        # Retry failed stocks with sequential calls (less aggressive)
+        if failed:
+            print(f"[TopMovers] Retrying {len(failed)} failed stocks...")
+            for stock in failed[:5]:  # Retry up to 5 failed stocks
+                try:
+                    result = await _fetch_one(stock)
+                    if result is not None:
+                        valid.append(result)
+                except Exception:
+                    pass
 
         valid.sort(key=lambda x: x["change_pct"], reverse=True)
         n = self._top_n
@@ -79,23 +109,36 @@ class TopMoversCache:
     """
     Thread-safe in-memory cache for top movers data.
     Uses asyncio.Condition so SSE clients wake up exactly when cache is refreshed.
+
+    Also maintains a persistent "last valid data" cache for closed-market display,
+    so users see the last-known top movers even when market is closed.
     """
 
     def __init__(self):
-        self._data:       dict | None = None
-        self._generation: int         = 0
-        self._condition               = asyncio.Condition()
+        self._data:            dict | None = None
+        self._last_valid_data: dict | None = None  # Persistent cache for closed market
+        self._generation:      int         = 0
+        self._condition                    = asyncio.Condition()
 
     def get(self) -> dict | None:
-        return self._data
+        """Get current cache, fallback to last valid if current has no data."""
+        # Return current data only if it has gainers or losers
+        if self._data is not None and (self._data.get("gainers") or self._data.get("losers")):
+            return self._data
+        # Fallback to last valid data when current is empty/None (market closed, etc)
+        return self._last_valid_data
 
     @property
     def generation(self) -> int:
         return self._generation
 
     async def update(self, data: dict) -> None:
+        """Update cache and persist to last_valid_data if gainers/losers exist."""
         async with self._condition:
             self._data       = data
+            # Store as last-valid if it has actual data (not just empty lists)
+            if data.get("gainers") or data.get("losers"):
+                self._last_valid_data = data
             self._generation += 1
             self._condition.notify_all()
 
@@ -103,4 +146,4 @@ class TopMoversCache:
         """Blocks until the cache is updated past `after_generation`."""
         async with self._condition:
             await self._condition.wait_for(lambda: self._generation > after_generation)
-            return self._data
+            return self.get()  # Return current, with fallback to last_valid

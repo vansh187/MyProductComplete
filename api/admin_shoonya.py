@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
+from utils.auth_dependency import get_current_user
 
 router = APIRouter(prefix="/admin/shoonya", tags=["Shoonya Admin"])
 
@@ -9,7 +10,7 @@ class CodeExchangeRequest(BaseModel):
 
 
 @router.get("/auth-url")
-def get_auth_url(request: Request):
+def get_auth_url(request: Request, current_user=Depends(get_current_user)):
     """
     Step 1 of OAuth flow.
     Returns the browser URL to open for Shoonya authentication.
@@ -27,7 +28,7 @@ def get_auth_url(request: Request):
 
 
 @router.post("/exchange-code")
-def exchange_code(body: CodeExchangeRequest, request: Request):
+def exchange_code(body: CodeExchangeRequest, request: Request, current_user=Depends(get_current_user)):
     """
     Step 2 of OAuth flow.
     Exchanges the browser code for a session token, saves it to .env,
@@ -49,7 +50,7 @@ def exchange_code(body: CodeExchangeRequest, request: Request):
 
 
 @router.get("/status")
-def get_status(request: Request):
+def get_status(request: Request, current_user=Depends(get_current_user)):
     """Returns current Shoonya connection status."""
     shoonya = getattr(request.app.state, "shoonya", None)
     return {

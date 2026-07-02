@@ -1,15 +1,16 @@
 create_order: |
-  INSERT INTO orders (user_id, symbol, side, quantity, price, status, created_at)
-  VALUES (%s, %s, %s, %s, %s, %s, NOW())
+  INSERT INTO orders (user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, created_at)
+  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
   RETURNING id
 
 get_orders: |
-  SELECT id, symbol, side, quantity, price, status
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, created_at, updated_at
   FROM orders
   WHERE user_id = %s
+  ORDER BY created_at DESC
 
 get_order_by_id: |
-  SELECT id, symbol, side, quantity, price, status
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, created_at, updated_at
   FROM orders
   WHERE user_id = %s AND id = %s
 
