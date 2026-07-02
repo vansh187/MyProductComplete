@@ -2,7 +2,6 @@ import os
 import asyncio
 import hashlib
 import json
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -294,30 +293,18 @@ class ShoonyaConnection:
             return None
 
     # ------------------------------------------------------------------
-    # Automated headless login (no browser interaction needed)
+    # Automated login (direct HTTP — no browser required)
     # ------------------------------------------------------------------
 
     def auto_login(self) -> bool:
         """
-        Fully automated OAuth login using headless Chrome + TOTP.
-        Reads credentials from .env, captures the auth code from
-        Shoonya's network response, exchanges it for tokens, and
-        connects — all without any human interaction.
-
-        Requires: selenium, webdriver-manager, pyotp (all in requirements.txt)
+        Direct HTTP login via Shoonya's classic /QuickAuth endpoint.
+        Reads credentials + TOTP secret from .env and logs in with a
+        single POST request — no Chrome/Selenium dependency, so it works
+        on memory-constrained hosts where headless Chrome can't launch.
         """
         try:
             import pyotp
-            from selenium import webdriver
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.common.keys import Keys
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            from selenium.common.exceptions import WebDriverException, StaleElementReferenceException
-            from urllib.parse import urlparse, parse_qs
-            from webdriver_manager.chrome import ChromeDriverManager
-            from webdriver_manager.core.driver_cache import DriverCacheManager
-            from selenium.webdriver.chrome.service import Service
         except ImportError as e:
             print(f"[Shoonya] auto_login dependency missing: {e}")
             return False
@@ -330,142 +317,51 @@ class ShoonyaConnection:
 
         print(f"[Shoonya] auto_login starting (pid={os.getpid()})")
 
-        login_url = (
-            f"https://api.shoonya.com/OAuthlogin/investor-entry-level/login"
-            f"?api_key={self._vendor_code}&route_to={self._user_id}"
-        )
+        pwd_hash     = hashlib.sha256(self._password.encode("utf-8")).hexdigest()
+        app_key_hash = hashlib.sha256(f"{self._user_id}|{self._api_key}".encode("utf-8")).hexdigest()
+        totp_val     = pyotp.TOTP(totp_secret).now()
 
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--log-level=3")
-        # --no-sandbox is required on Linux servers (GCP/Azure/Render); safe to add on all platforms
-        if os.name != "nt":
-            options.add_argument("--no-sandbox")
-        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-        # Cache path: D: drive on Windows (C: full), /tmp on Linux
-        default_cache = "D:\\webdriver_cache" if os.name == "nt" else "/tmp/webdriver_cache"
-        wdm_root = os.environ.get("WDM_CACHE_PATH", default_cache)
-        os.makedirs(wdm_root, exist_ok=True)
-        _cache = DriverCacheManager(root_dir=wdm_root)
-
-        print("[Shoonya] Starting headless Chrome for auto-login...")
-        try:
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager(cache_manager=_cache).install()),
-                options=options,
-            )
-        except Exception as exc:
-            print(f"[Shoonya] auto_login: could not start Chrome — {exc}")
-            return False
-
-        wait = WebDriverWait(driver, 30)
-        auth_code = None
-        last_url  = login_url
+        payload = {
+            "apkversion": "1.0.0",
+            "uid":        self._user_id,
+            "pwd":        pwd_hash,
+            "factor2":    totp_val,
+            "vc":         self._vendor_code,
+            "appkey":     app_key_hash,
+            "imei":       self._imei,
+            "source":     "API",
+        }
+        url = self._api_url.rstrip("/") + "/QuickAuth"
 
         try:
-            driver.get(login_url)
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input")))
-            time.sleep(1)
-
-            all_inputs     = driver.find_elements(By.CSS_SELECTOR, "input:not([type='hidden'])")
-            visible_inputs = [i for i in all_inputs if i.is_displayed()]
-
-            def _fill(el, val):
-                el.click(); time.sleep(0.1); el.clear(); el.send_keys(val); time.sleep(0.1)
-
-            if len(visible_inputs) < 3:
-                raise RuntimeError(
-                    f"[Shoonya] Expected ≥3 visible inputs on login page, found {len(visible_inputs)}. "
-                    f"URL: {driver.current_url}"
-                )
-
-            totp_val = pyotp.TOTP(totp_secret).now()
-            _fill(visible_inputs[0], self._user_id)
-            _fill(visible_inputs[1], self._password)
-            _fill(visible_inputs[2], totp_val)
-
-            # Submit via Enter key (avoids fragile button DOM iteration)
-            visible_inputs[2].send_keys(Keys.RETURN)
-
-            print("[Shoonya] Credentials submitted, waiting for auth code...")
-            deadline = time.time() + 60
-
-            while time.time() < deadline:
-                # Primary: check browser's current URL after redirect
-                try:
-                    current_url = driver.current_url
-                    last_url    = current_url
-                    if "code=" in current_url:
-                        code = parse_qs(urlparse(current_url).query).get("code", [None])[0]
-                        if code:
-                            auth_code = code
-                            break
-                except Exception:
-                    pass
-
-                # Fallback: scan Chrome performance logs for redirect URL
-                if not auth_code:
-                    for entry in driver.get_log("performance"):
-                        try:
-                            msg = json.loads(entry["message"])["message"]
-                            if msg.get("method") == "Network.requestWillBeSent":
-                                url = msg.get("params", {}).get("request", {}).get("url", "")
-                                if "code=" in url:
-                                    code = parse_qs(urlparse(url).query).get("code", [None])[0]
-                                    if code:
-                                        auth_code = code
-                                        break
-                        except Exception:
-                            continue
-                if auth_code:
-                    break
-
-                # Re-submit if TOTP rotated before page responded
-                new_totp = pyotp.TOTP(totp_secret).now()
-                if new_totp != totp_val:
-                    try:
-                        all_inputs     = driver.find_elements(By.CSS_SELECTOR, "input:not([type='hidden'])")
-                        visible_now    = [i for i in all_inputs if i.is_displayed()]
-                        if len(visible_now) >= 3:
-                            _fill(visible_now[2], new_totp)
-                            visible_now[2].send_keys(Keys.RETURN)
-                        totp_val = new_totp
-                    except (StaleElementReferenceException, Exception):
-                        pass
-
-                time.sleep(0.5)
-
+            r    = _requests.post(url, data="jData=" + json.dumps(payload), timeout=15)
+            resp = r.json()
         except Exception as exc:
-            print(f"[Shoonya] auto_login browser error: {exc}")
-        finally:
-            if not auth_code:
-                try:
-                    print(f"[Shoonya] auto_login failure diagnostics — last URL: {last_url}")
-                    print(f"[Shoonya] auto_login failure diagnostics — page title: {driver.title!r}")
-                    screenshot_path = str(_ENV_FILE.parent / "shoonya_login_failure.png")
-                    driver.save_screenshot(screenshot_path)
-                    print(f"[Shoonya] auto_login failure diagnostics — screenshot saved to {screenshot_path}")
-                except Exception as diag_exc:
-                    print(f"[Shoonya] auto_login: failed to capture failure diagnostics: {diag_exc}")
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
-        if not auth_code:
-            print("[Shoonya] auto_login: could not capture auth code")
+            print(f"[Shoonya] auto_login request failed: {exc}")
             return False
 
-        print(f"[Shoonya] Auth code captured, exchanging for token...")
-        token = self.exchange_code(auth_code)
-        if not token:
+        if resp.get("stat") != "Ok":
+            print(f"[Shoonya] auto_login rejected: {resp.get('emsg', resp)}")
             return False
 
-        return self.connect_with_token(token)
+        susertoken = resp.get("susertoken", "")
+        account_id = resp.get("actid") or self._user_id
+        if not susertoken:
+            print(f"[Shoonya] auto_login: no susertoken in response: {resp}")
+            return False
+
+        # Persist — access_token has no separate value in the classic
+        # QuickAuth flow, so susertoken is reused as the Bearer token,
+        # matching exchange_code()'s OAuth-v2 fallback behavior.
+        set_key(str(_ENV_FILE), "SHOONYA_SESSION_TOKEN", susertoken)
+        set_key(str(_ENV_FILE), "SHOONYA_ACCESS_TOKEN", susertoken)
+        set_key(str(_ENV_FILE), "SHOONYA_ACCOUNT_ID", account_id)
+
+        self._account_id   = account_id
+        self._access_token  = susertoken
+
+        print("[Shoonya] auto_login: token saved to .env, verifying session...")
+        return self.connect_with_token(susertoken)
 
     def invalidate(self) -> None:
         """Marks the session as disconnected (e.g. right before a forced refresh),

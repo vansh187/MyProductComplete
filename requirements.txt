@@ -66,8 +66,6 @@ pytz==2026.2
 PyYAML==6.0.3
 NorenRestApiOAuth==0.0.38
 pyotp==2.10.0
-selenium>=4.15.0
-webdriver-manager>=4.0.0
 razorpay==2.0.1
 realtime==2.31.0
 redis==8.0.0
