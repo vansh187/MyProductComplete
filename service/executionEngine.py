@@ -14,6 +14,7 @@ import psycopg2.errors
 from service.portfolioService import portfolioService
 from service.orderService import OrderService
 from service.tradeHistoryService import TradeHistoryService as tradeService
+from service.walletbalance.WalletBalanceService import WalletBalanceService
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from service.matchingEngine.matchingEngine import MatchingEngine
 from api.models import OrderCreate, OrderSide
@@ -312,6 +313,7 @@ class ExecutionEngine:
             order_service = OrderService()
             portfolio_service = portfolioService()
             trade_service = tradeService()
+            wallet_service = WalletBalanceService()
             transaction_id = None
             total_matched_qty = 0
 
@@ -320,6 +322,18 @@ class ExecutionEngine:
             for match_found in trade_executions:
                 if match_found is None:
                     self.logger.warning("Received None match")
+                    continue
+
+                # Reject self-trades: the matching engine does not exclude a user's
+                # own resting orders, and settling both legs for the same user would
+                # corrupt avg_price (process_seller's update never rewrites avg_price
+                # after process_buyer recalculates it) and can bleed real money if the
+                # taker's limit price differs from the matched price.
+                if match_found.buy_user_id == match_found.sell_user_id:
+                    self.logger.warning(
+                        f"Skipping self-trade: user={match_found.buy_user_id}, "
+                        f"symbol={match_found.symbol}, qty={match_found.quantity}"
+                    )
                     continue
 
                 # Verify user ownership of trades
@@ -382,21 +396,29 @@ class ExecutionEngine:
                     incoming_status, self.order_id, cursor
                 )
 
-                # Update holdings
-                if self.order.side == OrderSide.BUY:
-                    portfolio_service.process_buyer(
-                        user_id, self.order.symbol,
-                        match_found.quantity, match_found.execution_price,
-                        cursor
-                    )
-                elif self.order.side == OrderSide.SELL:
-                    portfolio_service.process_seller(
-                        user_id, self.order.symbol,
-                        match_found.quantity, match_found.execution_price,
-                        cursor
-                    )
+                # Update holdings for both sides of the match. match_found always
+                # carries both parties, regardless of which side placed the incoming
+                # (taker) order — the counterparty's resting (maker) order must be
+                # settled too. Only the seller's wallet is credited here; the buyer's
+                # wallet was already debited at order-creation time (see api/orders.py).
+                portfolio_service.process_buyer(
+                    match_found.buy_user_id, match_found.symbol,
+                    match_found.quantity, match_found.execution_price,
+                    cursor
+                )
+                portfolio_service.process_seller(
+                    match_found.sell_user_id, match_found.symbol,
+                    match_found.quantity, match_found.execution_price,
+                    cursor
+                )
+                wallet_service.creditWallet(
+                    cursor, match_found.sell_user_id, match_found.trade_value
+                )
 
-                self.logger.info(f"Trade processed: transaction_id={transaction_id}, qty={match_found.quantity}")
+                self.logger.info(
+                    f"Trade processed: transaction_id={transaction_id}, qty={match_found.quantity}, "
+                    f"buyer={match_found.buy_user_id}, seller={match_found.sell_user_id}"
+                )
 
             conn.commit()
             self.logger.info(f"All trades committed successfully")

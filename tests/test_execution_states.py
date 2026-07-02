@@ -259,7 +259,8 @@ class TestPartiallyExecutedState:
         with patch("service.executionEngine.PostgresConnectionFactory") as MockConnFactory, \
              patch("service.executionEngine.OrderService") as MockOrderService, \
              patch("service.executionEngine.portfolioService") as MockPortfolioService, \
-             patch("service.executionEngine.tradeService") as MockTradeService:
+             patch("service.executionEngine.tradeService") as MockTradeService, \
+             patch("service.executionEngine.WalletBalanceService") as MockWalletBalanceService:
 
             # Setup mock connection
             mock_cursor = MagicMock()
@@ -394,7 +395,8 @@ class TestExecutedState:
         with patch("service.executionEngine.PostgresConnectionFactory") as MockConnFactory, \
              patch("service.executionEngine.OrderService") as MockOrderService, \
              patch("service.executionEngine.portfolioService") as MockPortfolioService, \
-             patch("service.executionEngine.tradeService") as MockTradeService:
+             patch("service.executionEngine.tradeService") as MockTradeService, \
+             patch("service.executionEngine.WalletBalanceService") as MockWalletBalanceService:
 
             # Setup mock connection
             mock_cursor = MagicMock()
@@ -514,7 +516,8 @@ class TestExecutionEdgeCases:
         with patch("service.executionEngine.PostgresConnectionFactory") as MockConnFactory, \
              patch("service.executionEngine.OrderService") as MockOrderService, \
              patch("service.executionEngine.portfolioService") as MockPortfolioService, \
-             patch("service.executionEngine.tradeService") as MockTradeService:
+             patch("service.executionEngine.tradeService") as MockTradeService, \
+             patch("service.executionEngine.WalletBalanceService") as MockWalletBalanceService:
 
             mock_cursor = MagicMock()
             mock_conn = MagicMock()
