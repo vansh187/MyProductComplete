@@ -38,7 +38,16 @@ class RazorPayPersistence:
             if cursor is not None:
                 cursor.close()
 
-    def updatePaymentStatus(self, razorpay_order_id, razorpay_payment_id, userId):
+    def updatePaymentStatus(self, razorpay_order_id, razorpay_payment_id, userId) -> bool:
+        """
+        Atomically flips the ledger row from PENDING to SUCCESS.
+
+        Returns True only if this call performed the PENDING->SUCCESS
+        transition (i.e. this is the first time this payment has been
+        processed). Returns False if the row was already SUCCESS (a
+        duplicate/retried webhook delivery) or not found, so callers can use
+        this as a single-use gate before crediting the wallet.
+        """
         conn = None
         cursor = None
         try:
@@ -49,12 +58,18 @@ class RazorPayPersistence:
                 (TransactionStatus.SUCCESS, razorpay_payment_id,
                  userId, razorpay_order_id, TransactionStatus.PENDING)
             )
+            was_pending = cursor.rowcount > 0
             conn.commit()
-            print("Transaction update is success")
+            if was_pending:
+                print("Transaction update is success")
+            else:
+                print(f"Payment for order {razorpay_order_id}/user {userId} was already processed - skipping duplicate")
+            return was_pending
         except Exception as ex:
             if conn:
                 conn.rollback()
             print(f"Error in updating status: {str(ex)}")
+            return False
         finally:
             if conn is not None:
                 conn.close()

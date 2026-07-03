@@ -181,11 +181,17 @@ class RazorPayManagerService:
     def invokeCallToDatabase(self,razorpay_order_id,razorpay_payment_id,userId):
         print("calling to database")
         razorPayPersistence=RazorPayPersistence()
-        razorPayPersistence.updatePaymentStatus(
-                       razorpay_order_id , 
-                       razorpay_payment_id , 
+        was_newly_processed = razorPayPersistence.updatePaymentStatus(
+                       razorpay_order_id ,
+                       razorpay_payment_id ,
                         userId
                     )
-                    
-        razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id) 
-        print("database update completed")  
+
+        # updatePaymentStatus only returns True the first time this payment
+        # transitions PENDING -> SUCCESS, so this guards against crediting
+        # the wallet multiple times for retried/duplicate Razorpay webhooks.
+        if was_newly_processed:
+            razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id)
+        else:
+            print(f"Skipping wallet credit for order {razorpay_order_id}: payment already processed")
+        print("database update completed")
