@@ -32,29 +32,29 @@ def _override_auth():
 class TestCandleService:
 
     def test_normalize_interval_1m(self):
-        """1m → 1minute"""
+        """1m → 1 (NorenApi TPSeries expects plain minute counts)"""
         result = CandleService._normalize_interval("1m")
-        assert result == "1minute"
+        assert result == "1"
 
     def test_normalize_interval_5m(self):
-        """5m → 5minute"""
+        """5m → 5"""
         result = CandleService._normalize_interval("5m")
-        assert result == "5minute"
+        assert result == "5"
 
     def test_normalize_interval_1h(self):
-        """1h → 1hour"""
+        """1h → 60"""
         result = CandleService._normalize_interval("1h")
-        assert result == "1hour"
+        assert result == "60"
 
-    def test_normalize_interval_1d(self):
-        """1d → 1day"""
+    def test_normalize_interval_1d_unsupported(self):
+        """1d is not available via TPSeries (minute-granularity only)"""
         result = CandleService._normalize_interval("1d")
-        assert result == "1day"
+        assert result is None
 
-    def test_normalize_interval_invalid_defaults_to_1minute(self):
-        """Unknown interval defaults to 1minute"""
+    def test_normalize_interval_invalid_returns_none(self):
+        """Unknown/unsupported interval returns None instead of silently defaulting"""
         result = CandleService._normalize_interval("30m")
-        assert result == "1minute"
+        assert result is None
 
     def test_format_candle_valid(self):
         """Candle dict is normalized and rounded correctly"""
@@ -149,6 +149,37 @@ class TestNiftyCandles:
 
         assert resp.status_code == 400
         assert "Invalid timeframe" in resp.json()["detail"]
+
+    @pytest.mark.parametrize("timeframe", ["5s", "10s", "1d"])
+    def test_nifty_candles_broker_unsupported_timeframe_rejected(self, timeframe):
+        """5s/10s/1d aren't fulfillable via Shoonya's TPSeries (minute-only
+        granularity) so they must be rejected at validation, not silently
+        return an empty candle list."""
+        app = _make_app()
+
+        with patch("api.candles._get_shoonya"):
+            client = TestClient(app)
+            resp = client.get(f"/api/market/nifty/candles?timeframe={timeframe}")
+
+        assert resp.status_code == 400
+        assert "Invalid timeframe" in resp.json()["detail"]
+
+    def test_nifty_candles_default_timeframe_is_1m(self):
+        """Default timeframe must be one the broker can actually fulfill"""
+        app = _make_app()
+
+        with patch("api.candles._candleService.get_index_candles", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = ([], [])
+            with patch("api.candles._get_shoonya") as mock_shoonya:
+                mock_shoonya_conn = MagicMock()
+                mock_shoonya_conn.is_connected = True
+                mock_shoonya.return_value = mock_shoonya_conn
+
+                client = TestClient(app)
+                resp = client.get("/api/market/nifty/candles")
+
+        assert resp.status_code == 200
+        assert resp.json()["timeframe"] == "1m"
 
     def test_nifty_candles_shoonya_disconnected(self):
         """Shoonya disconnected returns 503"""
@@ -265,11 +296,11 @@ class TestFinNiftyCandles:
                 mock_shoonya.return_value = mock_shoonya_conn
 
                 client = TestClient(app)
-                resp = client.get("/api/market/finnifty/candles?timeframe=1d")
+                resp = client.get("/api/market/finnifty/candles?timeframe=1h")
 
         assert resp.status_code == 200
         assert resp.json()["symbol"] == "FINNIFTY"
-        assert resp.json()["timeframe"] == "1d"
+        assert resp.json()["timeframe"] == "1h"
 
 
 # ── GET /api/market/sensex/candles ──────────────────────────────────────────
@@ -303,10 +334,10 @@ class TestSensexCandles:
         assert data["errors"] == []
 
     def test_sensex_candles_multiple_timeframes(self):
-        """Sensex supports all timeframes"""
+        """Sensex supports all broker-fulfillable timeframes"""
         app = _make_app()
 
-        for timeframe in ["1m", "3m", "5m", "15m", "1h", "1d"]:
+        for timeframe in ["1m", "3m", "5m", "15m", "1h"]:
             with patch("api.candles._candleService.get_index_candles", new_callable=AsyncMock) as mock_fetch:
                 mock_fetch.return_value = ([], [])
 

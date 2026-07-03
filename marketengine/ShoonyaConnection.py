@@ -244,7 +244,9 @@ class ShoonyaConnection:
         Args:
             exchange: 'NSE' or 'BSE'
             token: Security token (e.g. '26000' for Nifty 50)
-            interval: Candle interval ('1minute', '3minute', '5minute', '15minute', '1hour', '1day')
+            interval: Candle interval in minutes as a string, one of
+                '1', '3', '5', '15', '60' (NorenApi's TPSeries only supports
+                minute granularity - no sub-minute intervals).
             days: Number of days of history to fetch (default 1 = today)
 
         Returns:
@@ -254,38 +256,48 @@ class ShoonyaConnection:
         if not self._connected or self._api is None:
             return None
 
+        if not interval:
+            return None
+
         try:
+            starttime = time.time() - (days * 86400)
+
             ret = self._api.get_time_price_series(
                 exchange=exchange,
                 token=token,
-                starttime=0,
+                starttime=starttime,
                 interval=interval,
-                lastn=500  # Get last 500 candles (covers ~8 hours of 1m data)
             )
 
-            if not ret or ret.get("stat") != "Ok":
+            # NorenApi returns a plain list of candle dicts on success, or a
+            # dict (e.g. {"stat": "Not_Ok", "emsg": ...}) on failure.
+            if not ret or not isinstance(ret, list):
                 print(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
                 return None
 
-            candles = ret.get("jdata", [])
-            if not candles:
-                return None
-
-            # Parse Shoonya's timestamp format and normalize
-            result = []
-            for candle in candles:
+            # Parse Shoonya's TPSeries field names and normalize. TPSeries
+            # returns candles newest-first, but callers expect chronological
+            # (oldest-first) order for charting/trimming, so sort by the
+            # broker's own timestamp before returning.
+            parsed = []
+            for candle in ret:
                 try:
-                    result.append({
-                        "timestamp": candle.get("time"),  # Already ISO-8601 from Shoonya
-                        "open":      _safe_float(candle.get("o")),
-                        "high":      _safe_float(candle.get("h")),
-                        "low":       _safe_float(candle.get("l")),
-                        "close":     _safe_float(candle.get("c")),
-                        "volume":    int(candle.get("v", 0)) if candle.get("v") else 0,
-                    })
+                    raw_time = candle.get("time")
+                    sort_key = datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S")
+                    parsed.append((sort_key, {
+                        "timestamp": raw_time,
+                        "open":      _safe_float(candle.get("into")),
+                        "high":      _safe_float(candle.get("inth")),
+                        "low":       _safe_float(candle.get("intl")),
+                        "close":     _safe_float(candle.get("intc")),
+                        "volume":    int(_safe_float(candle.get("intv"))),
+                    }))
                 except Exception as e:
                     print(f"[Shoonya] Error parsing candle {candle}: {e}")
                     continue
+
+            parsed.sort(key=lambda item: item[0])
+            result = [candle for _, candle in parsed]
 
             return result if result else None
 
