@@ -74,6 +74,45 @@ class TestCandleService:
         assert result["close"] == 24870.51
         assert result["volume"] == 50000
 
+    def test_filter_to_last_trading_day_drops_stale_days(self):
+        """When the lookback window spans a weekend, only the most recent
+        day's candles (e.g. Friday) should survive, not a blend with Thursday."""
+        raw = [
+            {"timestamp": "02-07-2026 15:29:00", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},  # Thursday
+            {"timestamp": "03-07-2026 09:15:00", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},  # Friday
+            {"timestamp": "03-07-2026 09:16:00", "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3},  # Friday
+        ]
+        result = CandleService._filter_to_last_trading_day(raw)
+        assert len(result) == 2
+        assert all(c["timestamp"].startswith("03-07-2026") for c in result)
+
+    def test_get_index_candles_returns_last_trading_day_over_weekend(self):
+        """Simulates opening the app on a Sunday: broker (given a wide lookback)
+        returns Friday's candles even though 'today' has no data, and the
+        service must surface them instead of reporting no_candle_data."""
+        import asyncio
+
+        friday_candles = [
+            {"timestamp": "03-07-2026 09:15:00", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1000},
+            {"timestamp": "03-07-2026 09:16:00", "open": 100.5, "high": 102, "low": 100, "close": 101.5, "volume": 1200},
+        ]
+
+        fake_shoonya = MagicMock()
+        fake_shoonya.is_connected = True
+        fake_shoonya.get_time_price_series.return_value = friday_candles
+
+        service = CandleService()
+        candles, errors = asyncio.run(
+            service.get_index_candles(fake_shoonya, "NSE", "26000", "1m", limit=100)
+        )
+
+        assert errors == []
+        assert len(candles) == 2
+        # Lookback window must be wide enough to survive a closed weekend,
+        # not the old hardcoded days=1 (last 24h from "now").
+        _, kwargs = fake_shoonya.get_time_price_series.call_args
+        assert kwargs["days"] > 1
+
     def test_format_candle_missing_fields_defaults_to_zero(self):
         """Missing OHLC fields default to 0"""
         raw = {"timestamp": "2026-07-01T09:15:00+05:30"}

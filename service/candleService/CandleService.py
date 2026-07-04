@@ -3,7 +3,14 @@ OHLC candle data service for F&O trading terminal.
 Fetches historical candles from Shoonya for charting.
 """
 
+from datetime import datetime
 from decimal import Decimal
+
+# How many calendar days of history to request from the broker. This must be
+# wide enough to reach back past weekends/holidays to the last trading day
+# (e.g. a long weekend + a holiday Monday can leave 3+ closed days in a row),
+# not just "1 day back from now".
+_LOOKBACK_DAYS = 10
 
 
 class CandleService:
@@ -32,6 +39,40 @@ class CandleService:
     def _normalize_interval(cls, timeframe: str) -> str | None:
         """Convert API timeframe param to Shoonya interval format, or None if unsupported."""
         return cls._SUPPORTED_INTERVALS.get(timeframe)
+
+    @staticmethod
+    def _filter_to_last_trading_day(raw_candles: list[dict]) -> list[dict]:
+        """Keep only the candles belonging to the most recent date present.
+
+        raw_candles is assumed chronologically sorted (oldest first, as
+        returned by ShoonyaConnection.get_time_price_series). Broker
+        timestamps are "DD-MM-YYYY HH:MM:SS" strings.
+        """
+        last_date = None
+        for candle in reversed(raw_candles):
+            ts = candle.get("timestamp")
+            if not ts:
+                continue
+            try:
+                last_date = datetime.strptime(ts, "%d-%m-%Y %H:%M:%S").date()
+            except ValueError:
+                continue
+            break
+
+        if last_date is None:
+            return raw_candles
+
+        filtered = []
+        for candle in raw_candles:
+            ts = candle.get("timestamp")
+            try:
+                candle_date = datetime.strptime(ts, "%d-%m-%Y %H:%M:%S").date()
+            except (ValueError, TypeError):
+                continue
+            if candle_date == last_date:
+                filtered.append(candle)
+
+        return filtered
 
     @staticmethod
     def _format_candle(raw_candle: dict) -> dict:
@@ -70,7 +111,7 @@ class CandleService:
                 })
                 return candles, errors
 
-            raw_candles = shoonya.get_time_price_series(exchange, token, interval, days=1)
+            raw_candles = shoonya.get_time_price_series(exchange, token, interval, days=_LOOKBACK_DAYS)
 
             if not raw_candles:
                 errors.append({
@@ -81,8 +122,15 @@ class CandleService:
                 })
                 return candles, errors
 
+            # raw_candles may span several calendar days (weekends/holidays
+            # widen the lookback window above). Keep only the most recent
+            # trading day present so a Sunday/holiday request still shows a
+            # full, coherent session (e.g. Friday's candles) instead of a
+            # blend of the last two trading days.
+            last_day_candles = self._filter_to_last_trading_day(raw_candles)
+
             # Trim to requested limit (most recent candles)
-            result_candles = raw_candles[-limit:] if len(raw_candles) > limit else raw_candles
+            result_candles = last_day_candles[-limit:] if len(last_day_candles) > limit else last_day_candles
 
             # Normalize each candle
             candles = [self._format_candle(c) for c in result_candles]
