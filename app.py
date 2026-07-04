@@ -15,6 +15,8 @@ from api.admin_shoonya import router as adminShoonyaRouter
 from api.sectorPerformance import router as sectorPerformanceRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from api.candles import router as candlesRouter
+from api.optionChain import router as optionChainRouter, _optionChainService
+from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -30,10 +32,12 @@ except Exception as _breeze_import_err:
 
 try:
     from marketengine.ShoonyaConnection import ShoonyaConnection, schedule_daily_refresh as shoonya_daily_refresh
+    from marketengine.ShoonyaOptionFeed import ShoonyaOptionFeed
     _SHOONYA_IMPORTABLE = True
 except Exception as _shoonya_import_err:
     ShoonyaConnection = None
     shoonya_daily_refresh = None
+    ShoonyaOptionFeed = None
     _SHOONYA_IMPORTABLE = False
     print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
 
@@ -43,8 +47,10 @@ async def lifespan(app: FastAPI):
     refresh_task         = None
     shoonya_refresh_task = None
     top_movers_task      = None
-    app.state.breeze     = None
-    app.state.shoonya    = None
+    option_master_task   = None
+    app.state.breeze       = None
+    app.state.shoonya      = None
+    app.state.option_feed  = None
 
     # ── Shoonya (primary indices provider) ───────────────────────────
     if _SHOONYA_IMPORTABLE:
@@ -69,6 +75,18 @@ async def lifespan(app: FastAPI):
         # until a manual restart or the next scheduled 8:30 AM slot.
         shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
         top_movers_task      = asyncio.create_task(top_movers_refresh(app))
+
+        # ── Option chain: live WS feed + scrip-master daily refresh ──
+        if app.state.shoonya is not None:
+            try:
+                option_feed = ShoonyaOptionFeed(app.state.shoonya)
+                option_feed.start()
+                _optionChainService.set_feed(option_feed)
+                app.state.option_feed = option_feed
+                print("App starting... Option chain WebSocket feed started.")
+            except Exception as e:
+                print(f"[WARNING] Option chain feed init error: {e}")
+        option_master_task = asyncio.create_task(option_master_daily_refresh(app))
     else:
         print("App starting... Shoonya unavailable.")
 
@@ -99,6 +117,10 @@ async def lifespan(app: FastAPI):
         shoonya_refresh_task.cancel()
     if top_movers_task:
         top_movers_task.cancel()
+    if option_master_task:
+        option_master_task.cancel()
+    if app.state.option_feed:
+        app.state.option_feed.close()
     print("Server shutting down.")
 
 
@@ -117,6 +139,7 @@ app.include_router(adminShoonyaRouter)
 app.include_router(sectorPerformanceRouter)
 app.include_router(topMoversRouter)
 app.include_router(candlesRouter)
+app.include_router(optionChainRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],

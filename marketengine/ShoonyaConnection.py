@@ -237,6 +237,35 @@ class ShoonyaConnection:
             print(f"[Shoonya] get_index_quote error {exchange}:{token}: {exc}")
             return None
 
+    def get_option_quote(self, exchange: str, token: str) -> dict | None:
+        """
+        REST snapshot for a single option contract - used to seed OI/LTP/bid/
+        ask immediately when a strike chain is first subscribed, before
+        touchline ticks start arriving (WS updates only carry the fields that
+        changed, so a fresh contract has nothing until the first tick).
+        Returns a normalised dict or None on failure.
+        Keys: ltp, bid, ask, oi, volume
+        """
+        if not self._connected or self._api is None:
+            return None
+        try:
+            ret = self._api.get_quotes(exchange=exchange, token=token)
+            if not ret or ret.get("stat") != "Ok":
+                print(f"[Shoonya] get_option_quote failed {exchange}:{token} → {ret}")
+                return None
+
+            return {
+                "ltp":    _safe_float(ret.get("lp")),
+                "bid":    _safe_float(ret.get("bp1")),
+                "ask":    _safe_float(ret.get("sp1")),
+                "oi":     int(_safe_float(ret.get("oi"))) if ret.get("oi") not in (None, "") else None,
+                "volume": int(_safe_float(ret.get("v"))) if ret.get("v") not in (None, "") else None,
+            }
+
+        except Exception as exc:
+            print(f"[Shoonya] get_option_quote error {exchange}:{token}: {exc}")
+            return None
+
     def get_time_price_series(self, exchange: str, token: str, interval: str, days: int = 1) -> list[dict] | None:
         """
         Fetch OHLC candle data from Shoonya for a given timeframe.
@@ -532,6 +561,21 @@ async def schedule_daily_refresh(app):
             ok = False
         if ok:
             app.state.shoonya = shoonya
+
+            # connect() (called inside auto_login) builds a BRAND NEW NorenApi
+            # instance every time, so any option-chain WebSocket opened on the
+            # previous instance is now orphaned — without this, option-chain
+            # ticks would go permanently dead after every reconnect (daily
+            # 8:30 AM refresh, or a retry after an outage) even though REST
+            # endpoints keep working fine since they resolve self._api fresh
+            # on every call.
+            option_feed = getattr(app.state, "option_feed", None)
+            if option_feed is not None:
+                try:
+                    option_feed.start()
+                    print("[Shoonya] Option chain WS feed restarted after reconnect")
+                except Exception as exc:
+                    print(f"[Shoonya] Failed to restart option chain feed after reconnect: {exc}")
         return ok
 
     while True:
