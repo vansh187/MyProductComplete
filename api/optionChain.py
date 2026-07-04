@@ -7,6 +7,7 @@ provides no IV field anywhere.
 """
 
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timezone
 
@@ -113,17 +114,62 @@ async def stream_option_chain(
     async def _event_generator():
         last_seen_gen = -1
         was_shoonya_disconnected = False
+        cache = None
+        resolved_expiry_value = None
+        errors: list[dict] = [{"reason": "connecting"}]
+        init_task = asyncio.create_task(_optionChainService.get_cache_for_stream(shoonya, underlying, expiry))
+
         try:
-            # Send the current snapshot immediately so the UI doesn't wait for the next tick.
-            snapshot = cache.get()
-            if snapshot is not None:
-                last_seen_gen = cache.generation
-                data = {**snapshot, "expiry": resolved_expiry}
-                yield f"data: {json.dumps(_envelope(underlying, resolved_expiry, data, []))}\n\n"
+            await asyncio.sleep(0)
+            if init_task.done():
+                try:
+                    cache, resolved_expiry_value, errors = init_task.result()
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    errors = [{"reason": "initialization_failed", "detail": str(exc)}]
+                    yield f"data: {json.dumps(_envelope(underlying, expiry, None, errors))}\n\n"
+                    return
+
+                if cache is None:
+                    yield f"data: {json.dumps(_envelope(underlying, expiry, None, errors))}\n\n"
+                    return
+
+                resolved_expiry_value = resolved_expiry_value or expiry
+                snapshot = cache.get()
+                if snapshot is not None:
+                    last_seen_gen = cache.generation
+                    data = {**snapshot, "expiry": resolved_expiry_value}
+                    yield f"data: {json.dumps(_envelope(underlying, resolved_expiry_value, data, []))}\n\n"
+            else:
+                # Send a lightweight placeholder immediately so the client and any
+                # upstream proxy don't wait for the cache warm-up to finish.
+                yield f"data: {json.dumps(_envelope(underlying, expiry, None, errors))}\n\n"
 
             while True:
                 if await request.is_disconnected():
                     break
+
+                if cache is None:
+                    if init_task.done():
+                        try:
+                            cache, resolved_expiry_value, errors = init_task.result()
+                        except Exception as exc:  # pragma: no cover - defensive guard
+                            errors = [{"reason": "initialization_failed", "detail": str(exc)}]
+                            yield f"data: {json.dumps(_envelope(underlying, expiry, None, errors))}\n\n"
+                            break
+
+                        if cache is None:
+                            yield f"data: {json.dumps(_envelope(underlying, expiry, None, errors))}\n\n"
+                            break
+
+                        resolved_expiry_value = resolved_expiry_value or expiry
+                        snapshot = cache.get()
+                        if snapshot is not None:
+                            last_seen_gen = cache.generation
+                            data = {**snapshot, "expiry": resolved_expiry_value}
+                            yield f"data: {json.dumps(_envelope(underlying, resolved_expiry_value, data, []))}\n\n"
+                    else:
+                        await asyncio.sleep(0.2)
+                        continue
 
                 # A chain that started streaming while Shoonya was connected
                 # would otherwise loop here forever once it drops mid-stream
@@ -134,8 +180,8 @@ async def stream_option_chain(
                     if not was_shoonya_disconnected:
                         was_shoonya_disconnected = True
                         snapshot = cache.get()
-                        data = {**snapshot, "expiry": resolved_expiry} if snapshot else None
-                        yield f"data: {json.dumps(_envelope(underlying, resolved_expiry, data, [{'reason': 'shoonya_disconnected'}]))}\n\n"
+                        data = {**snapshot, "expiry": resolved_expiry_value} if snapshot else None
+                        yield f"data: {json.dumps(_envelope(underlying, resolved_expiry_value, data, [{'reason': 'shoonya_disconnected'}]))}\n\n"
                     await asyncio.sleep(DISCONNECTED_RECHECK_SECS)
                     continue
                 was_shoonya_disconnected = False
@@ -150,10 +196,15 @@ async def stream_option_chain(
 
                 last_seen_gen = cache.generation
                 if snapshot is not None:
-                    data = {**snapshot, "expiry": resolved_expiry}
-                    yield f"data: {json.dumps(_envelope(underlying, resolved_expiry, data, []))}\n\n"
+                    data = {**snapshot, "expiry": resolved_expiry_value}
+                    yield f"data: {json.dumps(_envelope(underlying, resolved_expiry_value, data, []))}\n\n"
         finally:
-            _optionChainService.release_chain(underlying, resolved_expiry)
+            if init_task is not None:
+                init_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await init_task
+            if cache is not None and resolved_expiry_value is not None:
+                _optionChainService.release_chain(underlying, resolved_expiry_value)
 
     return StreamingResponse(
         _event_generator(),

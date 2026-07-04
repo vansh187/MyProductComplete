@@ -38,6 +38,32 @@ class _FakeCache:
 
 
 @pytest.mark.asyncio
+async def test_stream_emits_initial_frame_while_cache_initializes():
+    shoonya = MagicMock()
+    shoonya.is_connected = True
+    fake_request = _FakeRequest()
+    fake_request.app.state.shoonya = shoonya
+
+    async def delayed_get_cache_for_stream(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return _FakeCache(), "2026-07-14", []
+
+    with patch("api.optionChain.OptionMaster") as mock_master, \
+         patch.object(mod._optionChainService, "get_cache_for_stream",
+                      new=AsyncMock(side_effect=delayed_get_cache_for_stream)), \
+         patch.object(mod._optionChainService, "release_chain"):
+        mock_master.is_valid_underlying.return_value = True
+
+        response = await mod.stream_option_chain(underlying="nifty", request=fake_request, expiry=None)
+        gen = response.body_iterator
+
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=0.5)
+        body = json.loads(frame.split("data: ", 1)[1])
+        assert body["errors"] == [{"reason": "connecting"}]
+        await gen.aclose()
+
+
+@pytest.mark.asyncio
 async def test_stream_signals_disconnect_then_recovers(monkeypatch):
     monkeypatch.setattr(mod, "DISCONNECTED_RECHECK_SECS", 0.01)
 
