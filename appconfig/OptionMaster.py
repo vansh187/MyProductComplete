@@ -5,8 +5,31 @@ from pathlib import Path
 
 _FILE = Path(__file__).parent / "master_options.json"
 
-# Structure in JSON: { "NIFTY": { "expiries": [...], "<iso-expiry>": { "<strike>": {...} } }, ... }
-_raw: dict[str, dict] = json.loads(_FILE.read_text(encoding="utf-8"))
+
+def _load(path: Path) -> dict[str, dict]:
+    """
+    Structure in JSON: { "NIFTY": { "expiries": [...], "<iso-expiry>": { "<strike>": {...} } }, ... }
+
+    A missing/corrupt file must never take down the whole app at import time
+    (app.py imports api/optionChain.py -> this module unconditionally at
+    startup) - the rest of the platform (orders, wallet, candles, etc.) has
+    nothing to do with the option chain feature and must keep working. Falls
+    back to an empty chain set instead: is_valid_underlying()/get_strike_chain()
+    then simply report "nothing available" and the option-chain endpoints
+    return no_option_data rather than crashing the server.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(
+            f"[OptionMaster] {path} missing or unreadable ({exc}) - option chain "
+            f"will report no_option_data until `python scripts/build_option_master.py` "
+            f"is run to generate it."
+        )
+        return {}
+
+
+_raw: dict[str, dict] = _load(_FILE)
 
 
 def is_valid_underlying(underlying: str) -> bool:
@@ -35,7 +58,7 @@ def get_strike_chain(underlying: str, expiry: str) -> dict[str, dict]:
 def reload() -> None:
     """Re-reads master_options.json from disk without restarting the process."""
     global _raw
-    _raw = json.loads(_FILE.read_text(encoding="utf-8"))
+    _raw = _load(_FILE)
 
 
 async def schedule_daily_refresh(app=None) -> None:
