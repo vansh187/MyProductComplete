@@ -120,8 +120,8 @@ class ShoonyaOptionFeed:
         )
 
     @staticmethod
-    def _force_stop_websocket(api) -> None:
-        """Reliably stops the previous NorenApi instance's WS thread.
+    def _signal_stop_websocket(api) -> None:
+        """Best-effort, thread-safe request to stop an instance's WS loop.
 
         NorenApi.close_websocket() is a no-op once __websocket_connected is
         already False - which is exactly the case here, since our own
@@ -129,11 +129,16 @@ class ShoonyaOptionFeed:
         callback has already flipped that flag. In that case close_websocket()
         never sets its internal stop_event, so the old __ws_run_forever
         thread spins forever (run_forever() fails instantly against the dead
-        socket, sleeps 100ms, repeats) and is never joined - every failed
-        reconnect then permanently leaks one more OS thread, eventually
-        exhausting the process's thread/task limit. Reach into the library's
-        internals directly (best-effort, version-tolerant) to force the loop
-        to actually exit regardless of that connected-flag check.
+        socket, sleeps 100ms, repeats) until something else sets that event -
+        reach into the library's internals directly (best-effort,
+        version-tolerant) to force the loop to actually exit regardless of
+        that connected-flag check.
+
+        Deliberately does NOT join the thread - this is called from _on_close/
+        _on_error, which run ON that same WS thread (invoked synchronously
+        from inside NorenApi's run_forever()), and a thread can't join itself.
+        See _force_stop_websocket() for the join, done later from a different
+        thread/coroutine.
         """
         try:
             api.close_websocket()
@@ -150,6 +155,16 @@ class ShoonyaOptionFeed:
                 ws.close()
             except Exception:
                 pass
+
+    @classmethod
+    def _force_stop_websocket(cls, api) -> None:
+        """Full stop of a previous NorenApi instance: signal + join.
+
+        Only safe to call from a thread other than the target instance's own
+        WS thread (true for start()/close(), which run on the asyncio loop's
+        thread) - see _signal_stop_websocket() for why the join is split out.
+        """
+        cls._signal_stop_websocket(api)
 
         thread = getattr(api, "_NorenApi__ws_thread", None)
         if thread is not None and thread.is_alive():
@@ -245,6 +260,7 @@ class ShoonyaOptionFeed:
 
     def _on_close(self, *args) -> None:
         logger.warning("[OptionFeed] WebSocket closed - scheduling reconnect")
+        self._signal_stop_current_instance()
         try:
             self._schedule_reconnect()
         except Exception as e:
@@ -252,10 +268,24 @@ class ShoonyaOptionFeed:
 
     def _on_error(self, *args) -> None:
         logger.warning(f"[OptionFeed] WebSocket error: {args}")
+        self._signal_stop_current_instance()
         try:
             self._schedule_reconnect()
         except Exception as e:
             logger.warning(f"[OptionFeed] Error scheduling reconnect after error: {e}")
+
+    def _signal_stop_current_instance(self) -> None:
+        """Tells the dead connection's internal retry loop to stop right now,
+        instead of leaving it to independently hammer the broker every 100ms
+        (see NorenApi.__ws_run_forever) for the full RECONNECT_DELAY_SECS
+        until our own start() eventually gets around to it. Two unsynchronized
+        retry loops racing against a broker that's rejecting every attempt is
+        exactly what turns one bad connection into a connection leak."""
+        if self._api_instance is not None:
+            try:
+                self._signal_stop_websocket(self._api_instance)
+            except Exception as e:
+                logger.warning(f"[OptionFeed] Error signaling old WS to stop: {e}")
 
     def _schedule_reconnect(self) -> None:
         if self._reconnecting or self._async_loop is None:

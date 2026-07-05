@@ -176,6 +176,54 @@ class TestStartClosesPriorSocket:
         assert not zombie_thread.is_alive()
 
 
+class TestOnCloseSignalsStopImmediately:
+
+    def test_on_close_stops_dead_instance_before_the_5s_reconnect_delay(self):
+        """Regression test: NorenApi's own __ws_run_forever loop keeps
+        retrying the dead connection every 100ms on its own, independent of
+        our reconnect timer, until its stop_event is set. Previously nothing
+        set that event until our own start() ran RECONNECT_DELAY_SECS later -
+        two unsynchronized retry loops hammering a broker that keeps
+        rejecting every attempt. _on_close/_on_error must signal the old
+        instance to stop immediately, not wait for the delayed reconnect."""
+        feed, _ = _make_feed()
+        feed._async_loop = MagicMock()  # truthy, so _schedule_reconnect proceeds
+
+        dead_api = MagicMock()
+        feed._api_instance = dead_api
+
+        with patch.object(feed, "_schedule_reconnect"):
+            feed._on_close()
+
+        dead_api.close_websocket.assert_called_once()
+
+    def test_on_error_stops_dead_instance_before_the_5s_reconnect_delay(self):
+        feed, _ = _make_feed()
+        feed._async_loop = MagicMock()
+
+        dead_api = MagicMock()
+        feed._api_instance = dead_api
+
+        with patch.object(feed, "_schedule_reconnect"):
+            feed._on_error("boom")
+
+        dead_api.close_websocket.assert_called_once()
+
+    def test_signal_stop_does_not_join_thread(self):
+        """_signal_stop_websocket must be safe to call from the WS's own
+        thread (which is exactly where _on_close/_on_error run) - it must
+        never join, since a thread can't join itself."""
+        import threading
+
+        api = MagicMock()
+        thread = MagicMock(spec=threading.Thread)
+        api._NorenApi__ws_thread = thread
+
+        ShoonyaOptionFeed._signal_stop_websocket(api)
+
+        thread.join.assert_not_called()
+
+
 class TestReconnectCallbacksAreExceptionSafe:
 
     def test_on_close_does_not_raise_when_schedule_reconnect_fails(self):

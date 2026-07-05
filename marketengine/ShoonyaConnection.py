@@ -2,6 +2,7 @@ import os
 import asyncio
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,15 @@ except ImportError:
 class _ShoonyaApi(_NorenApi):
     def __init__(self, api_url: str):
         api_url = api_url.rstrip("/")
-        ws_url  = api_url.replace("https://", "wss://").replace("NorenWClientAPI", "NorenWSAPI")
+        # Strip whatever scheme api_url has (http/https/ws/wss, any case) and
+        # always force wss:// - a plain substring .replace("https://", "wss://")
+        # silently leaves the scheme untouched (and NorenApi.start_websocket()
+        # then hands an http(s):// URL straight to websocket-client, which
+        # rejects it with "scheme https is invalid") for anything that isn't
+        # an exact lowercase "https://" prefix, e.g. a differently-cased
+        # scheme or a URL with no scheme at all.
+        host_and_path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", api_url)
+        ws_url = "wss://" + host_and_path.replace("NorenWClientAPI", "NorenWSAPI")
         super().__init__(host=api_url, websocket=ws_url)
 
 
