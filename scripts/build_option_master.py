@@ -42,28 +42,45 @@ NFO_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
 BFO_UNDERLYINGS = {"SENSEX"}
 TRACKED_UNDERLYINGS = NFO_UNDERLYINGS | BFO_UNDERLYINGS
 
+# Unlike NFO (whose Symbol column is already "NIFTY"/"BANKNIFTY"/"FINNIFTY"
+# verbatim), BFO's Symbol column uses its own product codes per index -
+# confirmed from a live BFO_symbols.txt.zip: 'BSXOPT' (Sensex), 'BKXOPT'
+# (Bankex), 'SX50OPT' (Sensex 50), 'BITOPT' - none of which match our
+# internal underlying names, so they must be remapped during parsing.
+BFO_SYMBOL_TO_UNDERLYING = {
+    "BSXOPT": "SENSEX",
+}
+
 
 def _parse_expiry(raw: str) -> str:
     """Shoonya's Expiry column is 'DD-MMM-YYYY' (e.g. '29-SEP-2026') -> ISO 'YYYY-MM-DD'."""
     return datetime.strptime(raw.strip(), "%d-%b-%Y").strftime("%Y-%m-%d")
 
 
-def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS) -> dict:
+def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS, symbol_map: dict[str, str] | None = None) -> dict:
     """
     Parses a Shoonya *_symbols.txt CSV content (Exchange,Token,LotSize,Symbol,
     TradingSymbol,Expiry,Instrument,OptionType,StrikePrice,TickSize).
     Returns { underlying: { expiries: [...], "<iso-expiry>": { strike: {...} } } }
     for the given tracked index underlyings (Instrument == "OPTIDX") only.
+
+    symbol_map: raw file Symbol -> our internal underlying name, for masters
+    (like BFO) whose Symbol column doesn't already match 1:1 (see
+    BFO_SYMBOL_TO_UNDERLYING). Rows whose (mapped) symbol isn't in `tracked`
+    are skipped.
+
     Pure function - no I/O - so it can be unit-tested against a fixture.
     """
     reader = csv.DictReader(io.StringIO(content))
+    symbol_map = symbol_map or {}
 
     chains: dict[str, dict] = {u: {} for u in tracked}
 
     for row in reader:
-        symbol = (row.get("Symbol") or "").strip()
+        raw_symbol = (row.get("Symbol") or "").strip()
+        underlying = symbol_map.get(raw_symbol, raw_symbol)
         instrument = (row.get("Instrument") or "").strip()
-        if symbol not in tracked or instrument != "OPTIDX":
+        if underlying not in tracked or instrument != "OPTIDX":
             continue
 
         option_type = (row.get("OptionType") or "").strip().upper()
@@ -77,7 +94,7 @@ def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS) -> dict:
         except (KeyError, ValueError):
             continue
 
-        expiry_chain = chains[symbol].setdefault(expiry_iso, {})
+        expiry_chain = chains[underlying].setdefault(expiry_iso, {})
         strike_entry = expiry_chain.setdefault(strike, {"lot_size": lot_size})
 
         if option_type == "CE":
@@ -95,7 +112,7 @@ def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS) -> dict:
     return result
 
 
-def _download_and_parse(url: str, tracked: set[str]) -> dict:
+def _download_and_parse(url: str, tracked: set[str], symbol_map: dict[str, str] | None = None) -> dict:
     """Downloads one Shoonya scrip-master zip and parses it via parse_master_csv()."""
     print(f"Downloading Shoonya symbol master from {url}...")
     resp = urlopen(url, timeout=30)
@@ -111,14 +128,14 @@ def _download_and_parse(url: str, tracked: set[str]) -> dict:
         raise FileNotFoundError(f"No symbols .txt found in master ZIP from {url}")
 
     content = zip_data.read(target).decode("utf-8", errors="replace")
-    return parse_master_csv(content, tracked=tracked)
+    return parse_master_csv(content, tracked=tracked, symbol_map=symbol_map)
 
 
 def download_option_master() -> dict:
     """Downloads both Shoonya scrip masters (NFO for NSE indices, BFO for Sensex)
     and merges them into a single { underlying: {...} } chain map."""
     nfo_chains = _download_and_parse(NFO_MASTER_URL, NFO_UNDERLYINGS)
-    bfo_chains = _download_and_parse(BFO_MASTER_URL, BFO_UNDERLYINGS)
+    bfo_chains = _download_and_parse(BFO_MASTER_URL, BFO_UNDERLYINGS, symbol_map=BFO_SYMBOL_TO_UNDERLYING)
     return {**nfo_chains, **bfo_chains}
 
 
