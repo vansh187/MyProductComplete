@@ -218,7 +218,7 @@ async def stream_option_chain(
                 with contextlib.suppress(asyncio.CancelledError):
                     await init_task
             if cache is not None and resolved_expiry_value is not None:
-                _optionChainService.release_chain(underlying, resolved_expiry_value)
+                await _optionChainService.release_chain(underlying, resolved_expiry_value)
 
     return StreamingResponse(
         _event_generator(),

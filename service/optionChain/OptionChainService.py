@@ -6,9 +6,20 @@ returns the (data, errors) tuple convention used across this codebase
 """
 
 import asyncio
+import logging
 
 from appconfig import OptionMaster
 from service.optionChain.OptionChainCache import OptionChainCache
+
+logger = logging.getLogger(__name__)
+
+# NorenApi.subscribe()/unsubscribe() send a frame over the WS connection and
+# busy-wait (plain time.sleep loop) until it's connected - if the feed is down
+# or stuck reconnecting, that wait never returns. Bounding it here keeps a
+# broker-side WS outage from freezing the whole request (and, with only a
+# handful of Uvicorn workers, the whole app) - the feed will simply catch up
+# once reconnected since ensure_subscribed()/release() are ref-count based.
+FEED_SUBSCRIBE_TIMEOUT_SECS = 3.0
 
 UNDERLYING_SPOT_TOKENS = {
     "nifty": ("NSE", "26000"),
@@ -95,11 +106,20 @@ class OptionChainService:
             self._token_to_cache_keys.setdefault(token, set()).add(key)
 
         if self._feed is not None:
-            self._feed.ensure_subscribed(cache.tokens())
+            await self._ensure_subscribed_async(cache.tokens())
 
         await self._seed_from_rest(shoonya, cache, strike_chain)
 
         return cache, None
+
+    async def _ensure_subscribed_async(self, tokens: set[str]) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, self._feed.ensure_subscribed, tokens),
+                timeout=FEED_SUBSCRIBE_TIMEOUT_SECS,
+            )
+        except Exception as e:
+            logger.warning(f"[OptionChainService] ensure_subscribed timed out/failed: {e}")
 
     async def _seed_from_rest(self, shoonya, cache: OptionChainCache, strike_chain: dict) -> None:
         loop = asyncio.get_running_loop()
@@ -129,7 +149,7 @@ class OptionChainService:
         key = self._cache_key(underlying, expiry)
         self._refcounts[key] = self._refcounts.get(key, 0) + 1
 
-    def _release(self, underlying: str, expiry: str) -> None:
+    async def _release(self, underlying: str, expiry: str) -> None:
         """Decrements the consumer count; only once it reaches zero do we
         unsubscribe from the feed and evict the cache + its token-index
         entries, so a still-connected concurrent viewer of the same chain
@@ -154,12 +174,21 @@ class OptionChainService:
                     self._token_to_cache_keys.pop(token, None)
 
         if self._feed is not None:
-            self._feed.release(cache.tokens())
+            await self._release_feed_async(cache.tokens())
 
-    def release_chain(self, underlying: str, expiry: str) -> None:
+    async def _release_feed_async(self, tokens: set[str]) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, self._feed.release, tokens),
+                timeout=FEED_SUBSCRIBE_TIMEOUT_SECS,
+            )
+        except Exception as e:
+            logger.warning(f"[OptionChainService] feed release timed out/failed: {e}")
+
+    async def release_chain(self, underlying: str, expiry: str) -> None:
         """Called when an SSE stream client (that previously called
         get_cache_for_stream) disconnects."""
-        self._release(underlying, expiry)
+        await self._release(underlying, expiry)
 
     async def _resolve_spot(self, shoonya, underlying: str) -> float | None:
         """shoonya.get_index_quote() is a blocking REST call (plain `requests`

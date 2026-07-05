@@ -129,7 +129,7 @@ class TestFeedSubscription:
 
             svc = OptionChainService(feed=feed)
             await svc.get_cache_for_stream(_fake_shoonya(), "nifty", "2026-07-14")
-            svc.release_chain("nifty", "2026-07-14")
+            await svc.release_chain("nifty", "2026-07-14")
 
         feed.release.assert_called_once()
 
@@ -152,11 +152,11 @@ class TestFeedSubscription:
             await svc.get_cache_for_stream(shoonya, "nifty", "2026-07-14")
 
             # First viewer disconnects.
-            svc.release_chain("nifty", "2026-07-14")
+            await svc.release_chain("nifty", "2026-07-14")
             feed.release.assert_not_called()  # second viewer still needs it subscribed
 
             # Second viewer disconnects.
-            svc.release_chain("nifty", "2026-07-14")
+            await svc.release_chain("nifty", "2026-07-14")
             feed.release.assert_called_once()  # only now actually unsubscribed
 
     @pytest.mark.asyncio
@@ -173,7 +173,7 @@ class TestFeedSubscription:
             shoonya = _fake_shoonya()
 
             await svc.get_cache_for_stream(shoonya, "nifty", "2026-07-14")
-            svc.release_chain("nifty", "2026-07-14")
+            await svc.release_chain("nifty", "2026-07-14")
 
             assert svc._caches == {}
             assert svc._token_to_cache_keys == {}

@@ -51,7 +51,7 @@ async def test_stream_emits_initial_frame_while_cache_initializes():
     with patch("api.optionChain.OptionMaster") as mock_master, \
          patch.object(mod._optionChainService, "get_cache_for_stream",
                       new=AsyncMock(side_effect=delayed_get_cache_for_stream)), \
-         patch.object(mod._optionChainService, "release_chain"):
+         patch.object(mod._optionChainService, "release_chain", new=AsyncMock()):
         mock_master.is_valid_underlying.return_value = True
 
         response = await mod.stream_option_chain(underlying="nifty", request=fake_request, expiry=None)
@@ -76,7 +76,7 @@ async def test_stream_signals_disconnect_then_recovers(monkeypatch):
     with patch("api.optionChain.OptionMaster") as mock_master, \
          patch.object(mod._optionChainService, "get_cache_for_stream",
                       new=AsyncMock(return_value=(fake_cache, "2026-07-14", []))), \
-         patch.object(mod._optionChainService, "release_chain"):
+         patch.object(mod._optionChainService, "release_chain", new=AsyncMock()):
         mock_master.is_valid_underlying.return_value = True
 
         response = await mod.stream_option_chain(underlying="nifty", request=fake_request, expiry=None)
