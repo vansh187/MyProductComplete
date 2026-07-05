@@ -25,13 +25,6 @@ STREAM_WAIT_TIMEOUT_SECS = 15  # how often to re-check request.is_disconnected()
 DISCONNECTED_RECHECK_SECS = 5  # how often to poll for Shoonya reconnecting once it's gone down mid-stream
 
 
-def _get_shoonya(request: Request):
-    shoonya = getattr(request.app.state, "shoonya", None)
-    if shoonya is None or not shoonya.is_connected:
-        raise HTTPException(status_code=503, detail="Market data service is not ready. Try again shortly.")
-    return shoonya
-
-
 def _validate_expiry_format(expiry: str | None) -> None:
     if expiry is None:
         return
@@ -76,7 +69,17 @@ async def get_option_chain(
         raise HTTPException(status_code=400, detail=f"Invalid underlying: {underlying}")
 
     _validate_expiry_format(expiry)
-    shoonya = _get_shoonya(request)
+
+    shoonya = getattr(request.app.state, "shoonya", None)
+    if shoonya is None or not shoonya.is_connected:
+        # Broker session down (after-hours token refresh, holiday, outage) -
+        # still serve whatever this process last saw for this chain instead
+        # of a bare 503, so the frontend can keep showing last-traded data
+        # for the user to analyze ahead of the next session.
+        cached, resolved_expiry = _optionChainService.peek_cached_chain(underlying, expiry)
+        if cached is not None:
+            return _envelope(underlying, resolved_expiry, cached, [{"reason": "shoonya_disconnected"}])
+        raise HTTPException(status_code=503, detail="Market data service is not ready. Try again shortly.")
 
     data, errors = await _optionChainService.get_chain(shoonya, underlying, expiry)
     return _envelope(underlying, expiry, data, errors)
@@ -101,7 +104,20 @@ async def stream_option_chain(
         raise HTTPException(status_code=400, detail=f"Invalid underlying: {underlying}")
 
     _validate_expiry_format(expiry)
-    shoonya = _get_shoonya(request)
+
+    shoonya = getattr(request.app.state, "shoonya", None)
+    if shoonya is None or not shoonya.is_connected:
+        # Broker session already down before this stream even opened - serve
+        # whatever was last cached (if anything) as a single frame and close,
+        # rather than a bare 503. EventSource auto-reconnects a few seconds
+        # later per the SSE spec, so once Shoonya comes back the next retry
+        # picks up live data automatically without any client-side changes.
+        cached, resolved_expiry = _optionChainService.peek_cached_chain(underlying, expiry)
+
+        async def _cached_only_stream():
+            yield f"data: {json.dumps(_envelope(underlying, resolved_expiry, cached, [{'reason': 'shoonya_disconnected'}]))}\n\n"
+
+        return StreamingResponse(_cached_only_stream(), media_type="text/event-stream")
 
     cache, resolved_expiry, errors = await _optionChainService.get_cache_for_stream(shoonya, underlying, expiry)
 

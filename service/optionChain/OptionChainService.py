@@ -263,6 +263,34 @@ class OptionChainService:
             "strikes": snapshot["strikes"],
         }, []
 
+    def peek_cached_chain(self, underlying: str, expiry: str | None) -> tuple[dict | None, str | None]:
+        """Best-effort read of whatever this process already has cached for
+        (underlying, resolved expiry), without touching Shoonya at all - used
+        when the broker session is down so the endpoint can still serve
+        yesterday's/last-known data instead of a bare 503. Returns
+        (None, None) if no cache exists yet for this key (e.g. right after a
+        process restart, before any live session has ever seeded it)."""
+        underlying = underlying.lower()
+        resolved_expiry = expiry or OptionMaster.nearest_expiry(underlying)
+        if not resolved_expiry:
+            return None, None
+
+        cache = self._caches.get(self._cache_key(underlying, resolved_expiry))
+        if cache is None:
+            return None, None
+
+        snapshot = cache.get()
+        if snapshot is None:
+            return None, None
+
+        return {
+            "symbol": underlying.upper(),
+            "exchange": OPTIONS_EXCHANGE.get(underlying, "NFO"),
+            "expiry": resolved_expiry,
+            "spot": snapshot["spot"],
+            "strikes": snapshot["strikes"],
+        }, resolved_expiry
+
     async def get_cache_for_stream(self, shoonya, underlying: str, expiry: str | None) -> tuple[OptionChainCache | None, str | None, list[dict]]:
         """Resolution/subscription-trigger only (no synchronous fetch) - the SSE
         endpoint waits on the returned cache's wait_for_next() directly."""
