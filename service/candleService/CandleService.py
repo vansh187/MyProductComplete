@@ -3,6 +3,7 @@ OHLC candle data service for F&O trading terminal.
 Fetches historical candles from Shoonya for charting.
 """
 
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 
@@ -111,7 +112,11 @@ class CandleService:
                 })
                 return candles, errors
 
-            raw_candles = shoonya.get_time_price_series(exchange, token, interval, days=_LOOKBACK_DAYS)
+            loop = asyncio.get_running_loop()
+            raw_candles = await loop.run_in_executor(
+                None,
+                lambda: shoonya.get_time_price_series(exchange, token, interval, days=_LOOKBACK_DAYS)
+            )
 
             if not raw_candles:
                 errors.append({
