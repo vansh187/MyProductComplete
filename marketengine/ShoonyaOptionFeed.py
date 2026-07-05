@@ -108,10 +108,7 @@ class ShoonyaOptionFeed:
         # one, so calling it again (on the same or a new instance) would
         # otherwise leak the old socket/thread.
         if self._api_instance is not None:
-            try:
-                self._api_instance.close_websocket()
-            except Exception:
-                pass  # already closed, or never fully opened
+            self._force_stop_websocket(self._api_instance)
 
         self._api_instance = api
 
@@ -121,6 +118,44 @@ class ShoonyaOptionFeed:
             socket_close_callback=self._on_close,
             socket_error_callback=self._on_error,
         )
+
+    @staticmethod
+    def _force_stop_websocket(api) -> None:
+        """Reliably stops the previous NorenApi instance's WS thread.
+
+        NorenApi.close_websocket() is a no-op once __websocket_connected is
+        already False - which is exactly the case here, since our own
+        reconnect is only ever triggered *after* NorenApi's on_close/on_error
+        callback has already flipped that flag. In that case close_websocket()
+        never sets its internal stop_event, so the old __ws_run_forever
+        thread spins forever (run_forever() fails instantly against the dead
+        socket, sleeps 100ms, repeats) and is never joined - every failed
+        reconnect then permanently leaks one more OS thread, eventually
+        exhausting the process's thread/task limit. Reach into the library's
+        internals directly (best-effort, version-tolerant) to force the loop
+        to actually exit regardless of that connected-flag check.
+        """
+        try:
+            api.close_websocket()
+        except Exception:
+            pass
+
+        stop_event = getattr(api, "_NorenApi__stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+        ws = getattr(api, "_NorenApi__websocket", None)
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        thread = getattr(api, "_NorenApi__ws_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+            if thread.is_alive():
+                logger.warning("[OptionFeed] Old WS thread did not exit within timeout")
 
     def ensure_subscribed(self, tokens: set[str]) -> None:
         """tokens: set of 'EXCH|TOKEN' strings. Subscribes only genuinely-new tokens."""
@@ -156,11 +191,8 @@ class ShoonyaOptionFeed:
         """Closes the instance the socket was actually opened on, not whatever
         self._shoonya._api happens to be right now - those can differ after a
         token refresh (see the _api_instance comment in __init__)."""
-        try:
-            if self._api_instance is not None:
-                self._api_instance.close_websocket()
-        except Exception as e:
-            logger.warning(f"[OptionFeed] Error closing websocket: {e}")
+        if self._api_instance is not None:
+            self._force_stop_websocket(self._api_instance)
 
     # -- callbacks fired on NorenApi's own daemon WS thread --------------
 

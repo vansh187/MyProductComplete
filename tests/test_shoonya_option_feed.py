@@ -134,6 +134,47 @@ class TestStartClosesPriorSocket:
 
         asyncio.run(_run())  # must not raise
 
+    def test_reconnect_force_stops_zombie_thread_when_close_websocket_is_a_noop(self):
+        """Regression test for the production thread-leak bug: NorenApi's own
+        close_websocket() silently does nothing once __websocket_connected is
+        already False (exactly the state after our own reconnect fires, since
+        that only happens after NorenApi's on_close callback already flipped
+        it) - it never sets the internal stop_event, so the old
+        __ws_run_forever thread spins forever and is never joined, leaking
+        one OS thread per failed reconnect. start() must force-stop it
+        directly instead of trusting close_websocket() alone."""
+        import threading
+
+        feed, shoonya = _make_feed()
+
+        old_api = MagicMock()
+        old_api.close_websocket = MagicMock()  # simulates the library's no-op
+        old_stop_event = threading.Event()
+        old_api._NorenApi__stop_event = old_stop_event
+
+        old_ws = MagicMock()
+        old_api._NorenApi__websocket = old_ws
+
+        # A "zombie" thread that only exits once stop_event is actually set -
+        # standing in for NorenApi's real __ws_run_forever loop.
+        zombie_thread = threading.Thread(target=old_stop_event.wait)
+        zombie_thread.daemon = True
+        zombie_thread.start()
+        old_api._NorenApi__ws_thread = zombie_thread
+
+        feed._api_instance = old_api
+        shoonya._api = MagicMock()  # a fresh instance for the new attempt
+
+        async def _run():
+            feed.start()
+
+        asyncio.run(_run())
+
+        assert old_stop_event.is_set()
+        old_ws.close.assert_called_once()
+        zombie_thread.join(timeout=1)
+        assert not zombie_thread.is_alive()
+
 
 class TestReconnectCallbacksAreExceptionSafe:
 
