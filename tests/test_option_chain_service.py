@@ -78,6 +78,28 @@ class TestGetChainHappyPath:
         assert len(data["strikes"]) == 2
 
     @pytest.mark.asyncio
+    async def test_sensex_chain_uses_bfo_exchange(self):
+        """Sensex options trade on BFO (BSE F&O), not NFO - the response and
+        every underlying REST/WS token must reflect that, not the NSE default."""
+        sensex_chain = {
+            "80000": {"ce_token": "900001", "ce_tsym": "SENSEX07JUL26C80000", "pe_token": "900002", "pe_tsym": "SENSEX07JUL26P80000", "lot_size": 10},
+        }
+        with patch("service.optionChain.OptionChainService.OptionMaster") as mock_master:
+            mock_master.is_valid_underlying.return_value = True
+            mock_master.nearest_expiry.return_value = "2026-07-07"
+            mock_master.get_strike_chain.return_value = sensex_chain
+
+            shoonya = _fake_shoonya()
+            svc = OptionChainService(feed=None)
+            data, errors = await svc.get_chain(shoonya, "sensex", None)
+
+        assert errors == []
+        assert data["symbol"] == "SENSEX"
+        assert data["exchange"] == "BFO"
+        shoonya.get_option_quote.assert_any_call("BFO", "900001")
+        shoonya.get_index_quote.assert_any_call("BSE", "1")
+
+    @pytest.mark.asyncio
     async def test_explicit_expiry_bypasses_nearest_expiry_lookup(self):
         with patch("service.optionChain.OptionChainService.OptionMaster") as mock_master:
             mock_master.is_valid_underlying.return_value = True

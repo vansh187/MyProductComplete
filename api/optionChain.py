@@ -15,7 +15,7 @@ from fastapi import APIRouter, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from appconfig import OptionMaster
-from service.optionChain.OptionChainService import OptionChainService
+from service.optionChain.OptionChainService import OPTIONS_EXCHANGE, OptionChainService
 
 router = APIRouter(prefix="/api/market", tags=["Option Chain"])
 
@@ -44,7 +44,7 @@ def _validate_expiry_format(expiry: str | None) -> None:
 def _envelope(underlying: str, expiry: str | None, data: dict | None, errors: list[dict]) -> dict:
     return {
         "symbol": underlying.upper(),
-        "exchange": "NFO",
+        "exchange": OPTIONS_EXCHANGE.get(underlying.lower(), "NFO"),
         "expiry": data["expiry"] if data else expiry,
         "spot": data["spot"] if data else None,
         "strikes": data["strikes"] if data else [],
@@ -62,7 +62,7 @@ async def get_option_chain(
     """
     Returns the live option chain for an index underlying.
 
-    underlying: nifty | banknifty | finnifty
+    underlying: nifty | banknifty | finnifty | sensex
     expiry: optional, defaults to the nearest available expiry
 
     Response:

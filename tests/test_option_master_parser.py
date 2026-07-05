@@ -4,7 +4,7 @@ fixture mirroring the real Shoonya NFO_symbols.txt column layout:
 Exchange,Token,LotSize,Symbol,TradingSymbol,Expiry,Instrument,OptionType,StrikePrice,TickSize
 """
 
-from scripts.build_option_master import parse_master_csv
+from scripts.build_option_master import BFO_UNDERLYINGS, parse_master_csv
 
 FIXTURE_CSV = """Exchange,Token,LotSize,Symbol,TradingSymbol,Expiry,Instrument,OptionType,StrikePrice,TickSize,
 NFO,44594,65,NIFTY,NIFTY07JUL26C24300,07-JUL-2026,OPTIDX,CE,24300,0.05,
@@ -65,3 +65,25 @@ def test_malformed_row_is_skipped_not_raised():
     bad_csv = FIXTURE_CSV + "NFO,1,65,NIFTY,BADROW,not-a-date,OPTIDX,CE,abc,0.05,\n"
     result = parse_master_csv(bad_csv)  # must not raise
     assert result["NIFTY"]["expiries"] == ["2026-07-07", "2026-07-14"]
+
+
+BFO_FIXTURE_CSV = """Exchange,Token,LotSize,Symbol,TradingSymbol,Expiry,Instrument,OptionType,StrikePrice,TickSize,
+BFO,900001,10,SENSEX,SENSEX07JUL26C80000,07-JUL-2026,OPTIDX,CE,80000,100,
+BFO,900002,10,SENSEX,SENSEX07JUL26P80000,07-JUL-2026,OPTIDX,PE,80000,100,
+"""
+
+
+def test_sensex_parsed_from_bfo_master_when_tracked():
+    result = parse_master_csv(BFO_FIXTURE_CSV, tracked=BFO_UNDERLYINGS)
+    assert result["SENSEX"]["expiries"] == ["2026-07-07"]
+    strike = result["SENSEX"]["2026-07-07"]["80000"]
+    assert strike["ce_token"] == "900001"
+    assert strike["pe_token"] == "900002"
+    assert strike["lot_size"] == 10
+
+
+def test_sensex_absent_from_default_nfo_tracked_set():
+    """SENSEX must not accidentally leak into the default (NFO) parse - it only
+    ever comes from the separate BFO master."""
+    result = parse_master_csv(BFO_FIXTURE_CSV)
+    assert "SENSEX" not in result

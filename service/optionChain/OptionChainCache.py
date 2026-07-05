@@ -19,7 +19,7 @@ MARKET_CLOSE = dtime(15, 30)
 
 class OptionChainCache:
 
-    def __init__(self, underlying: str, expiry: str, strike_chain: dict[str, dict], rate: float = 0.065):
+    def __init__(self, underlying: str, expiry: str, strike_chain: dict[str, dict], exchange: str = "NFO", rate: float = 0.065):
         self.underlying = underlying
         self.expiry = expiry
         self._rate = rate
@@ -29,9 +29,9 @@ class OptionChainCache:
         self._token_to_strike_leg: dict[str, tuple[str, str]] = {}
         for strike, info in strike_chain.items():
             if info.get("ce_token"):
-                self._token_to_strike_leg[f"NFO|{info['ce_token']}"] = (strike, "ce")
+                self._token_to_strike_leg[f"{exchange}|{info['ce_token']}"] = (strike, "ce")
             if info.get("pe_token"):
-                self._token_to_strike_leg[f"NFO|{info['pe_token']}"] = (strike, "pe")
+                self._token_to_strike_leg[f"{exchange}|{info['pe_token']}"] = (strike, "pe")
 
         self._legs: dict[str, dict] = {}       # "strike:leg" -> {ltp, bid, ask, oi, oi_change, volume, iv}
         self._oi_baseline: dict[str, int] = {}  # "strike:leg" -> reference OI for oi_change

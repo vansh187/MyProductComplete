@@ -25,6 +25,18 @@ UNDERLYING_SPOT_TOKENS = {
     "nifty": ("NSE", "26000"),
     "banknifty": ("NSE", "26009"),
     "finnifty": ("NSE", "26037"),
+    "sensex": ("BSE", "1"),
+}
+
+# NSE index options (Nifty/BankNifty/FinNifty) trade on the NFO segment;
+# Sensex (BSE) options trade on the separate BFO segment - a different token
+# space, so every option-leg REST/WS call must use the underlying's own
+# exchange rather than assuming NFO everywhere.
+OPTIONS_EXCHANGE = {
+    "nifty": "NFO",
+    "banknifty": "NFO",
+    "finnifty": "NFO",
+    "sensex": "BFO",
 }
 
 # A typical option-chain UI shows a window around the money, not all ~200+
@@ -98,8 +110,9 @@ class OptionChainService:
             return None, {"reason": "no_option_data"}
 
         strike_chain = self._window_around_spot(full_chain, spot)
+        exchange = OPTIONS_EXCHANGE[underlying]
 
-        cache = OptionChainCache(underlying.upper(), expiry, strike_chain, rate=self.RATE)
+        cache = OptionChainCache(underlying.upper(), expiry, strike_chain, exchange=exchange, rate=self.RATE)
         self._caches[key] = cache
 
         for token in cache.tokens():
@@ -108,7 +121,7 @@ class OptionChainService:
         if self._feed is not None:
             await self._ensure_subscribed_async(cache.tokens())
 
-        await self._seed_from_rest(shoonya, cache, strike_chain)
+        await self._seed_from_rest(shoonya, cache, strike_chain, exchange)
 
         return cache, None
 
@@ -121,7 +134,7 @@ class OptionChainService:
         except Exception as e:
             logger.warning(f"[OptionChainService] ensure_subscribed timed out/failed: {e}")
 
-    async def _seed_from_rest(self, shoonya, cache: OptionChainCache, strike_chain: dict) -> None:
+    async def _seed_from_rest(self, shoonya, cache: OptionChainCache, strike_chain: dict, exchange: str) -> None:
         loop = asyncio.get_running_loop()
         legs = [
             (strike, leg, info[token_field])
@@ -133,7 +146,7 @@ class OptionChainService:
         async def _fetch_one(strike: str, leg: str, token: str) -> None:
             try:
                 quote = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: shoonya.get_option_quote("NFO", token)),
+                    loop.run_in_executor(None, lambda: shoonya.get_option_quote(exchange, token)),
                     timeout=8.0,
                 )
                 if quote:
@@ -244,7 +257,7 @@ class OptionChainService:
 
         return {
             "symbol": underlying.upper(),
-            "exchange": "NFO",
+            "exchange": OPTIONS_EXCHANGE[underlying],
             "expiry": resolved_expiry,
             "spot": snapshot["spot"],
             "strikes": snapshot["strikes"],

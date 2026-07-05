@@ -1,7 +1,8 @@
 """
-One-time script: downloads Shoonya's NFO symbol master and rebuilds
-appconfig/master_options.json with the NIFTY/BANKNIFTY/FINNIFTY option chain
-(strike -> CE/PE token/tradingsymbol/lot-size) for every available expiry.
+One-time script: downloads Shoonya's NFO and BFO symbol masters and rebuilds
+appconfig/master_options.json with the NIFTY/BANKNIFTY/FINNIFTY (NSE, via NFO)
+and SENSEX (BSE, via BFO) option chains (strike -> CE/PE token/tradingsymbol/
+lot-size) for every available expiry.
 
 Run once (or periodically, e.g. daily, since Shoonya adds new expiries and
 occasionally reshuffles tokens):
@@ -16,7 +17,8 @@ Output: appconfig/master_options.json
     }
   },
   "BANKNIFTY": {...},
-  "FINNIFTY": {...}
+  "FINNIFTY": {...},
+  "SENSEX": {...}
 }
 """
 
@@ -29,9 +31,16 @@ from urllib.request import urlopen
 from zipfile import ZipFile
 
 NFO_MASTER_URL = "https://api.shoonya.com/NFO_symbols.txt.zip"
+BFO_MASTER_URL = "https://api.shoonya.com/BFO_symbols.txt.zip"
 OUTPUT_FILE = Path(__file__).parent.parent / "appconfig" / "master_options.json"
 
-TRACKED_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
+# NSE index options are listed under the NFO segment; Sensex (BSE) options
+# are a completely separate scrip master (BFO) - Shoonya publishes them as
+# two different zip files, so each underlying is tied to the exchange file
+# it actually comes from.
+NFO_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
+BFO_UNDERLYINGS = {"SENSEX"}
+TRACKED_UNDERLYINGS = NFO_UNDERLYINGS | BFO_UNDERLYINGS
 
 
 def _parse_expiry(raw: str) -> str:
@@ -39,22 +48,22 @@ def _parse_expiry(raw: str) -> str:
     return datetime.strptime(raw.strip(), "%d-%b-%Y").strftime("%Y-%m-%d")
 
 
-def parse_master_csv(content: str) -> dict:
+def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS) -> dict:
     """
-    Parses Shoonya's NFO_symbols.txt CSV content (Exchange,Token,LotSize,Symbol,
+    Parses a Shoonya *_symbols.txt CSV content (Exchange,Token,LotSize,Symbol,
     TradingSymbol,Expiry,Instrument,OptionType,StrikePrice,TickSize).
     Returns { underlying: { expiries: [...], "<iso-expiry>": { strike: {...} } } }
-    for NIFTY/BANKNIFTY/FINNIFTY index options (Instrument == "OPTIDX") only.
+    for the given tracked index underlyings (Instrument == "OPTIDX") only.
     Pure function - no I/O - so it can be unit-tested against a fixture.
     """
     reader = csv.DictReader(io.StringIO(content))
 
-    chains: dict[str, dict] = {u: {} for u in TRACKED_UNDERLYINGS}
+    chains: dict[str, dict] = {u: {} for u in tracked}
 
     for row in reader:
         symbol = (row.get("Symbol") or "").strip()
         instrument = (row.get("Instrument") or "").strip()
-        if symbol not in TRACKED_UNDERLYINGS or instrument != "OPTIDX":
+        if symbol not in tracked or instrument != "OPTIDX":
             continue
 
         option_type = (row.get("OptionType") or "").strip().upper()
@@ -86,19 +95,31 @@ def parse_master_csv(content: str) -> dict:
     return result
 
 
-def download_option_master() -> dict:
-    """Downloads Shoonya's NFO_symbols.txt.zip and parses it via parse_master_csv()."""
-    print("Downloading Shoonya NFO symbol master...")
-    resp = urlopen(NFO_MASTER_URL, timeout=30)
+def _download_and_parse(url: str, tracked: set[str]) -> dict:
+    """Downloads one Shoonya scrip-master zip and parses it via parse_master_csv()."""
+    print(f"Downloading Shoonya symbol master from {url}...")
+    resp = urlopen(url, timeout=30)
     zip_data = ZipFile(io.BytesIO(resp.read()))
 
-    target = "NFO_symbols.txt"
-    if target not in zip_data.namelist():
+    target = zip_data.namelist()[0] if len(zip_data.namelist()) == 1 else None
+    if target is None:
+        # Fall back to matching the conventional "<SEGMENT>_symbols.txt" name.
+        candidates = [n for n in zip_data.namelist() if n.endswith("_symbols.txt")]
+        target = candidates[0] if candidates else None
+    if target is None or target not in zip_data.namelist():
         print(f"Available files: {zip_data.namelist()}")
-        raise FileNotFoundError(f"{target} not found in NFO master ZIP")
+        raise FileNotFoundError(f"No symbols .txt found in master ZIP from {url}")
 
     content = zip_data.read(target).decode("utf-8", errors="replace")
-    return parse_master_csv(content)
+    return parse_master_csv(content, tracked=tracked)
+
+
+def download_option_master() -> dict:
+    """Downloads both Shoonya scrip masters (NFO for NSE indices, BFO for Sensex)
+    and merges them into a single { underlying: {...} } chain map."""
+    nfo_chains = _download_and_parse(NFO_MASTER_URL, NFO_UNDERLYINGS)
+    bfo_chains = _download_and_parse(BFO_MASTER_URL, BFO_UNDERLYINGS)
+    return {**nfo_chains, **bfo_chains}
 
 
 def main():
