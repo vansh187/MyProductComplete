@@ -161,9 +161,23 @@ class OptionChainService:
         get_cache_for_stream) disconnects."""
         self._release(underlying, expiry)
 
-    def _resolve_spot(self, shoonya, underlying: str) -> float | None:
+    async def _resolve_spot(self, shoonya, underlying: str) -> float | None:
+        """shoonya.get_index_quote() is a blocking REST call (plain `requests`
+        under the hood) - calling it directly from an async def would freeze
+        the entire single-threaded event loop for the duration of that HTTP
+        round-trip, stalling every other concurrent request (including any
+        other SSE stream already open) until it returns. Offload it to a
+        worker thread, same as _seed_from_rest() already does for option-leg
+        quotes."""
         exch, spot_token = UNDERLYING_SPOT_TOKENS[underlying]
-        spot_quote = shoonya.get_index_quote(exch, spot_token)
+        loop = asyncio.get_running_loop()
+        try:
+            spot_quote = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: shoonya.get_index_quote(exch, spot_token)),
+                timeout=8.0,
+            )
+        except Exception:
+            return None
         return spot_quote["ltp"] if spot_quote else None
 
     async def get_chain(self, shoonya, underlying: str, expiry: str | None) -> tuple[dict | None, list[dict]]:
@@ -178,7 +192,7 @@ class OptionChainService:
         if not resolved_expiry:
             return None, [{"reason": "no_expiry_available"}]
 
-        spot = self._resolve_spot(shoonya, underlying)
+        spot = await self._resolve_spot(shoonya, underlying)
 
         cache, error = await self._get_or_create_cache(shoonya, underlying, resolved_expiry, spot)
         if cache is None:
@@ -218,7 +232,7 @@ class OptionChainService:
         if not resolved_expiry:
             return None, None, [{"reason": "no_expiry_available"}]
 
-        spot = self._resolve_spot(shoonya, underlying)
+        spot = await self._resolve_spot(shoonya, underlying)
 
         cache, error = await self._get_or_create_cache(shoonya, underlying, resolved_expiry, spot)
         if cache is None:

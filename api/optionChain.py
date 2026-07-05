@@ -182,6 +182,13 @@ async def stream_option_chain(
                         snapshot = cache.get()
                         data = {**snapshot, "expiry": resolved_expiry_value} if snapshot else None
                         yield f"data: {json.dumps(_envelope(underlying, resolved_expiry_value, data, [{'reason': 'shoonya_disconnected'}]))}\n\n"
+                    else:
+                        # Same reverse-proxy read-timeout concern as the
+                        # tick-wait branch below - a broker outage can last
+                        # minutes (auto-login retries every RETRY_DELAY), so
+                        # this must not go byte-silent on the wire that whole
+                        # time.
+                        yield ": keep-alive\n\n"
                     await asyncio.sleep(DISCONNECTED_RECHECK_SECS)
                     continue
                 was_shoonya_disconnected = False
@@ -192,6 +199,13 @@ async def stream_option_chain(
                         timeout=STREAM_WAIT_TIMEOUT_SECS,
                     )
                 except asyncio.TimeoutError:
+                    # No live tick for a full STREAM_WAIT_TIMEOUT_SECS (thin
+                    # option volume, or the feed reconnecting) must not mean
+                    # total silence on the wire - a reverse proxy's own read
+                    # timeout (commonly 30-60s) will treat a byte-less
+                    # connection as dead and return 504 even though this
+                    # coroutine is still alive and holding it open correctly.
+                    yield ": keep-alive\n\n"
                     continue
 
                 last_seen_gen = cache.generation

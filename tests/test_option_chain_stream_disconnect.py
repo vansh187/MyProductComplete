@@ -93,16 +93,18 @@ async def test_stream_signals_disconnect_then_recovers(monkeypatch):
         assert body2["errors"] == [{"reason": "shoonya_disconnected"}]
         assert body2["spot"] == 100.0  # last-known data included, not wiped out
 
-        # Start waiting for the *next* frame without forcing cancellation -
-        # while still disconnected, it must not spam another notice frame.
-        pending = asyncio.ensure_future(gen.__anext__())
-        await asyncio.sleep(0.1)
-        assert not pending.done(), "must not emit another frame every poll tick while still down"
+        # While still disconnected, subsequent frames must only be transport-
+        # level SSE comments (keep-alive, ignored by EventSource.onmessage) -
+        # never another JSON "data:" notice frame every poll tick.
+        for _ in range(3):
+            frame = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+            assert frame == ": keep-alive\n\n", "must not spam another JSON notice frame while still down"
 
-        # Shoonya recovers - the pending wait should still be blocked (now on
-        # cache.wait_for_next(), which never resolves in this fake), i.e. no
+        # Shoonya recovers - the pending wait should now be blocked on
+        # cache.wait_for_next() (which never resolves in this fake), i.e. no
         # extra disconnect/recovery frame gets emitted either.
         shoonya.is_connected = True
+        pending = asyncio.ensure_future(gen.__anext__())
         await asyncio.sleep(0.1)
         assert not pending.done(), "recovery must not itself emit a frame"
 
