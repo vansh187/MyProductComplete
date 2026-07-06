@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from fastapi import FastAPI
 from api.signup import router as signup_router
 from api.login import router as login_router
@@ -147,6 +149,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+logger = logging.getLogger("latency")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    # Independent of any other logging config in the app (most of which
+    # uses plain print()) - guarantees these lines reach stdout, which
+    # systemd/journald already captures, without depending on root logger
+    # setup or double-printing if this module is ever imported twice.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [latency] %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
+
+# Requests slower than this get an explicit warning line (grep "SLOW" in the
+# journal) instead of blending into the routine per-request log noise -
+# these are exactly the ones worth investigating first.
+SLOW_REQUEST_THRESHOLD_MS = 1000
+
+
+@app.middleware("http")
+async def add_latency_tracking(request, call_next):
+    """Times every request end-to-end (including any broker/DB round-trips
+    the handler makes) with negligible overhead (a single perf_counter read
+    on each side of the call). Exposes it two ways:
+      - "Server-Timing" response header: visible directly in the browser's
+        Network tab (Timing panel) per request, no extra tooling needed.
+      - A log line per request, so latency can be grepped/aggregated from
+        the server's own logs (journalctl -u primepiptrade-api) without
+        needing a separate APM stack.
+    """
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.error(f"{request.method} {request.url.path} FAILED after {duration_ms:.1f}ms")
+        raise
+
+    duration_ms = (time.perf_counter() - start) * 1000
+    response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
+    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+
+    log_line = f"{request.method} {request.url.path} {response.status_code} {duration_ms:.1f}ms"
+    if duration_ms >= SLOW_REQUEST_THRESHOLD_MS:
+        logger.warning(f"SLOW {log_line}")
+    else:
+        logger.info(log_line)
+
+    return response
 
 
 @app.middleware("http")
