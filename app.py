@@ -10,6 +10,12 @@ from api.portfolio import router as user_portfolio
 from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
 from api.Dashboard import router as dashboardRouter
+import requests
+
+proxies = {
+    "http": "socks5h://127.0.0.1:9090",
+    "https": "socks5h://127.0.0.1:9090",
+}
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
 from api.auth_google import router as googleAuthRouter
@@ -43,7 +49,10 @@ except Exception as _shoonya_import_err:
     _SHOONYA_IMPORTABLE = False
     print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
 
-
+response = requests.get(
+    "https://api.ipify.org",
+    proxies=proxies,
+)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     refresh_task         = None

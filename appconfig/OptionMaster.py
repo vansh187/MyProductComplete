@@ -55,6 +55,46 @@ def get_strike_chain(underlying: str, expiry: str) -> dict[str, dict]:
     return _raw.get(underlying.upper(), {}).get(expiry, {})
 
 
+# Sensex options trade on Shoonya's separate BFO segment; every other tracked
+# underlying (NIFTY, BANKNIFTY, FINNIFTY) is NFO. Mirrors BFO_UNDERLYINGS in
+# scripts/build_option_master.py.
+_BFO_UNDERLYINGS = {"SENSEX"}
+
+
+def find_by_tsym(tsym: str) -> dict | None:
+    """
+    Reverse lookup for order placement and position building: tradingsymbol
+    (e.g. 'NIFTY07JUL2623800CE') -> {token, lot_size, exchange, underlying,
+    expiry, strike, option_type}. Tradingsymbols are unique per contract, so
+    this scans every underlying/expiry/strike without needing to parse the
+    symbol string.
+    """
+    if not tsym:
+        return None
+    tsym = tsym.upper().strip()
+    for underlying, chains in _raw.items():
+        for expiry, strikes in chains.items():
+            if expiry == "expiries":
+                continue
+            for strike, info in strikes.items():
+                if info.get("ce_tsym", "").upper() == tsym:
+                    leg_token, option_type = info["ce_token"], "CE"
+                elif info.get("pe_tsym", "").upper() == tsym:
+                    leg_token, option_type = info["pe_token"], "PE"
+                else:
+                    continue
+                return {
+                    "token": leg_token,
+                    "lot_size": info["lot_size"],
+                    "exchange": "BFO" if underlying in _BFO_UNDERLYINGS else "NFO",
+                    "underlying": underlying,
+                    "expiry": expiry,
+                    "strike": float(strike),
+                    "option_type": option_type,
+                }
+    return None
+
+
 def reload() -> None:
     """Re-reads master_options.json from disk without restarting the process."""
     global _raw

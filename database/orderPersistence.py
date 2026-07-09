@@ -70,7 +70,11 @@ class OrderPersistence:
                     order.product_type.value,
                     order.validity.value,
                     float(order.trigger_price) if order.trigger_price else None,
-                    order.client_order_id
+                    order.client_order_id,
+                    order.broker,
+                    order.source,
+                    order.token,
+                    order.lot_size
                 )
             )
 
@@ -107,6 +111,37 @@ class OrderPersistence:
                 cursor.close()
             if conn is not None:
                 conn.close()
+
+    def get_order_snapshot(self, order_id: int, cursor) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the reference fields (symbol/broker/source/token/lot_size/product_type/
+        exchange) an in-flight trade needs to build a position row, using the caller's
+        own cursor so it reads inside the same transaction as the trade being processed.
+
+        Args:
+            order_id: Order ID
+            cursor: Database cursor (shared with the calling transaction)
+
+        Returns:
+            Dict of order reference fields, or None if the order doesn't exist
+
+        Raises:
+            ValueError: If parameters are invalid
+        """
+        if order_id is None or order_id <= 0:
+            logger.error(f"get_order_snapshot() received invalid order_id: {order_id}")
+            raise ValueError("Order ID must be a positive integer")
+
+        if cursor is None:
+            logger.error("get_order_snapshot() received None cursor")
+            raise ValueError("Database cursor cannot be None")
+
+        query = QueryLoader.get('orders.yaml', 'get_order_snapshot_by_id')
+        if query is None:
+            raise Exception("Query 'get_order_snapshot_by_id' not found in orders.yaml")
+
+        cursor.execute(query, (order_id,))
+        return cursor.fetchone()
 
     @staticmethod
     def get_orders(user_id: int) -> List[Dict[str, Any]]:

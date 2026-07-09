@@ -1,6 +1,6 @@
 create_order: |
-  INSERT INTO orders (user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, created_at)
-  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+  INSERT INTO orders (user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker, source, token, lot_size, created_at, updated_at)
+  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
   RETURNING id
 
 get_orders: |
@@ -14,6 +14,11 @@ get_order_by_id: |
   FROM orders
   WHERE user_id = %s AND id = %s
 
+get_order_snapshot_by_id: |
+  SELECT symbol, broker, source, token, lot_size, product_type, exchange
+  FROM orders
+  WHERE id = %s
+
 cancel_order: |
   UPDATE orders
   SET status = %s
@@ -26,5 +31,10 @@ update_order_status: |
 
 update_order_status_single: |
   UPDATE orders
-  SET status = %s
+  SET status = %s,
+      avg_fill_price = %s,
+      filled_qty = %s,
+      trigger_price = COALESCE(%s, trigger_price),
+      client_order_id = COALESCE(%s, client_order_id),
+      updated_at = NOW()
   WHERE id = %s

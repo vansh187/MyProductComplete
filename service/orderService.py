@@ -6,11 +6,15 @@ Production-grade code with comprehensive error handling
 import logging
 from typing import Optional, List, Dict, Any
 
+from appconfig import OptionMaster
 from database.orderPersistence import OrderPersistence
 from database.portfolioPersistence import portfolioPersistence
+from service.tradeHistoryService import TradeHistoryService
+from dotenv import load_dotenv
+import os
 
 logger = logging.getLogger(__name__)
-
+load_dotenv()
 
 class OrderService:
     """Service class for order operations."""
@@ -45,8 +49,20 @@ class OrderService:
 
         try:
             self.logger.info(f"Creating order for user {user_id}: {order.symbol} {order.side.value} x{order.quantity}")
+            if user_id is not None:
+                order.broker='Shoonya'
+                order.lot_size=order.quantity
 
-            order_id = self.order_persistence.create_order(order, user_id)
+                token_match = OptionMaster.find_by_tsym(order.symbol)
+                if token_match:
+                    order.token = token_match["token"]
+
+                if(os.getenv("IS_PROD_ENVIRONMENT") is True):
+                    order.source='LIVE'
+                else:
+                    order.source='SIMULATED'
+                        
+                order_id = self.order_persistence.create_order(order, user_id)
 
             if order_id is None or order_id <= 0:
                 raise Exception("Order creation returned invalid ID")
@@ -98,6 +114,33 @@ class OrderService:
 
         except Exception as ex:
             self.logger.error(f"Error retrieving orders: {str(ex)}")
+            raise
+
+    def get_order_snapshot(self, order_id: int, cursor) -> Optional[Dict[str, Any]]:
+        """
+        Fetch an order's reference fields for position building, using the
+        caller's own cursor/transaction.
+
+        Args:
+            order_id: Order ID
+            cursor: Database cursor (shared with the calling transaction)
+
+        Returns:
+            Dict of order reference fields, or None if the order doesn't exist
+
+        Raises:
+            ValueError: If parameters are invalid
+        """
+        if order_id is None or order_id <= 0:
+            raise ValueError("Order ID must be a positive integer")
+
+        if cursor is None:
+            raise ValueError("Database cursor cannot be None")
+
+        try:
+            return self.order_persistence.get_order_snapshot(order_id, cursor)
+        except Exception as ex:
+            self.logger.error(f"Error fetching order snapshot for order {order_id}: {str(ex)}")
             raise
 
     def get_order_by_id(self, user_id: int, order_id: int) -> Optional[Dict[str, Any]]:
@@ -221,14 +264,20 @@ class OrderService:
             self.logger.error(f"Error updating order status: {str(ex)}")
             raise
 
-    def update_order_status_single(self, status: str, order_id: int, cursor) -> None:
+    def update_order_status_single(self, status: str, order_id: int, cursor,
+                                    trigger_price: float = None, client_order_id: str = None) -> None:
         """
-        Update status for a single order.
+        Update status for a single order, along with avg_fill_price/filled_qty
+        (recomputed as the weighted average across ALL fills recorded for this
+        order in trade_history - not just the latest match) and, when provided,
+        trigger_price/client_order_id.
 
         Args:
             status: New status
             order_id: Order ID
             cursor: Database cursor
+            trigger_price: Optional trigger price to persist (left unchanged if None)
+            client_order_id: Optional client order ID to persist (left unchanged if None)
 
         Raises:
             ValueError: If parameters are invalid
@@ -244,8 +293,14 @@ class OrderService:
             raise ValueError("Database cursor cannot be None")
 
         try:
-            portfolioPersistence.updateOrderStatusSingle(status, order_id, cursor)
-            self.logger.info(f"Updated single order status: order_id={order_id}, status={status}")
+            avg_fill_price, filled_qty = TradeHistoryService().getFillStats(order_id, cursor)
+            portfolioPersistence.updateOrderStatusSingle(
+                status, order_id, cursor, avg_fill_price, filled_qty, trigger_price, client_order_id
+            )
+            self.logger.info(
+                f"Updated single order status: order_id={order_id}, status={status}, "
+                f"avg_fill_price={avg_fill_price}, filled_qty={filled_qty}"
+            )
 
         except Exception as ex:
             self.logger.error(f"Error updating order status: {str(ex)}")

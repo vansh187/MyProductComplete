@@ -56,10 +56,11 @@ class portfolioPersistence:
             raise Exception(f"Exception in process_seller: {str(e)}") from e
 
     @staticmethod
-    def updateOrderStatusSingle(status, order_id, cursor):
+    def updateOrderStatusSingle(status, order_id, cursor, avg_fill_price=0, filled_qty=0,
+                                 trigger_price=None, client_order_id=None):
         cursor.execute(
             QueryLoader.get('orders.yaml', 'update_order_status_single'),
-            (status, order_id)
+            (status, avg_fill_price, filled_qty, trigger_price, client_order_id, order_id)
         )
 
     @staticmethod

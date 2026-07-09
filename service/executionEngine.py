@@ -13,6 +13,7 @@ import psycopg2.errors
 
 from service.portfolioService import portfolioService
 from service.orderService import OrderService
+from service.tradeSettlementService import TradeSettlementService
 from service.tradeHistoryService import TradeHistoryService as tradeService
 from service.walletbalance.WalletBalanceService import WalletBalanceService
 from database.PostgresConnectionFactory import PostgresConnectionFactory
@@ -89,6 +90,7 @@ class ExecutionEngine:
             if portfolio_service is None:
                 raise Exception("Failed to initialize portfolio service")
 
+            #order book craetion will be connect to real time
             order_book_id = self._create_order_book_entry(conn, cursor, portfolio_service, user_id)
 
             if order_book_id is None or order_book_id <= 0:
@@ -312,6 +314,7 @@ class ExecutionEngine:
         try:
             order_service = OrderService()
             portfolio_service = portfolioService()
+            trade_settlement_service = TradeSettlementService()
             trade_service = tradeService()
             wallet_service = WalletBalanceService()
             transaction_id = None
@@ -388,29 +391,47 @@ class ExecutionEngine:
                     incoming_remaining, incoming_status, order_book_id, cursor
                 )
 
-                # Update orders table
+                # Update orders table. Only the incoming order's trigger_price/
+                # client_order_id are known here (self.order) - the counterparty's
+                # OrderCreate isn't loaded in this engine, so its update passes None
+                # for those two and leaves the existing DB values untouched.
                 order_service.update_order_status_single(
                     counterparty_status, counterparty_order_id, cursor
                 )
                 order_service.update_order_status_single(
-                    incoming_status, self.order_id, cursor
+                    incoming_status, self.order_id, cursor,
+                    trigger_price=float(self.order.trigger_price) if self.order.trigger_price else None,
+                    client_order_id=self.order.client_order_id
                 )
+                
+                # Settle both sides of the match. match_found always carries both
+                # parties, regardless of which side placed the incoming (taker)
+                # order — the counterparty's resting (maker) order must be settled
+                # too. TradeSettlementService decides per-side whether this lands
+                # in holdings (cash equity) or positions (F&O) - this engine stays
+                # agnostic to that distinction. A missing order snapshot (order not
+                # found) is skipped rather than raising, since the trade itself has
+                # already been committed above.
+                buyer_order_snapshot = order_service.get_order_snapshot(match_found.buy_order_id, cursor)
+                if buyer_order_snapshot is not None:
+                    trade_settlement_service.settle_fill(
+                        match_found.buy_user_id, "BUY", buyer_order_snapshot,
+                        match_found.quantity, match_found.execution_price, cursor
+                    )
+                else:
+                    self.logger.warning(f"No order snapshot found for buy_order_id={match_found.buy_order_id}; skipping settlement")
 
-                # Update holdings for both sides of the match. match_found always
-                # carries both parties, regardless of which side placed the incoming
-                # (taker) order — the counterparty's resting (maker) order must be
-                # settled too. Only the seller's wallet is credited here; the buyer's
-                # wallet was already debited at order-creation time (see api/orders.py).
-                portfolio_service.process_buyer(
-                    match_found.buy_user_id, match_found.symbol,
-                    match_found.quantity, match_found.execution_price,
-                    cursor
-                )
-                portfolio_service.process_seller(
-                    match_found.sell_user_id, match_found.symbol,
-                    match_found.quantity, match_found.execution_price,
-                    cursor
-                )
+                seller_order_snapshot = order_service.get_order_snapshot(match_found.sell_order_id, cursor)
+                if seller_order_snapshot is not None:
+                    trade_settlement_service.settle_fill(
+                        match_found.sell_user_id, "SELL", seller_order_snapshot,
+                        match_found.quantity, match_found.execution_price, cursor
+                    )
+                else:
+                    self.logger.warning(f"No order snapshot found for sell_order_id={match_found.sell_order_id}; skipping settlement")
+
+                # Only the seller's wallet is credited here; the buyer's wallet
+                # was already debited at order-creation time (see api/orders.py).
                 wallet_service.creditWallet(
                     cursor, match_found.sell_user_id, match_found.trade_value
                 )
@@ -419,7 +440,7 @@ class ExecutionEngine:
                     f"Trade processed: transaction_id={transaction_id}, qty={match_found.quantity}, "
                     f"buyer={match_found.buy_user_id}, seller={match_found.sell_user_id}"
                 )
-
+                
             conn.commit()
             self.logger.info(f"All trades committed successfully")
 

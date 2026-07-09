@@ -3,6 +3,7 @@ API Models and Enums
 Separated from orders.py to avoid circular imports
 """
 
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
@@ -62,6 +63,14 @@ class OrderCreate(BaseModel):
 
     client_order_id: Optional[str] = Field(default=None, max_length=100, description="Client order ID for tracking")
     notes: Optional[str] = Field(default=None, max_length=500, description="Order notes")
+
+    broker: Optional[str] = Field(default=None, max_length=20, description="Broker name (set by backend)")
+    source: Optional[str] = Field(default=None, max_length=20, description="Order source (set by backend)")
+    token: Optional[str] = Field(default=None, max_length=20, description="Instrument token (set by backend)")
+    filled_qty: Optional[int] = Field(default=None, description="Filled quantity (set by backend)")
+    lot_size: Optional[int] = Field(default=None, description="Lot size (set by backend)")
+    avg_fill_price: Optional[float] = Field(default=None, description="Average fill price (set by backend)")
+    updated_at: Optional[datetime] = Field(default=None, description="Last update timestamp (set by backend)")
 
     @field_validator('price')
     @classmethod
