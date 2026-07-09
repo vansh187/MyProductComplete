@@ -32,29 +32,29 @@ def _override_auth():
 class TestCandleService:
 
     def test_normalize_interval_1m(self):
-        """1m → 1minute"""
+        """1m → 1 (NorenApi TPSeries expects plain minute counts)"""
         result = CandleService._normalize_interval("1m")
-        assert result == "1minute"
+        assert result == "1"
 
     def test_normalize_interval_5m(self):
-        """5m → 5minute"""
+        """5m → 5"""
         result = CandleService._normalize_interval("5m")
-        assert result == "5minute"
+        assert result == "5"
 
     def test_normalize_interval_1h(self):
-        """1h → 1hour"""
+        """1h → 60"""
         result = CandleService._normalize_interval("1h")
-        assert result == "1hour"
+        assert result == "60"
 
-    def test_normalize_interval_1d(self):
-        """1d → 1day"""
+    def test_normalize_interval_1d_unsupported(self):
+        """1d is not available via TPSeries (minute-granularity only)"""
         result = CandleService._normalize_interval("1d")
-        assert result == "1day"
+        assert result is None
 
-    def test_normalize_interval_invalid_defaults_to_1minute(self):
-        """Unknown interval defaults to 1minute"""
+    def test_normalize_interval_invalid_returns_none(self):
+        """Unknown/unsupported interval returns None instead of silently defaulting"""
         result = CandleService._normalize_interval("30m")
-        assert result == "1minute"
+        assert result is None
 
     def test_format_candle_valid(self):
         """Candle dict is normalized and rounded correctly"""
@@ -73,6 +73,45 @@ class TestCandleService:
         assert result["low"] == 24850.11
         assert result["close"] == 24870.51
         assert result["volume"] == 50000
+
+    def test_filter_to_last_trading_day_drops_stale_days(self):
+        """When the lookback window spans a weekend, only the most recent
+        day's candles (e.g. Friday) should survive, not a blend with Thursday."""
+        raw = [
+            {"timestamp": "02-07-2026 15:29:00", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},  # Thursday
+            {"timestamp": "03-07-2026 09:15:00", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},  # Friday
+            {"timestamp": "03-07-2026 09:16:00", "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3},  # Friday
+        ]
+        result = CandleService._filter_to_last_trading_day(raw)
+        assert len(result) == 2
+        assert all(c["timestamp"].startswith("03-07-2026") for c in result)
+
+    def test_get_index_candles_returns_last_trading_day_over_weekend(self):
+        """Simulates opening the app on a Sunday: broker (given a wide lookback)
+        returns Friday's candles even though 'today' has no data, and the
+        service must surface them instead of reporting no_candle_data."""
+        import asyncio
+
+        friday_candles = [
+            {"timestamp": "03-07-2026 09:15:00", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1000},
+            {"timestamp": "03-07-2026 09:16:00", "open": 100.5, "high": 102, "low": 100, "close": 101.5, "volume": 1200},
+        ]
+
+        fake_shoonya = MagicMock()
+        fake_shoonya.is_connected = True
+        fake_shoonya.get_time_price_series.return_value = friday_candles
+
+        service = CandleService()
+        candles, errors = asyncio.run(
+            service.get_index_candles(fake_shoonya, "NSE", "26000", "1m", limit=100)
+        )
+
+        assert errors == []
+        assert len(candles) == 2
+        # Lookback window must be wide enough to survive a closed weekend,
+        # not the old hardcoded days=1 (last 24h from "now").
+        _, kwargs = fake_shoonya.get_time_price_series.call_args
+        assert kwargs["days"] > 1
 
     def test_format_candle_missing_fields_defaults_to_zero(self):
         """Missing OHLC fields default to 0"""
@@ -149,6 +188,37 @@ class TestNiftyCandles:
 
         assert resp.status_code == 400
         assert "Invalid timeframe" in resp.json()["detail"]
+
+    @pytest.mark.parametrize("timeframe", ["5s", "10s", "1d"])
+    def test_nifty_candles_broker_unsupported_timeframe_rejected(self, timeframe):
+        """5s/10s/1d aren't fulfillable via Shoonya's TPSeries (minute-only
+        granularity) so they must be rejected at validation, not silently
+        return an empty candle list."""
+        app = _make_app()
+
+        with patch("api.candles._get_shoonya"):
+            client = TestClient(app)
+            resp = client.get(f"/api/market/nifty/candles?timeframe={timeframe}")
+
+        assert resp.status_code == 400
+        assert "Invalid timeframe" in resp.json()["detail"]
+
+    def test_nifty_candles_default_timeframe_is_1m(self):
+        """Default timeframe must be one the broker can actually fulfill"""
+        app = _make_app()
+
+        with patch("api.candles._candleService.get_index_candles", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = ([], [])
+            with patch("api.candles._get_shoonya") as mock_shoonya:
+                mock_shoonya_conn = MagicMock()
+                mock_shoonya_conn.is_connected = True
+                mock_shoonya.return_value = mock_shoonya_conn
+
+                client = TestClient(app)
+                resp = client.get("/api/market/nifty/candles")
+
+        assert resp.status_code == 200
+        assert resp.json()["timeframe"] == "1m"
 
     def test_nifty_candles_shoonya_disconnected(self):
         """Shoonya disconnected returns 503"""
@@ -265,11 +335,11 @@ class TestFinNiftyCandles:
                 mock_shoonya.return_value = mock_shoonya_conn
 
                 client = TestClient(app)
-                resp = client.get("/api/market/finnifty/candles?timeframe=1d")
+                resp = client.get("/api/market/finnifty/candles?timeframe=1h")
 
         assert resp.status_code == 200
         assert resp.json()["symbol"] == "FINNIFTY"
-        assert resp.json()["timeframe"] == "1d"
+        assert resp.json()["timeframe"] == "1h"
 
 
 # ── GET /api/market/sensex/candles ──────────────────────────────────────────
@@ -303,10 +373,10 @@ class TestSensexCandles:
         assert data["errors"] == []
 
     def test_sensex_candles_multiple_timeframes(self):
-        """Sensex supports all timeframes"""
+        """Sensex supports all broker-fulfillable timeframes"""
         app = _make_app()
 
-        for timeframe in ["1m", "3m", "5m", "15m", "1h", "1d"]:
+        for timeframe in ["1m", "3m", "5m", "15m", "1h"]:
             with patch("api.candles._candleService.get_index_candles", new_callable=AsyncMock) as mock_fetch:
                 mock_fetch.return_value = ([], [])
 

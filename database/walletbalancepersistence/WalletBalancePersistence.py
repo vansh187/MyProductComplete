@@ -1,6 +1,7 @@
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from utils.query_loader import QueryLoader
 import psycopg2.extras
+from decimal import Decimal
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,3 +58,26 @@ class WalletBalancePersistence:
             return cursor.fetchone()
         except Exception as ex:
             raise Exception(f"Error fetching wallet with lock: {str(ex)}") from ex
+
+    def creditWallet(self, cursor, userId, amount):
+        """
+        Credit amount to a user's wallet within an active transaction.
+        Locks the wallet row first to avoid lost updates from concurrent trades.
+        """
+        if cursor is None:
+            raise ValueError("Cursor cannot be None")
+        if userId is None or userId <= 0:
+            raise ValueError("User ID must be a positive integer")
+        if amount is None or amount <= 0:
+            raise ValueError("Credit amount must be positive")
+
+        wallet = self.getWalletBalanceWithLock(cursor, userId)
+        if wallet is None:
+            raise Exception(f"No wallet found for user {userId}")
+
+        new_balance = Decimal(str(wallet["balance"])) + Decimal(str(amount))
+        cursor.execute(
+            QueryLoader.get('wallet.yaml', 'update_wallet_balance'),
+            (new_balance, userId)
+        )
+        return new_balance

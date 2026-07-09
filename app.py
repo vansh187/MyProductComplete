@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from fastapi import FastAPI
 from api.signup import router as signup_router
 from api.login import router as login_router
@@ -15,6 +17,8 @@ from api.admin_shoonya import router as adminShoonyaRouter
 from api.sectorPerformance import router as sectorPerformanceRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from api.candles import router as candlesRouter
+from api.optionChain import router as optionChainRouter, _optionChainService
+from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -30,10 +34,12 @@ except Exception as _breeze_import_err:
 
 try:
     from marketengine.ShoonyaConnection import ShoonyaConnection, schedule_daily_refresh as shoonya_daily_refresh
+    from marketengine.ShoonyaOptionFeed import ShoonyaOptionFeed
     _SHOONYA_IMPORTABLE = True
 except Exception as _shoonya_import_err:
     ShoonyaConnection = None
     shoonya_daily_refresh = None
+    ShoonyaOptionFeed = None
     _SHOONYA_IMPORTABLE = False
     print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
 
@@ -43,8 +49,10 @@ async def lifespan(app: FastAPI):
     refresh_task         = None
     shoonya_refresh_task = None
     top_movers_task      = None
-    app.state.breeze     = None
-    app.state.shoonya    = None
+    option_master_task   = None
+    app.state.breeze       = None
+    app.state.shoonya      = None
+    app.state.option_feed  = None
 
     # ── Shoonya (primary indices provider) ───────────────────────────
     if _SHOONYA_IMPORTABLE:
@@ -69,6 +77,18 @@ async def lifespan(app: FastAPI):
         # until a manual restart or the next scheduled 8:30 AM slot.
         shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
         top_movers_task      = asyncio.create_task(top_movers_refresh(app))
+
+        # ── Option chain: live WS feed + scrip-master daily refresh ──
+        if app.state.shoonya is not None:
+            try:
+                option_feed = ShoonyaOptionFeed(app.state.shoonya)
+                option_feed.start()
+                _optionChainService.set_feed(option_feed)
+                app.state.option_feed = option_feed
+                print("App starting... Option chain WebSocket feed started.")
+            except Exception as e:
+                print(f"[WARNING] Option chain feed init error: {e}")
+        option_master_task = asyncio.create_task(option_master_daily_refresh(app))
     else:
         print("App starting... Shoonya unavailable.")
 
@@ -99,6 +119,10 @@ async def lifespan(app: FastAPI):
         shoonya_refresh_task.cancel()
     if top_movers_task:
         top_movers_task.cancel()
+    if option_master_task:
+        option_master_task.cancel()
+    if app.state.option_feed:
+        app.state.option_feed.close()
     print("Server shutting down.")
 
 
@@ -117,6 +141,7 @@ app.include_router(adminShoonyaRouter)
 app.include_router(sectorPerformanceRouter)
 app.include_router(topMoversRouter)
 app.include_router(candlesRouter)
+app.include_router(optionChainRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],
@@ -124,6 +149,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+logger = logging.getLogger("latency")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    # Independent of any other logging config in the app (most of which
+    # uses plain print()) - guarantees these lines reach stdout, which
+    # systemd/journald already captures, without depending on root logger
+    # setup or double-printing if this module is ever imported twice.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [latency] %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
+
+# Requests slower than this get an explicit warning line (grep "SLOW" in the
+# journal) instead of blending into the routine per-request log noise -
+# these are exactly the ones worth investigating first.
+SLOW_REQUEST_THRESHOLD_MS = 1000
+
+
+@app.middleware("http")
+async def add_latency_tracking(request, call_next):
+    """Times every request end-to-end (including any broker/DB round-trips
+    the handler makes) with negligible overhead (a single perf_counter read
+    on each side of the call). Exposes it two ways:
+      - "Server-Timing" response header: visible directly in the browser's
+        Network tab (Timing panel) per request, no extra tooling needed.
+      - A log line per request, so latency can be grepped/aggregated from
+        the server's own logs (journalctl -u primepiptrade-api) without
+        needing a separate APM stack.
+    """
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.error(f"{request.method} {request.url.path} FAILED after {duration_ms:.1f}ms")
+        raise
+
+    duration_ms = (time.perf_counter() - start) * 1000
+    response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
+    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+
+    log_line = f"{request.method} {request.url.path} {response.status_code} {duration_ms:.1f}ms"
+    if duration_ms >= SLOW_REQUEST_THRESHOLD_MS:
+        logger.warning(f"SLOW {log_line}")
+    else:
+        logger.info(log_line)
+
+    return response
 
 
 @app.middleware("http")

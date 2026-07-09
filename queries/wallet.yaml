@@ -8,3 +8,8 @@ get_wallet_balance_for_update: |
   FROM wallets
   WHERE user_id = %s
   FOR UPDATE
+
+update_wallet_balance: |
+  UPDATE wallets
+  SET balance = %s
+  WHERE user_id = %s
