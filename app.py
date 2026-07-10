@@ -7,6 +7,7 @@ from api.login import router as login_router
 from api.orders import router as orders_router
 from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
+from api.positions import router as positionsRouter
 from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
 from api.Dashboard import router as dashboardRouter
@@ -18,6 +19,7 @@ from api.sectorPerformance import router as sectorPerformanceRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from api.candles import router as candlesRouter
 from api.optionChain import router as optionChainRouter, _optionChainService
+from service.positionTickService import positionTickService
 from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
 from fastapi.middleware.cors import CORSMiddleware
 try:
@@ -84,6 +86,7 @@ async def lifespan(app: FastAPI):
                 option_feed = ShoonyaOptionFeed(app.state.shoonya)
                 option_feed.start()
                 _optionChainService.set_feed(option_feed)
+                positionTickService.set_feed(option_feed)
                 app.state.option_feed = option_feed
                 print("App starting... Option chain WebSocket feed started.")
             except Exception as e:
@@ -132,6 +135,7 @@ app.include_router(signup_router)
 app.include_router(login_router)
 app.include_router(trade_history)
 app.include_router(user_portfolio)
+app.include_router(positionsRouter)
 app.include_router(dashboardRouter)
 app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)

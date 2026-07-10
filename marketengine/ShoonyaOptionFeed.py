@@ -69,7 +69,7 @@ class ShoonyaOptionFeed:
     def __init__(self, shoonya_connection):
         self._shoonya = shoonya_connection
         self._async_loop: asyncio.AbstractEventLoop | None = None
-        self._tick_handler: TickHandler | None = None
+        self._tick_handlers: list[TickHandler] = []
         self._subscribed_tokens: dict[str, int] = {}  # "EXCH|TOKEN" -> ref count
         self._lock = threading.Lock()
         self._reconnecting = False
@@ -84,8 +84,11 @@ class ShoonyaOptionFeed:
         self._api_instance = None
 
     def on_tick(self, handler: TickHandler) -> None:
-        """Registers the single callback invoked as handler(instrument_key, tick_fields)."""
-        self._tick_handler = handler
+        """Registers a callback invoked as handler(instrument_key, tick_fields)
+        on every tick. Multiple independent consumers (e.g. the option chain
+        cache and the position cache) can each register their own handler -
+        every registered handler receives every tick."""
+        self._tick_handlers.append(handler)
 
     def start(self) -> None:
         """Opens the WebSocket connection. Safe to call again after a reconnect
@@ -224,19 +227,20 @@ class ShoonyaOptionFeed:
             instrument_key = f"{exch}|{token}"
 
             tick = normalize_touchline_tick(raw)
-            if not tick or self._tick_handler is None or self._async_loop is None:
+            if not tick or not self._tick_handlers or self._async_loop is None:
                 return
 
-            result = self._tick_handler(instrument_key, tick)
-            if inspect.isawaitable(result):
-                future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
-                # run_coroutine_threadsafe schedules `result` as a detached
-                # Task - nothing ever calls .result() on the returned Future,
-                # so an exception raised inside tick processing (e.g. a bad
-                # expiry date, a KeyError) would otherwise vanish silently:
-                # that option leg would simply stop updating with no log,
-                # metric, or alert anywhere. This surfaces it.
-                future.add_done_callback(self._log_tick_task_exception)
+            for handler in self._tick_handlers:
+                result = handler(instrument_key, tick)
+                if inspect.isawaitable(result):
+                    future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
+                    # run_coroutine_threadsafe schedules `result` as a detached
+                    # Task - nothing ever calls .result() on the returned Future,
+                    # so an exception raised inside tick processing (e.g. a bad
+                    # expiry date, a KeyError) would otherwise vanish silently:
+                    # that option leg would simply stop updating with no log,
+                    # metric, or alert anywhere. This surfaces it.
+                    future.add_done_callback(self._log_tick_task_exception)
         except Exception as e:
             logger.warning(f"[OptionFeed] Error processing tick {raw}: {e}")
 
