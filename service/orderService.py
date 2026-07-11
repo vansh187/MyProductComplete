@@ -11,6 +11,8 @@ from api.models import ExchangeType
 from database.orderPersistence import OrderPersistence
 from database.portfolioPersistence import portfolioPersistence
 from service.tradeHistoryService import TradeHistoryService
+from service.marginengine.margin_engine import MarginEngine
+from service.marginengine.exceptions import MarginEngineError
 from dotenv import load_dotenv
 import os
 
@@ -23,6 +25,7 @@ class OrderService:
     def __init__(self):
         """Initialize OrderService."""
         self.order_persistence = OrderPersistence()
+        self.margin_engine = MarginEngine()
         self.logger = logger
 
     def create_order(self, order: Any, user_id: int) -> int:
@@ -234,6 +237,16 @@ class OrderService:
 
             if was_cancelled:
                 self.logger.info(f"Order {order_id} cancelled successfully")
+                try:
+                    # Idempotent no-op for non-F&O orders or orders that never
+                    # had a margin block - must never block a successful
+                    # cancel from being reported back to the caller.
+                    self.margin_engine.release_on_cancel(order_id)
+                except MarginEngineError as margin_ex:
+                    self.logger.error(
+                        f"Margin release failed for cancelled order {order_id} "
+                        f"(cancel already succeeded): {str(margin_ex)}"
+                    )
             else:
                 self.logger.warning(f"No pending order found to cancel: {order_id}")
 

@@ -14,6 +14,8 @@ from appconfig import OptionMaster
 from database.positionCache import CACHE_SCHEMA_VERSION, PositionCache
 from database.positionPersistence import PositionPersistence
 from service.positionTickService import positionTickService
+from service.marginengine.margin_engine import MarginEngine
+from service.marginengine.exceptions import MarginEngineError
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,7 @@ class PositionService:
     def __init__(self):
         self.position_persistence = PositionPersistence()
         self.position_cache = PositionCache()
+        self.margin_engine = MarginEngine()
         self.logger = logger
 
     def apply_fill(self, user_id: int, side: str, order_snapshot: Dict[str, Any],
@@ -239,4 +242,18 @@ class PositionService:
                 self.logger.info(
                     f"Open position cached: user_id={user_id}, tsym={tsym}, "
                     f"netqty={position['netqty']}"
+                )
+
+            # Margin reconciliation is best-effort with respect to trade
+            # settlement: a margin-subsystem failure must never roll back or
+            # block an otherwise-successful fill (see
+            # FnO_Margin_Engine_Design.md - "no blockers in production in
+            # order execution" is a hard requirement carried over from the
+            # original F&O settlement-routing fix). Logged, not raised.
+            try:
+                self.margin_engine.reconcile_on_fill(user_id, side, order_snapshot, netqty, cursor)
+            except MarginEngineError as margin_ex:
+                self.logger.error(
+                    f"Margin reconciliation failed for user_id={user_id}, tsym={tsym} "
+                    f"(trade settlement proceeds regardless): {str(margin_ex)}"
                 )

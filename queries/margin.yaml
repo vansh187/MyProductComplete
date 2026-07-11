@@ -1,0 +1,107 @@
+insert_order_margin_block: |
+  INSERT INTO order_margin_blocks (
+    order_id, user_id, tsym, exchange, contract_type, side, qty, lot_size,
+    blocked_amount, premium_component, notional_component, reference_price,
+    reference_source, reference_source_tier, price_source_multiplier_used,
+    moneyness_multiplier_used, expiry_multiplier_used, notional_pct_or_span_pct,
+    status
+  )
+  VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s,
+    %s, %s, %s,
+    %s, %s, %s,
+    'ACTIVE'
+  )
+  RETURNING id
+
+get_active_block_for_order: |
+  SELECT id, order_id, user_id, tsym, exchange, contract_type, side, qty, lot_size,
+         blocked_amount, premium_component, notional_component, reference_price,
+         reference_source, reference_source_tier, status
+  FROM order_margin_blocks
+  WHERE order_id = %s AND status = 'ACTIVE'
+  FOR UPDATE
+
+release_order_margin_block: |
+  UPDATE order_margin_blocks
+  SET status = 'RELEASED', released_at = NOW(), release_reason = %s
+  WHERE id = %s
+
+get_active_margin_config: |
+  SELECT contract_type, underlying, notional_pct, span_pct, near_expiry_multiplier,
+         far_expiry_multiplier, near_expiry_days, far_expiry_days,
+         moneyness_itm_multiplier, moneyness_atm_multiplier, moneyness_otm_multiplier,
+         session_gap_multiplier, price_source_tier1_multiplier, price_source_tier2_multiplier,
+         price_source_tier3_multiplier, price_source_tier4_multiplier, tier3_verification_band_pct
+  FROM margin_config
+  WHERE contract_type = %s AND underlying = %s AND is_active = true
+  LIMIT 1
+
+get_default_margin_config: |
+  SELECT contract_type, underlying, notional_pct, span_pct, near_expiry_multiplier,
+         far_expiry_multiplier, near_expiry_days, far_expiry_days,
+         moneyness_itm_multiplier, moneyness_atm_multiplier, moneyness_otm_multiplier,
+         session_gap_multiplier, price_source_tier1_multiplier, price_source_tier2_multiplier,
+         price_source_tier3_multiplier, price_source_tier4_multiplier, tier3_verification_band_pct
+  FROM margin_config
+  WHERE contract_type = %s AND underlying IS NULL AND is_active = true
+  LIMIT 1
+
+get_wallet_for_margin_update: |
+  SELECT user_id, balance, blocked_margin
+  FROM wallets
+  WHERE user_id = %s
+  FOR UPDATE
+
+update_wallet_blocked_margin: |
+  UPDATE wallets
+  SET blocked_margin = %s
+  WHERE user_id = %s
+
+get_position_for_margin: |
+  SELECT user_id, tsym, netqty, exchange, token, expiry, contract_type, blocked_margin, status
+  FROM positions
+  WHERE user_id = %s AND tsym = %s
+  FOR UPDATE
+
+update_position_blocked_margin: |
+  UPDATE positions
+  SET blocked_margin = %s
+  WHERE user_id = %s AND tsym = %s
+
+insert_margin_audit: |
+  INSERT INTO margin_block_audit (order_margin_block_id, user_id, event_type, amount_delta, reason_code)
+  VALUES (%s, %s, %s, %s, %s)
+
+insert_peak_margin_snapshot: |
+  INSERT INTO peak_margin_snapshot (user_id, snapshot_date, total_blocked_margin, available_balance)
+  VALUES (%s, %s, %s, %s)
+  ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
+    total_blocked_margin = EXCLUDED.total_blocked_margin,
+    available_balance = EXCLUDED.available_balance
+
+insert_margin_review_flag: |
+  INSERT INTO margin_review_flags (user_id, flag_date, flag_reason, required_margin_recomputed, available_balance_at_flag)
+  VALUES (%s, %s, %s, %s, %s)
+
+get_open_fno_positions_expiring_by: |
+  SELECT user_id, tsym, exchange, token, expiry, contract_type, netqty, blocked_margin
+  FROM positions
+  WHERE status = 'OPEN' AND expiry IS NOT NULL AND expiry <= %s
+
+get_all_open_fno_positions: |
+  SELECT user_id, tsym, exchange, token, expiry, contract_type, netqty, netavgprc, blocked_margin
+  FROM positions
+  WHERE status = 'OPEN'
+
+get_all_wallet_balances: |
+  SELECT user_id, balance, blocked_margin
+  FROM wallets
+
+get_last_trade_price_for_symbol: |
+  SELECT execution_price, executed_at
+  FROM trade_history
+  WHERE symbol = %s
+  ORDER BY executed_at DESC
+  LIMIT 1

@@ -6,11 +6,26 @@ from utils.auth_dependency import get_current_user
 from service.orderService import OrderService
 from service.executionEngine import ExecutionEngine
 from service.walletbalance.WalletBalanceService import WalletBalanceService
+from service.marginengine.margin_engine import MarginEngine
+from service.marginengine.exceptions import InsufficientMarginError, MarginEngineError, ReferencePriceUnresolvedError
 
 from api.models import OrderCreate, OrderSide, OrderType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _cancel_after_margin_failure(order_service: OrderService, user_id: int, order_id: int) -> None:
+    """Best-effort cancel of an order that failed its post-creation margin
+    check, so it isn't left resting with no margin behind it. Never raises -
+    the caller is already about to raise the real HTTPException for the
+    margin failure itself, and that must not be masked by a secondary
+    cancellation error."""
+    try:
+        order_service.cancel_order_by_id(user_id, order_id)
+    except Exception as ex:
+        logger.error(f"Failed to auto-cancel order {order_id} after margin failure: {str(ex)}")
+
 
 # ============================================
 # API ENDPOINTS
@@ -58,6 +73,7 @@ def get_orders(current_user=Depends(get_current_user)):
 
 @router.post("/orders")
 def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
+    
     """
     Create a new order with wallet balance validation.
 
@@ -84,12 +100,34 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
             logger.error("create_order() received None order")
             raise HTTPException(status_code=400, detail="Order cannot be None")
 
+        # F&O classification, resolved up front so both the BUY and SELL
+        # branches below know whether this order needs the margin engine
+        # (OPTION/FUTURES) instead of - or in addition to - the cash-based
+        # wallet checks. contract_type is None for equity/unrecognized
+        # instruments, in which case behavior is completely unchanged from
+        # before the margin engine existed.
+        margin_engine = MarginEngine()
+        instrument = margin_engine.resolve_contract_type(
+            order.symbol, order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange),
+            fallback_lot_size=order.quantity,
+        )
+        contract_type = instrument["contract_type"]
+        side_value = order.side.value if hasattr(order.side, "value") else str(order.side)
+
         # BUY order: Check wallet balance
         # IMPORTANT: This check is done outside a transaction lock. Between this check
         # and order creation, another request could reduce the wallet balance (race condition).
         # TODO: Implement transaction-level wallet locking using SELECT...FOR UPDATE in a database transaction
         # to prevent wallet double-spend attacks from concurrent orders.
-        if order.side == OrderSide.BUY:
+        #
+        # FUTURES BUY orders are excluded from this cash-debit path entirely:
+        # a future has no premium, so debiting quantity*price as if it were
+        # a cash purchase would be wrong - futures margin (both BUY and
+        # SELL) is handled below via MarginEngine.check_and_block() instead.
+        # OPTION BUY orders (opening or closing a short) keep this path
+        # unchanged - buying an option, including buying one back to cover
+        # a short, always costs real premium cash.
+        if order.side == OrderSide.BUY and contract_type != "FUTURES":
             if order.price is None or order.price <= 0:
                 raise HTTPException(
                     status_code=400,
@@ -126,8 +164,50 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
 
         logger.info(f"Order created: ID={order_id}, User={user_id}, Symbol={order.symbol}")
 
+        # F&O margin check + block, for any order the margin engine actually
+        # requires margin for (options SELL, futures BUY/SELL). Runs after
+        # order creation because the margin block row references order_id.
+        # On any margin failure the just-created order is cancelled (mirrors
+        # the existing fail-fast behavior of the equity wallet check above)
+        # so no order is left resting without margin behind it.
+        #
+        # order.exchange is authoritative here: OrderService.create_order()
+        # (just called above) server-resolves it from OptionMaster for any
+        # symbol it recognizes (see service/orderService.py) - the same
+        # exchange TradeSettlementService later uses to route fills.
+        margin_check_exchange = order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange)
+
+        if margin_engine.is_margin_required(margin_check_exchange, side_value, contract_type):
+            try:
+                margin_check = margin_engine.check_and_block(order, order_id, user_id)
+                logger.info(
+                    f"Margin check passed: order={order_id}, user={user_id}, "
+                    f"required_margin={margin_check.required_margin}"
+                )
+            except InsufficientMarginError as margin_ex:
+                logger.warning(f"Insufficient margin for order {order_id}, user {user_id}: {str(margin_ex)}")
+                _cancel_after_margin_failure(order_service, user_id, order_id)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Insufficient margin. Required: ₹{margin_ex.required_margin:.2f}, "
+                           f"Available: ₹{margin_ex.available_balance:.2f}, Shortfall: ₹{margin_ex.shortfall:.2f}"
+                )
+            except ReferencePriceUnresolvedError as margin_ex:
+                logger.error(f"Reference price unresolved for order {order_id}, user {user_id}: {str(margin_ex)}")
+                _cancel_after_margin_failure(order_service, user_id, order_id)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not resolve a reliable reference price for {margin_ex.tsym}. Please try again."
+                )
+            except MarginEngineError as margin_ex:
+                logger.error(f"Margin engine error for order {order_id}, user {user_id}: {str(margin_ex)}")
+                _cancel_after_margin_failure(order_service, user_id, order_id)
+                raise HTTPException(status_code=500, detail="Failed to process margin for this order")
+
         # For BUY orders: Deduct balance from wallet (funds are blocked)
-        if order.side == OrderSide.BUY:
+        # Excludes FUTURES BUY - see the matching exclusion on the pre-creation
+        # check above; futures margin was already blocked by check_and_block.
+        if order.side == OrderSide.BUY and contract_type != "FUTURES":
             try:
                 blocked_amount = Decimal(str(order.quantity)) * Decimal(str(order.price))
                 wallet_service = WalletBalanceService()
