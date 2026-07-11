@@ -142,6 +142,118 @@ class TestFuturesMarginCalculator:
 
 
 # ============================================================================
+# TieredPriceResolver
+#
+# Regression coverage for two production bugs found via a live order: Tier 4
+# was returning an option's STRIKE as its resolved price (fed directly into
+# OptionsMarginCalculator as premium_per_unit - a strike is nowhere near a
+# real premium, e.g. 23700 vs ~120, inflating required margin ~200x), and
+# Tier 3's verification baseline had the same conflation, which meant Tier 3
+# rejected every genuine internal trade for options unconditionally (a
+# strike-vs-premium "deviation" is always ~99%+, never within any sane
+# band). Neither bug was ever caught by the calculator tests above, because
+# those construct MarginContext by hand with already-correct values - they
+# never exercise the resolver's own tier-selection/fallback-value logic.
+# These tests close exactly that gap.
+# ============================================================================
+
+class TestTieredPriceResolver:
+
+    def _resolver(self):
+        from service.marginengine.tiered_price_resolver import TieredPriceResolver
+        return TieredPriceResolver()
+
+    def _no_cache_no_internal_trade(self):
+        """Patches Tier 2 (cached chain) to miss and Tier 3 (internal trade)
+        to find no prior trade, forcing every case through to Tier 4/5."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        return patch(
+            "service.marginengine.tiered_price_resolver.PostgresConnectionFactory.create_connection",
+            return_value=mock_conn,
+        )
+
+    def test_tier4_option_uses_order_price_not_strike(self):
+        """The core regression: Tier 4 for an OPTION must resolve to the
+        client's order price (a real premium-scale number), never the
+        strike (a spot-scale number that would silently 200x the margin)."""
+        with self._no_cache_no_internal_trade():
+            resolution = self._resolver().resolve(
+                tsym="NIFTY14JUL26C23700", contract_type="OPTION", underlying="NIFTY",
+                exchange="NFO", token="51355", order_price=Decimal("120.5"),
+                strike=Decimal("23700"), option_type="CE", expiry="2026-07-14",
+            )
+        assert resolution.tier == 4
+        assert resolution.source == "ORDER_PRICE_PROXY"
+        assert resolution.price == Decimal("120.5")
+
+    def test_tier4_futures_uses_order_price(self):
+        with self._no_cache_no_internal_trade():
+            resolution = self._resolver().resolve(
+                tsym="NIFTY28AUG25FUT", contract_type="FUTURES", underlying="NIFTY",
+                exchange="NFO", token=None, order_price=Decimal("21850"),
+            )
+        assert resolution.tier == 4
+        assert resolution.source == "ORDER_PRICE_PROXY"
+        assert resolution.price == Decimal("21850")
+
+    def test_tier4_option_with_no_order_price_falls_to_terminal_reject(self):
+        """A MARKET order (no order_price) with zero other price signals
+        must hard-reject, not silently fabricate a number from the strike."""
+        with self._no_cache_no_internal_trade():
+            with pytest.raises(ReferencePriceUnresolvedError):
+                self._resolver().resolve(
+                    tsym="NIFTY14JUL26C23700", contract_type="OPTION", underlying="NIFTY",
+                    exchange="NFO", token="51355", order_price=None,
+                    strike=Decimal("23700"), option_type="CE", expiry="2026-07-14",
+                )
+
+    def test_tier3_verified_internal_trade_uses_order_price_as_baseline(self):
+        """A last internal trade close to the client's order price (both
+        premium-scale) must be ACCEPTED at Tier 3 - this would previously
+        always fail (baseline was strike, ~99% "deviation" from any real
+        premium), silently skipping straight to Tier 4 every time."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (Decimal("118.0"), None)  # last traded premium
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        with patch(
+            "service.marginengine.tiered_price_resolver.PostgresConnectionFactory.create_connection",
+            return_value=mock_conn,
+        ):
+            resolution = self._resolver().resolve(
+                tsym="NIFTY14JUL26C23700", contract_type="OPTION", underlying="NIFTY",
+                exchange="NFO", token="51355", order_price=Decimal("120.5"),
+                strike=Decimal("23700"), option_type="CE", expiry="2026-07-14",
+                verification_band_pct=Decimal("0.20"),
+            )
+        assert resolution.tier == 3
+        assert resolution.source == "VERIFIED_INTERNAL"
+        assert resolution.price == Decimal("118.0")
+
+    def test_tier2_cached_chain_still_wins_over_tier4(self):
+        """Ordering sanity check: a real cached-chain premium must still be
+        preferred over the Tier 4 order-price fallback."""
+        mock_chain = {
+            "spot": 23850,
+            "strikes": [{"strike": 23700, "ce": {"ltp": 125.0}, "pe": {"ltp": 60.0}}],
+        }
+        with patch(
+            "service.optionChain.OptionChainService.OptionChainService.peek_cached_chain",
+            return_value=(mock_chain, "2026-07-14"),
+        ):
+            resolution = self._resolver().resolve(
+                tsym="NIFTY14JUL26C23700", contract_type="OPTION", underlying="NIFTY",
+                exchange="NFO", token="51355", order_price=Decimal("120.5"),
+                strike=Decimal("23700"), option_type="CE", expiry="2026-07-14",
+            )
+        assert resolution.tier == 2
+        assert resolution.price == Decimal("125.0")
+
+
+# ============================================================================
 # LockOrderGuard
 # ============================================================================
 

@@ -64,9 +64,15 @@ class TieredPriceResolver(ReferencePriceResolver):
         else:
             attempted.append({"tier": 2, "source": "CACHED_CHAIN", "result": "NOT_AVAILABLE_FOR_FUTURES"})
 
-        # Tier 3: verified last internal trade.
-        baseline = strike if contract_type == "OPTION" else order_price
-        tier3 = self._resolve_from_verified_internal_trade(tsym, baseline, verification_band_pct)
+        # Tier 3: verified last internal trade. The sanity baseline must be
+        # comparable to the last trade PRICE (a premium for options, a mark
+        # price for futures) - the option's strike is not (e.g. strike
+        # ~23700 vs a real premium ~120 is a ~99.5% "deviation", which would
+        # reject every genuine internal trade unconditionally, making this
+        # tier permanently dead for options). The client's own submitted
+        # order price is the only premium-comparable signal available here,
+        # for both instrument classes - same fix as Tier 4 below.
+        tier3 = self._resolve_from_verified_internal_trade(tsym, order_price, verification_band_pct)
         if tier3 is not None:
             return tier3
         attempted.append({"tier": 3, "source": "VERIFIED_INTERNAL", "result": "OUTSIDE_VERIFICATION_BAND_OR_MISSING"})
