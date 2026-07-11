@@ -49,7 +49,18 @@ class OptionsMarginCalculator(MarginCalculator):
             if notional_reference_price is None:
                 raise ValueError("Neither spot_price nor strike is available for notional margin calculation")
 
-            moneyness_multiplier = self._resolve_moneyness_multiplier(context, notional_reference_price)
+            # Deliberately NOT passed notional_reference_price here - that
+            # value falls back to strike when spot is unknown, which is a
+            # reasonable proxy for sizing the notional dollar amount above,
+            # but would be circular for moneyness bucketing specifically
+            # (comparing strike against itself always computes "0% away
+            # from the money" regardless of the option's true moneyness).
+            # _resolve_moneyness_multiplier checks context.spot_price
+            # directly so it can tell the difference between "genuinely ATM"
+            # and "we don't actually know" and default the latter to the
+            # conservative (higher-margin) ITM bucket instead of silently
+            # assuming ATM.
+            moneyness_multiplier = self._resolve_moneyness_multiplier(context)
 
             notional_component = (
                 context.notional_pct_or_span_pct * notional_reference_price * lot_qty
@@ -76,13 +87,28 @@ class OptionsMarginCalculator(MarginCalculator):
             self.logger.error(f"Options margin calculation failed for {getattr(context, 'tsym', '?')}: {str(ex)}")
             raise MarginEngineError(f"Options margin calculation failed: {str(ex)}") from ex
 
-    def _resolve_moneyness_multiplier(self, context: MarginContext, spot: Decimal) -> Decimal:
-        """Buckets abs(strike - spot) / spot into ITM/ATM/OTM bands. A short
-        deep-ITM option carries real assignment risk a flat expiry-only
-        multiplier would miss - see design review finding in section 3.1."""
-        if context.strike is None or spot is None or spot == 0:
-            return context.moneyness_atm_multiplier
+    def _resolve_moneyness_multiplier(self, context: MarginContext) -> Decimal:
+        """Buckets abs(strike - spot) / spot into ITM/ATM/OTM bands, using
+        ONLY a genuinely-resolved spot price (context.spot_price, set when
+        Tier 2's cached option chain hits - see TieredPriceResolver). A
+        short deep-ITM option carries real assignment risk a flat
+        expiry-only multiplier would miss - see design review finding in
+        section 3.1.
 
+        When no real spot signal is available, defaults to the ITM
+        multiplier (the highest-risk bucket) rather than ATM - a previous
+        version derived a "spot" proxy from the strike itself in this case,
+        which made moneyness_pct always compute to exactly 0 (comparing
+        strike against strike) and silently assumed every position was
+        precisely at-the-money regardless of its true moneyness. Defaulting
+        to the conservative bucket when genuinely uncertain is safe
+        (over-margins, never under-margins); silently assuming ATM was not."""
+        if context.strike is None:
+            return context.moneyness_atm_multiplier
+        if context.spot_price is None or context.spot_price == 0:
+            return context.moneyness_itm_multiplier
+
+        spot = context.spot_price
         moneyness_pct = abs(context.strike - spot) / spot
         is_itm = (
             (context.option_type == "CE" and spot > context.strike)

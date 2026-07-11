@@ -85,11 +85,17 @@ class TestOptionsMarginCalculator:
         assert result.moneyness_multiplier_used == Decimal("0.9")
 
     def test_falls_back_to_strike_when_spot_unavailable(self):
+        """Notional dollar sizing still falls back to strike as a spot
+        proxy when spot is unknown - but moneyness bucketing must NOT reuse
+        that same fallback value (comparing strike against itself would
+        always read as exactly ATM), so it defaults to the conservative ITM
+        multiplier instead when genuine spot data isn't available."""
         calc = OptionsMarginCalculator()
         context = _option_context(spot_price=None)
         result = calc.calculate(context)
-        expected_notional = Decimal("0.15") * Decimal("23800") * 50
+        expected_notional = Decimal("0.15") * Decimal("23800") * 50 * Decimal("1.2")  # ITM multiplier, not ATM
         assert result.notional_component == expected_notional
+        assert result.moneyness_multiplier_used == Decimal("1.2")
 
     def test_buy_side_raises_margin_engine_error(self):
         calc = OptionsMarginCalculator()
