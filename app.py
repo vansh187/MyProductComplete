@@ -21,6 +21,7 @@ from api.candles import router as candlesRouter
 from api.optionChain import router as optionChainRouter, _optionChainService
 from service.positionTickService import positionTickService
 from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
+from appconfig.FutureMaster import schedule_daily_refresh as future_master_daily_refresh
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from breeze_connect import BreezeConnect
@@ -45,6 +46,56 @@ except Exception as _shoonya_import_err:
     _SHOONYA_IMPORTABLE = False
     print(f"[WARNING] ShoonyaConnection import failed: {_shoonya_import_err}")
 
+lifespan_logger = logging.getLogger("lifespan")
+
+# Broker session-establishment calls (shoonya.connect/auto_login,
+# breeze.generate_session) are synchronous SDK calls with no built-in
+# timeout - an unresponsive broker endpoint during startup would otherwise
+# block the app from ever finishing lifespan and accepting requests
+# (health checks would fail forever instead of the app degrading gracefully
+# to "broker unavailable, will keep retrying"). Bounded here the same way
+# every other broker REST call in this codebase already is (see
+# service/optionChain/OptionChainService.py, api/marketquotes.py).
+SHOONYA_CONNECT_TIMEOUT_SECS = 15.0
+SHOONYA_AUTO_LOGIN_TIMEOUT_SECS = 90.0  # Chrome-automation OAuth flow - genuinely slower than a plain API call
+BREEZE_SESSION_TIMEOUT_SECS = 15.0
+
+# How long to wait before restarting a crashed background refresh loop -
+# short enough to recover quickly, long enough not to hot-loop against a
+# persistently failing dependency (e.g. broker endpoint down for an hour).
+BACKGROUND_TASK_RESTART_DELAY_SECS = 30.0
+
+
+async def _supervised_background_task(coro_func, name: str, app: FastAPI) -> None:
+    """
+    Wraps a lifespan background coroutine (a daily-refresh loop) so an
+    exception escaping it logs and restarts the loop after a backoff,
+    instead of silently terminating the task forever. A naked
+    asyncio.create_task(coro) means any unhandled exception inside the
+    coroutine kills that task permanently with nothing else surfacing it -
+    the app keeps serving requests and looks perfectly healthy while a
+    critical background job (broker session refresh, scrip master refresh)
+    has quietly stopped running until someone notices and restarts the
+    whole process. This makes that class of bug self-healing instead.
+    """
+    while True:
+        try:
+            await coro_func(app)
+            # A well-behaved refresh loop is itself an infinite `while True`
+            # and should never return normally - if it does, restarting
+            # would just do the same thing again, so stop here rather than
+            # busy-loop forever on a no-op coroutine.
+            lifespan_logger.warning(f"[{name}] background task returned without raising - not restarting")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            lifespan_logger.error(
+                f"[{name}] background task crashed: {ex} - restarting in "
+                f"{BACKGROUND_TASK_RESTART_DELAY_SECS}s"
+            )
+            await asyncio.sleep(BACKGROUND_TASK_RESTART_DELAY_SECS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,6 +103,7 @@ async def lifespan(app: FastAPI):
     shoonya_refresh_task = None
     top_movers_task      = None
     option_master_task   = None
+    future_master_task   = None
     app.state.breeze       = None
     app.state.shoonya      = None
     app.state.option_feed  = None
@@ -60,16 +112,25 @@ async def lifespan(app: FastAPI):
     if _SHOONYA_IMPORTABLE:
         try:
             shoonya = ShoonyaConnection()
-            if shoonya.connect():
+            loop = asyncio.get_running_loop()
+            connected = await asyncio.wait_for(
+                loop.run_in_executor(None, shoonya.connect),
+                timeout=SHOONYA_CONNECT_TIMEOUT_SECS
+            )
+            if connected:
                 app.state.shoonya = shoonya
             else:
                 print("[WARNING] Shoonya stored token invalid — attempting auto-login...")
-                loop = asyncio.get_running_loop()
-                ok   = await loop.run_in_executor(None, shoonya.auto_login)
+                ok = await asyncio.wait_for(
+                    loop.run_in_executor(None, shoonya.auto_login),
+                    timeout=SHOONYA_AUTO_LOGIN_TIMEOUT_SECS
+                )
                 if ok:
                     app.state.shoonya = shoonya
                 else:
                     print("[WARNING] Shoonya auto-login failed — will keep retrying in the background")
+        except asyncio.TimeoutError:
+            print("[WARNING] Shoonya connect/auto-login timed out during startup — will keep retrying in the background")
         except Exception as e:
             print(f"[WARNING] Shoonya init error: {e}")
 
@@ -77,8 +138,12 @@ async def lifespan(app: FastAPI):
         # above failed or raised — it will retry auto_login on a short
         # interval instead of leaving the app permanently disconnected
         # until a manual restart or the next scheduled 8:30 AM slot.
-        shoonya_refresh_task = asyncio.create_task(shoonya_daily_refresh(app))
-        top_movers_task      = asyncio.create_task(top_movers_refresh(app))
+        shoonya_refresh_task = asyncio.create_task(
+            _supervised_background_task(shoonya_daily_refresh, "shoonya_refresh", app)
+        )
+        top_movers_task = asyncio.create_task(
+            _supervised_background_task(top_movers_refresh, "top_movers_refresh", app)
+        )
 
         # ── Option chain: live WS feed + scrip-master daily refresh ──
         if app.state.shoonya is not None:
@@ -91,7 +156,12 @@ async def lifespan(app: FastAPI):
                 print("App starting... Option chain WebSocket feed started.")
             except Exception as e:
                 print(f"[WARNING] Option chain feed init error: {e}")
-        option_master_task = asyncio.create_task(option_master_daily_refresh(app))
+        option_master_task = asyncio.create_task(
+            _supervised_background_task(option_master_daily_refresh, "option_master_refresh", app)
+        )
+        future_master_task = asyncio.create_task(
+            _supervised_background_task(future_master_daily_refresh, "future_master_refresh", app)
+        )
     else:
         print("App starting... Shoonya unavailable.")
 
@@ -102,13 +172,24 @@ async def lifespan(app: FastAPI):
         print("App starting... Establishing Breeze session")
         try:
             breeze = BreezeConnect(api_key=Config.BREEZE_API_KEY)
-            breeze.generate_session(
-                api_secret=Config.BREEZE_SECRET_KEY,
-                session_token=Config.BREEZE_SESSION_TOKEN
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: breeze.generate_session(
+                        api_secret=Config.BREEZE_SECRET_KEY,
+                        session_token=Config.BREEZE_SESSION_TOKEN
+                    )
+                ),
+                timeout=BREEZE_SESSION_TIMEOUT_SECS
             )
             app.state.breeze = breeze
             print("Breeze session ready.")
-            refresh_task = asyncio.create_task(schedule_daily_refresh(app))
+            refresh_task = asyncio.create_task(
+                _supervised_background_task(schedule_daily_refresh, "breeze_refresh", app)
+            )
+        except asyncio.TimeoutError:
+            print("[WARNING] Breeze session establishment timed out — stock quotes will be unavailable")
         except Exception as e:
             print(f"[WARNING] Breeze session failed — stock quotes will be unavailable: {e}")
     else:
@@ -124,6 +205,8 @@ async def lifespan(app: FastAPI):
         top_movers_task.cancel()
     if option_master_task:
         option_master_task.cancel()
+    if future_master_task:
+        future_master_task.cancel()
     if app.state.option_feed:
         app.state.option_feed.close()
     print("Server shutting down.")

@@ -21,7 +21,10 @@ from database.PostgresConnectionFactory import PostgresConnectionFactory
 from database.marginenginepersistence.margin_sweep_persistence import MarginSweepPersistence
 from database.marginenginepersistence.position_margin_persistence import PositionMarginPersistence
 from database.marginenginepersistence.margin_wallet_persistence import MarginWalletPersistence
+from database.positionCache import PositionCache
+from database.positionPersistence import PositionPersistence
 from service.marginengine.margin_engine import MarginEngine
+from service.positionTickService import positionTickService
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,8 @@ class EodMarginSweepService:
         self.sweep_persistence = MarginSweepPersistence()
         self.position_persistence = PositionMarginPersistence()
         self.wallet_persistence = MarginWalletPersistence()
+        self.position_full_persistence = PositionPersistence()
+        self.position_cache = PositionCache()
         self.logger = logger
 
     def run_daily_sweep(self, run_date: date = None) -> dict:
@@ -86,6 +91,20 @@ class EodMarginSweepService:
                     self.logger.error(f"Failed to release expiry margin for user {position['user_id']}, "
                                        f"tsym {position['tsym']}: {str(ex)}")
 
+                # Releasing the margin block alone leaves the position row
+                # itself open forever ("zombie" position - margin looks
+                # freed but netqty/status never change, no P&L ever
+                # realized). Closing is attempted independently of whether
+                # the margin release above succeeded, and a failure here
+                # (e.g. no settlement price resolvable yet) never aborts the
+                # sweep for other accounts - it just leaves this one
+                # position open for tomorrow's sweep to retry.
+                try:
+                    self._close_expired_position(position, cursor)
+                except Exception as ex:
+                    self.logger.error(f"Failed to close expired position for user {position['user_id']}, "
+                                       f"tsym {position['tsym']}: {str(ex)}")
+
             conn.commit()
             return released
         except Exception as ex:
@@ -97,6 +116,68 @@ class EodMarginSweepService:
                 cursor.close()
             if conn is not None:
                 conn.close()
+
+    def _close_expired_position(self, position: dict, cursor) -> None:
+        """
+        Actually closes a still-open F&O position past its expiry, mirroring
+        PositionService.apply_fill()'s netqty==0 close branch: marks the
+        position CLOSED at netqty=0, realizes P&L against a resolved
+        settlement price, evicts it from the Redis cache, and releases its
+        feed subscription. Deliberately does NOT move wallet cash - no
+        normal position close in this codebase settles P&L into wallet
+        balance either (see service/positionService.py - realized_pnl is
+        informational there too), so this stays consistent with existing
+        behavior rather than inventing new cash-movement logic for expiry
+        alone, which would be the highest-risk kind of change to get wrong.
+
+        Silently returns (no-op) if the position was already closed by a
+        concurrent path, or if no settlement price can be resolved yet -
+        the latter leaves the position open for tomorrow's sweep to retry
+        rather than closing it against a fabricated price.
+        """
+        user_id = position["user_id"]
+        tsym = position["tsym"]
+
+        full_position = self.position_persistence.get_full_position_for_expiry_close(cursor, user_id, tsym)
+        if full_position is None:
+            return
+
+        netqty = Decimal(str(full_position.get("netqty") or 0))
+        if netqty == 0:
+            return
+
+        instrument = self.margin_engine.resolve_contract_type(tsym, full_position.get("exchange"))
+        contract_type = instrument.get("contract_type")
+        if contract_type not in ("OPTION", "FUTURES"):
+            self.logger.warning(
+                f"Cannot resolve contract type for expired position {tsym} (user {user_id}); "
+                f"leaving open for retry"
+            )
+            return
+
+        resolution = self.margin_engine.price_resolver.resolve(
+            tsym, contract_type, instrument.get("underlying"), full_position.get("exchange"),
+            instrument.get("token"), strike=instrument.get("strike"),
+            option_type=instrument.get("option_type"), expiry=instrument.get("expiry"),
+        )
+        settlement_price = resolution.price
+
+        netavgprc = Decimal(str(full_position.get("netavgprc") or 0))
+        realized_pnl = Decimal(str(full_position.get("realized_pnl") or 0)) + (settlement_price - netavgprc) * netqty
+
+        closed_position = dict(full_position)
+        closed_position["netqty"] = 0
+        closed_position["netavgprc"] = Decimal(0)
+        closed_position["realized_pnl"] = realized_pnl
+        closed_position["status"] = "CLOSED"
+
+        self.position_full_persistence.upsert_position(closed_position, cursor)
+        self.position_cache.remove_position(user_id, tsym, full_position.get("exchange"), full_position.get("token"))
+        positionTickService.release(full_position.get("exchange"), full_position.get("token"))
+        self.logger.info(
+            f"Expiry-closed position: user_id={user_id}, tsym={tsym}, "
+            f"settlement_price={settlement_price}, realized_pnl={realized_pnl}"
+        )
 
     def _snapshot_and_flag(self, run_date: date) -> tuple[int, int]:
         conn = None

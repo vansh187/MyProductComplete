@@ -99,6 +99,14 @@ get_all_wallet_balances: |
   SELECT user_id, balance, blocked_margin
   FROM wallets
 
+get_full_position_for_expiry_close: |
+  SELECT user_id, tsym, broker, token, exchange, underlying, expiry, strike, option_type,
+         lot_size, product_type, source, netqty, netavgprc, buyqty, sellqty, buyavgprc,
+         sellavgprc, realized_pnl, status
+  FROM positions
+  WHERE user_id = %s AND tsym = %s AND status = 'OPEN'
+  FOR UPDATE
+
 get_last_trade_price_for_symbol: |
   SELECT execution_price, executed_at
   FROM trade_history

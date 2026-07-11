@@ -328,13 +328,12 @@ def _patched_process_trades_deps():
 
 
 class TestProcessTradesExecutionStates:
-    """ExecutionEngine._process_trades() always returns status 'EXECUTED'
-    for any non-empty, successfully-processed trade list — PENDING is
-    decided one level up in _execute_matching() before _process_trades is
-    ever called, and there is no PARTIALLY_EXECUTED value in the dict this
-    method returns (only the per-order-book-row status passed to
-    updateIncomingOrderBook/updateCounterpartyOrderBook distinguishes
-    partial vs full at the row level)."""
+    """ExecutionEngine._process_trades() reports the incoming order's actual
+    fill state: 'EXECUTED' when total matched quantity fully covers the
+    order, 'PARTIALLY_EXECUTED' when some quantity remains unmatched, and
+    'PENDING' (matching _execute_matching()'s no-candidates-found case) when
+    every candidate in trade_executions was filtered out (self-trade
+    backstop, None entries) and nothing was actually processed."""
 
     def test_single_full_match_returns_executed(self):
         order = _buy_order(quantity=5)
@@ -358,10 +357,10 @@ class TestProcessTradesExecutionStates:
         assert result["trade_id"] == 6001
         mock_conn.commit.assert_called_once()
 
-    def test_partial_match_still_reports_executed_status(self):
-        """A partial fill (remaining_qty > 0) is still reported as
-        status='EXECUTED' by _process_trades — documenting real, current
-        (if slightly confusingly-named) behavior."""
+    def test_partial_match_reports_partially_executed_status(self):
+        """A partial fill (matched quantity < order quantity) is reported as
+        status='PARTIALLY_EXECUTED', reflecting the incoming order's actual
+        remaining quantity rather than a hardcoded 'EXECUTED'."""
         order = _buy_order(quantity=10)
         trade = MockTradeExecution(buy_order_id=201, sell_order_id=999,
                                     buy_user_id=1, sell_user_id=2, quantity=5, remaining_qty=5)
@@ -375,7 +374,7 @@ class TestProcessTradesExecutionStates:
             engine = ExecutionEngine(order, 201)
             result = engine._process_trades(MagicMock(), MagicMock(), [trade], order_book_id=1001, user_id=1)
 
-        assert result["status"] == "EXECUTED"
+        assert result["status"] == "PARTIALLY_EXECUTED"
         assert result["trade_id"] == 5001
 
     def test_multiple_partial_matches_accumulate_to_full_execution(self):
@@ -415,7 +414,8 @@ class TestProcessTradesExecutionStates:
                                               order_book_id=1001, user_id=1)
 
         assert result is not None
-        assert result["status"] == "EXECUTED"
+        # order quantity=10, only 5 actually matched (valid_trade) - partial, not full
+        assert result["status"] == "PARTIALLY_EXECUTED"
         assert result["trade_id"] == 7001
         # Only the one non-None trade should have been inserted
         assert mocks["tradeService"].return_value.insertTradeOrders.call_count == 1
@@ -436,9 +436,13 @@ class TestProcessTradesExecutionStates:
                 engine._process_trades(MagicMock(), MagicMock(), [unauthorized_trade],
                                         order_book_id=1001, user_id=1)
 
-    def test_self_trade_is_skipped_not_settled(self):
+    def test_self_trade_is_skipped_and_reports_pending_not_executed(self):
         """buy_user_id == sell_user_id must never be settled (would corrupt
-        avg_price / leak money) — it's silently skipped."""
+        avg_price / leak money) — it's skipped, and since it was the only
+        candidate, nothing was actually processed. Must report PENDING (the
+        order is still genuinely unmatched), not a false EXECUTED - that
+        false-positive previously left orders permanently stuck at PENDING
+        in the DB while the API told the caller they'd been filled."""
         order = _buy_order(quantity=10)
         self_trade = MockTradeExecution(
             buy_order_id=301, sell_order_id=302, buy_user_id=1, sell_user_id=1,
@@ -452,10 +456,9 @@ class TestProcessTradesExecutionStates:
 
         # Loop body never ran insertTradeOrders for the self-trade
         mocks["tradeService"].return_value.insertTradeOrders.assert_not_called()
-        # ... yet the method still reports success with no trade_id, since
-        # nothing raised and the loop completed — real, current behavior.
         assert result["success"] is True
-        assert result["trade_id"] is None
+        assert result["status"] == "PENDING"
+        assert "trade_id" not in result
 
     def test_empty_trade_list_raises_value_error(self):
         order = _buy_order(quantity=10)

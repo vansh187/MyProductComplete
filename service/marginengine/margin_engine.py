@@ -23,7 +23,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from appconfig import OptionMaster
+from appconfig import FutureMaster, OptionMaster
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from database.marginenginepersistence.margin_config_persistence import MarginConfigPersistence
 from database.marginenginepersistence.margin_wallet_persistence import MarginWalletPersistence
@@ -91,14 +91,16 @@ class MarginEngine:
     def resolve_contract_type(self, tsym: str, exchange: str, fallback_lot_size: Optional[int] = None) -> dict:
         """Looks up instrument details for a tsym. OPTION when OptionMaster
         recognizes it (authoritative - token/exchange/strike/expiry all come
-        from the scrip master); FUTURES only when the symbol matches the
-        'ends with FUT' convention AND the caller-supplied exchange is
-        already F&O (this codebase has no futures instrument master yet, so
-        this is a documented placeholder - see
-        utils/instrumentClassifier.looks_like_future_symbol); otherwise
-        contract_type is None, meaning "not this engine's concern" (equity,
-        or an unrecognized instrument) - callers must fall back to their
-        existing equity-path logic in that case, never guess."""
+        from the scrip master); FUTURES when either FutureMaster recognizes
+        it (authoritative - token/expiry/lot_size from the scrip master, see
+        appconfig/FutureMaster.py) or, when the master doesn't have it
+        (stale/missing), the symbol matches the futures trading-symbol
+        convention AND the caller-supplied exchange is already F&O (see
+        utils/instrumentClassifier.looks_like_future_symbol - kept as a
+        fallback for resilience, not the primary source of truth anymore);
+        otherwise contract_type is None, meaning "not this engine's concern"
+        (equity, or an unrecognized instrument) - callers must fall back to
+        their existing equity-path logic in that case, never guess."""
         try:
             contract = OptionMaster.find_by_tsym(tsym)
             if contract:
@@ -111,7 +113,23 @@ class MarginEngine:
                     "lot_size": contract["lot_size"],
                     "token": contract["token"],
                 }
+            future_contract = FutureMaster.find_by_tsym(tsym)
+            if future_contract:
+                return {
+                    "contract_type": "FUTURES",
+                    "underlying": future_contract["underlying"],
+                    "strike": None,
+                    "option_type": None,
+                    "expiry": future_contract["expiry"],
+                    "lot_size": future_contract["lot_size"],
+                    "token": future_contract["token"],
+                }
             if looks_like_future_symbol(tsym) and is_fo_exchange(exchange):
+                self.logger.warning(
+                    f"resolve_contract_type: {tsym} matched the futures symbol "
+                    f"heuristic but FutureMaster doesn't recognize it (stale/missing "
+                    f"master?) - classifying as FUTURES with no real expiry/lot_size"
+                )
                 return {
                     "contract_type": "FUTURES",
                     "underlying": None,
@@ -321,7 +339,8 @@ class MarginEngine:
 
             instrument = self.resolve_contract_type(tsym, exchange, fallback_lot_size=order_snapshot.get("lot_size"))
             contract_type = instrument["contract_type"]
-            if contract_type not in ("OPTION", "FUTURES"):
+            was_unclassified = contract_type not in ("OPTION", "FUTURES")
+            if was_unclassified:
                 # This position's exchange is F&O (checked above) but neither
                 # OptionMaster nor the futures-symbol heuristic recognized
                 # it - default to the OPTION formula rather than skip
@@ -344,17 +363,25 @@ class MarginEngine:
                 )
                 result = self.calculators["FUTURES"].calculate(context)
                 new_required_margin = result.blocked_amount
-            elif new_net_qty < 0:
+            elif new_net_qty < 0 or was_unclassified:
                 # Short option position: margin required on the short qty.
+                # Also applies to a LONG position of an unclassified
+                # instrument - the "default to OPTION, conservative" claim
+                # above is only true if a long position is margined too;
+                # exempting it via the long-option-pays-premium-only rule
+                # below would silently zero the margin for what might
+                # actually be genuine directional exposure (e.g. a
+                # misclassified future), which is the opposite of
+                # conservative.
                 context = self._build_context_for_reconcile(
                     tsym, exchange, "SELL", instrument, abs(int(new_net_qty)), order_snapshot, cursor
                 )
                 result = self.calculators["OPTION"].calculate(context)
                 new_required_margin = result.blocked_amount
             else:
-                # Long option position: buyer only ever pays premium up
-                # front (already debited via the wallet balance check at
-                # order time) - no margin block for a long option.
+                # Long option position (genuinely classified as OPTION):
+                # buyer only ever pays premium up front (already debited via
+                # the wallet balance check at order time) - no margin block.
                 new_required_margin = Decimal(0)
 
             self.ledger_repository.reconcile_position_margin(cursor, user_id, tsym, new_required_margin, contract_type)
@@ -430,9 +457,17 @@ class MarginEngine:
 
         notional_pct_or_span_pct = Decimal(str(config["notional_pct"] if contract_type == "OPTION" else config["span_pct"]))
 
+        # Calculators compute notional as lot_size * qty - qty here is a raw
+        # unit count (opening_qty), not a lot count, and there is no reliable
+        # way to always derive a true lot count (futures have no instrument
+        # master to divide by). Passing lot_size=1 with qty=total units makes
+        # lot_size*qty equal the real total exposure directly, regardless of
+        # instrument class - using the real per-lot lot_size here as well
+        # would silently square the exposure (e.g. a 65-unit NIFTY order
+        # computing margin as if it were 65 lots = 4225 units).
         return MarginContext(
             contract_type=contract_type, side=side, tsym=tsym, exchange=exchange,
-            lot_size=instrument["lot_size"] or order.quantity, qty=qty,
+            lot_size=1, qty=qty,
             product_type=order.product_type.value if hasattr(order.product_type, "value") else str(order.product_type),
             reference_price=resolution.price, reference_source=resolution.source,
             reference_source_tier=resolution.tier, notional_pct_or_span_pct=notional_pct_or_span_pct,
@@ -469,9 +504,12 @@ class MarginEngine:
 
         notional_pct_or_span_pct = Decimal(str(config["notional_pct"] if contract_type == "OPTION" else config["span_pct"]))
 
+        # See the identical comment in _build_context() above - lot_size=1,
+        # qty=total units keeps lot_size*qty equal to the real total
+        # exposure instead of squaring it.
         return MarginContext(
             contract_type=contract_type, side=side, tsym=tsym, exchange=exchange,
-            lot_size=instrument["lot_size"] or order_snapshot.get("lot_size") or qty, qty=qty,
+            lot_size=1, qty=qty,
             product_type=order_snapshot.get("product_type") or "MIS",
             reference_price=reference_price, reference_source=reference_source,
             reference_source_tier=reference_tier, notional_pct_or_span_pct=notional_pct_or_span_pct,

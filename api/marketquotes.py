@@ -66,16 +66,25 @@ async def _fetch_quotes(breeze, symbols: List[str]) -> tuple[list[dict], list[di
 
     for symbol in symbols:
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda s=symbol: breeze.get_historical_data(
-                    interval="1minute",
-                    from_date=f"{trading_day}T09:15:00.000Z",
-                    to_date=f"{trading_day}T15:30:00.000Z",
-                    stock_code=s,
-                    exchange_code="NSE",
-                    product_type="cash"
-                )
+            # Bounded like every other Breeze historical-data call in this
+            # module (see _fetch_index_quote below) - an un-timeout'd hang
+            # here would block this request indefinitely and, since it's a
+            # plain synchronous SDK call handed to the shared threadpool,
+            # eventually starve every other run_in_executor call in the app
+            # of worker threads too.
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda s=symbol: breeze.get_historical_data(
+                        interval="1minute",
+                        from_date=f"{trading_day}T09:15:00.000Z",
+                        to_date=f"{trading_day}T15:30:00.000Z",
+                        stock_code=s,
+                        exchange_code="NSE",
+                        product_type="cash"
+                    )
+                ),
+                timeout=2.0
             )
 
             if not response or response.get("Status") != 200:

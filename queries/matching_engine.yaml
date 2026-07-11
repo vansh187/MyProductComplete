@@ -5,6 +5,7 @@ select_sell_orders: |
     AND side = 'SELL'
     AND status IN ('PENDING', 'PARTIALLY_EXECUTED')
     AND remaining_quantity > 0
+    AND user_id != %s
   ORDER BY price ASC, created_at ASC
   FOR UPDATE NOWAIT
 
@@ -15,5 +16,6 @@ select_buy_orders: |
     AND side = 'BUY'
     AND status IN ('PENDING', 'PARTIALLY_EXECUTED')
     AND remaining_quantity > 0
+    AND user_id != %s
   ORDER BY price DESC, created_at ASC
   FOR UPDATE NOWAIT

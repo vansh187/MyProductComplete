@@ -319,6 +319,7 @@ class ExecutionEngine:
             wallet_service = WalletBalanceService()
             transaction_id = None
             total_matched_qty = 0
+            processed_count = 0
 
             self.logger.info(f"Processing {len(trade_executions)} matched trades")
 
@@ -327,11 +328,15 @@ class ExecutionEngine:
                     self.logger.warning("Received None match")
                     continue
 
-                # Reject self-trades: the matching engine does not exclude a user's
-                # own resting orders, and settling both legs for the same user would
-                # corrupt avg_price (process_seller's update never rewrites avg_price
-                # after process_buyer recalculates it) and can bleed real money if the
-                # taker's limit price differs from the matched price.
+                # Reject self-trades. The matching engine's query now excludes a
+                # user's own resting orders up front (see
+                # queries/matching_engine.yaml select_buy_orders/select_sell_orders
+                # - "AND user_id != %s") so this should never actually trigger in
+                # normal operation; kept as a defense-in-depth backstop only,
+                # since settling both legs for the same user would corrupt
+                # avg_price (process_seller's update never rewrites avg_price
+                # after process_buyer recalculates it) and can bleed real money if
+                # the taker's limit price differs from the matched price.
                 if match_found.buy_user_id == match_found.sell_user_id:
                     self.logger.warning(
                         f"Skipping self-trade: user={match_found.buy_user_id}, "
@@ -386,6 +391,7 @@ class ExecutionEngine:
                 # Update incoming order book - determine status from total matched vs order quantity
                 incoming_remaining = self.order.quantity - total_matched_qty
                 incoming_status = "PARTIALLY_EXECUTED" if incoming_remaining > 0 else "EXECUTED"
+                final_status = incoming_status
 
                 portfolio_service.updateIncomingOrderBook(
                     incoming_remaining, incoming_status, order_book_id, cursor
@@ -436,18 +442,41 @@ class ExecutionEngine:
                     cursor, match_found.sell_user_id, match_found.trade_value
                 )
 
+                processed_count += 1
                 self.logger.info(
                     f"Trade processed: transaction_id={transaction_id}, qty={match_found.quantity}, "
                     f"buyer={match_found.buy_user_id}, seller={match_found.sell_user_id}"
                 )
-                
+
             conn.commit()
+
+            if processed_count == 0:
+                # The matching engine proposed candidate(s) (trade_executions was
+                # non-empty), but every single one was filtered out in this loop
+                # (self-trade backstop, or a future guard added here) - the order
+                # was NOT actually matched against anything. Must be reported
+                # exactly like the "no candidates at all" case in
+                # _execute_matching, not as EXECUTED: returning EXECUTED here
+                # while the order/order_book rows were never updated is precisely
+                # the false-success bug that left orders stuck at PENDING while
+                # the API told the caller they'd been filled.
+                self.logger.warning(
+                    f"Order {self.order_id} had {len(trade_executions)} candidate match(es) "
+                    f"but none were actually processed - order remains unmatched"
+                )
+                return {
+                    "success": True,
+                    "status": "PENDING",
+                    "message": "Order queued for matching",
+                    "order_id": self.order_id
+                }
+
             self.logger.info(f"All trades committed successfully")
 
             return {
                 "success": True,
-                "status": "EXECUTED",
-                "message": "Order fully executed",
+                "status": final_status,
+                "message": "Order fully executed" if final_status == "EXECUTED" else "Order partially executed",
                 "order_id": self.order_id,
                 "trade_id": transaction_id
             }

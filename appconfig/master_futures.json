@@ -1,0 +1,90 @@
+{
+  "BANKNIFTY": {
+    "expiries": [
+      "2026-07-28",
+      "2026-08-25",
+      "2026-09-29"
+    ],
+    "2026-09-29": {
+      "token": "68390",
+      "tsym": "BANKNIFTY29SEP26F",
+      "lot_size": 30
+    },
+    "2026-07-28": {
+      "token": "61088",
+      "tsym": "BANKNIFTY28JUL26F",
+      "lot_size": 30
+    },
+    "2026-08-25": {
+      "token": "58067",
+      "tsym": "BANKNIFTY25AUG26F",
+      "lot_size": 30
+    }
+  },
+  "NIFTY": {
+    "expiries": [
+      "2026-07-28",
+      "2026-08-25",
+      "2026-09-29"
+    ],
+    "2026-09-29": {
+      "token": "68407",
+      "tsym": "NIFTY29SEP26F",
+      "lot_size": 65
+    },
+    "2026-07-28": {
+      "token": "61093",
+      "tsym": "NIFTY28JUL26F",
+      "lot_size": 65
+    },
+    "2026-08-25": {
+      "token": "58072",
+      "tsym": "NIFTY25AUG26F",
+      "lot_size": 65
+    }
+  },
+  "FINNIFTY": {
+    "expiries": [
+      "2026-07-28",
+      "2026-08-25",
+      "2026-09-29"
+    ],
+    "2026-09-29": {
+      "token": "68391",
+      "tsym": "FINNIFTY29SEP26F",
+      "lot_size": 60
+    },
+    "2026-07-28": {
+      "token": "61091",
+      "tsym": "FINNIFTY28JUL26F",
+      "lot_size": 60
+    },
+    "2026-08-25": {
+      "token": "58070",
+      "tsym": "FINNIFTY25AUG26F",
+      "lot_size": 60
+    }
+  },
+  "SENSEX": {
+    "expiries": [
+      "2026-07-30",
+      "2026-08-27",
+      "2026-09-24"
+    ],
+    "2026-08-27": {
+      "token": "830859",
+      "tsym": "SENSEX5026AUGFUT",
+      "lot_size": 75
+    },
+    "2026-07-30": {
+      "token": "1138486",
+      "tsym": "SENSEX5026JULFUT",
+      "lot_size": 75
+    },
+    "2026-09-24": {
+      "token": "848959",
+      "tsym": "SENSEX5026SEPFUT",
+      "lot_size": 75
+    }
+  }
+}

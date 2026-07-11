@@ -85,6 +85,39 @@ class PositionMarginPersistence:
             self.logger.error(f"Error fetching expiring open F&O positions: {str(ex)}")
             raise Exception(f"Error fetching expiring open F&O positions: {str(ex)}") from ex
 
+    def get_full_position_for_expiry_close(self, cursor, user_id: int, tsym: str) -> dict | None:
+        """Locks and returns every column PositionPersistence.upsert_position()
+        needs, for the EOD sweep to actually close an expired position (not
+        just release its margin block). Deliberately a full column list
+        rather than reusing PositionPersistence.get_position() (which only
+        returns a partial column set) - upsert_position()'s ON CONFLICT
+        clause overwrites broker/token/exchange/underlying/expiry/strike/
+        option_type/lot_size/product_type/source unconditionally, so passing
+        it a dict missing those keys would silently NULL them out on an
+        expiring position instead of closing it cleanly."""
+        if cursor is None:
+            raise ValueError("Cursor cannot be None")
+        if user_id is None or user_id <= 0:
+            raise ValueError("User ID must be a positive integer")
+        if not tsym or not tsym.strip():
+            raise ValueError("tsym cannot be empty")
+
+        try:
+            cursor.execute(
+                QueryLoader.get('margin.yaml', 'get_full_position_for_expiry_close'),
+                (user_id, tsym.strip().upper())
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            columns = ["user_id", "tsym", "broker", "token", "exchange", "underlying", "expiry",
+                       "strike", "option_type", "lot_size", "product_type", "source", "netqty",
+                       "netavgprc", "buyqty", "sellqty", "buyavgprc", "sellavgprc", "realized_pnl", "status"]
+            return dict(zip(columns, row))
+        except Exception as ex:
+            self.logger.error(f"Error locking full position for expiry close, user {user_id} tsym {tsym}: {str(ex)}")
+            raise Exception(f"Error locking full position for expiry close, user {user_id} tsym {tsym}: {str(ex)}") from ex
+
     def get_all_open_positions(self, cursor) -> list[dict]:
         """Used by the EOD flag-for-review sweep to recompute current MTM margin."""
         if cursor is None:

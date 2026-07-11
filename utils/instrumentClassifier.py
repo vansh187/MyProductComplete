@@ -4,7 +4,17 @@ Single source of truth for "is this instrument F&O?" - kept dependency-free
 reuse the same rule without pulling in unrelated concerns.
 """
 
+import re
+
 FO_EXCHANGES = {"NFO", "BFO"}
+
+# Real Shoonya futures trading-symbol conventions differ by exchange -
+# confirmed from a live scrip master: NFO index futures end in a single 'F'
+# (e.g. 'NIFTY28JUL26F'), while BFO Sensex futures end in 'FUT'
+# (e.g. 'SENSEX5026AUGFUT'). Only used as a fallback signal now that
+# appconfig/FutureMaster.py provides an authoritative lookup - kept broad
+# enough to catch either convention when the master is stale/missing.
+_NFO_FUTURES_PATTERN = re.compile(r"^[A-Z]+\d{2}[A-Z]{3}\d{2}F$")
 
 
 def is_fo_exchange(exchange: str | None) -> bool:
@@ -13,9 +23,11 @@ def is_fo_exchange(exchange: str | None) -> bool:
 
 
 def looks_like_future_symbol(tsym: str | None) -> bool:
-    """Best-effort futures detection by trading-symbol convention (e.g.
-    'NIFTY28AUG25FUT'). This codebase has no futures instrument master yet
-    (appconfig/OptionMaster.py only indexes options) - this heuristic is the
-    placeholder service/marginengine/margin_engine.py uses to classify a
-    futures order until a real futures scrip master exists."""
-    return bool(tsym) and tsym.strip().upper().endswith("FUT")
+    """Best-effort futures detection by trading-symbol convention, used only
+    as a fallback when appconfig/FutureMaster.py doesn't recognize the
+    symbol (master stale/missing) - see
+    service/marginengine/margin_engine.py.resolve_contract_type()."""
+    if not tsym:
+        return False
+    t = tsym.strip().upper()
+    return t.endswith("FUT") or bool(_NFO_FUTURES_PATTERN.match(t))
