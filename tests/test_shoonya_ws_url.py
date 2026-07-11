@@ -25,7 +25,22 @@ pytestmark = pytest.mark.skipif(
     ("http://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI"),
     ("api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI"),
     ("wss://api.shoonya.com/NorenWSAPI/", "wss://api.shoonya.com/NorenWSAPI"),
+    ("Wss://api.shoonya.com/NorenWSAPI/", "wss://api.shoonya.com/NorenWSAPI"),
 ])
 def test_websocket_endpoint_always_forced_to_wss(api_url, expected):
     api = _ShoonyaApi(api_url)
     assert api._NorenApi__service_config["websocket_endpoint"] == expected
+
+
+def test_trailing_slash_is_stripped_from_host_url():
+    """Both the REST host and websocket endpoint must not carry a trailing
+    slash, regardless of whether the caller's api_url had one."""
+    api = _ShoonyaApi("https://api.shoonya.com/NorenWClientAPI/")
+    assert api._NorenApi__service_config["host"] == "https://api.shoonya.com/NorenWClientAPI"
+
+
+def test_host_config_keeps_original_https_scheme():
+    """Only the websocket endpoint is forced to wss:// - the REST host
+    config must retain whatever scheme was actually passed in."""
+    api = _ShoonyaApi("https://api.shoonya.com/NorenWClientAPI/")
+    assert api._NorenApi__service_config["host"].startswith("https://")

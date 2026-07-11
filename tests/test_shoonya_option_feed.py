@@ -1,16 +1,18 @@
 """
-Unit tests for marketengine/ShoonyaOptionFeed.py, focused on the leak/
-exception-safety fixes: exceptions raised inside the detached tick-processing
-task must be logged (not silently dropped), and start() must attempt to close
-any prior websocket before opening a new one.
+Unit tests for marketengine/ShoonyaOptionFeed.py, covering: tick handling and
+normalization, subscribe/unsubscribe ref-counting, exception-safety of the
+detached tick-processing task, and start()/close() socket lifecycle
+(closing any prior websocket before opening a new one, surviving errors,
+and force-stopping zombie reconnect threads).
 """
 
 import asyncio
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from marketengine.ShoonyaOptionFeed import ShoonyaOptionFeed
+from marketengine.ShoonyaOptionFeed import ShoonyaOptionFeed, normalize_touchline_tick
 
 
 def _make_feed():
@@ -18,6 +20,86 @@ def _make_feed():
     feed = ShoonyaOptionFeed(shoonya)
     return feed, shoonya
 
+
+# ── normalize_touchline_tick ─────────────────────────────────────────────
+
+class TestNormalizeTouchlineTick:
+
+    def test_maps_known_fields(self):
+        raw = {"lp": "123.45", "bp1": "123.0", "sp1": "124.0", "v": "500", "oi": "1000", "poi": "900"}
+        result = normalize_touchline_tick(raw)
+        assert result == {
+            "ltp": 123.45,
+            "bid": 123.0,
+            "ask": 124.0,
+            "volume": 500,
+            "oi": 1000,
+            "poi": 900,
+        }
+
+    def test_only_includes_present_fields(self):
+        """Per Shoonya's docs, only t/e/tk are guaranteed on 'tf' updates -
+        every other field is present only when it changed."""
+        raw = {"t": "tf", "e": "NFO", "tk": "111", "lp": "65.0"}
+        result = normalize_touchline_tick(raw)
+        assert result == {"ltp": 65.0}
+
+    def test_empty_raw_returns_empty_dict(self):
+        assert normalize_touchline_tick({}) == {}
+
+    def test_invalid_numeric_values_do_not_raise(self):
+        raw = {"lp": "not-a-number", "v": "also-bad"}
+        result = normalize_touchline_tick(raw)
+        assert result["ltp"] is None
+        assert result["volume"] is None
+
+
+# ── subscribe/unsubscribe ref-counting ───────────────────────────────────
+
+class TestSubscription:
+
+    def test_ensure_subscribed_calls_broker_for_new_tokens(self):
+        feed, shoonya = _make_feed()
+        feed.ensure_subscribed({"NFO|111"})
+        shoonya._api.subscribe.assert_called_once()
+        called_tokens = shoonya._api.subscribe.call_args[0][0]
+        assert called_tokens == ["NFO|111"]
+
+    def test_ensure_subscribed_does_not_resubscribe_already_referenced_token(self):
+        feed, shoonya = _make_feed()
+        feed.ensure_subscribed({"NFO|111"})
+        feed.ensure_subscribed({"NFO|111"})
+        assert shoonya._api.subscribe.call_count == 1
+
+    def test_ensure_subscribed_noop_when_api_none(self):
+        feed, shoonya = _make_feed()
+        shoonya._api = None
+        feed.ensure_subscribed({"NFO|111"})  # must not raise
+
+    def test_release_unsubscribes_when_refcount_hits_zero(self):
+        feed, shoonya = _make_feed()
+        feed.ensure_subscribed({"NFO|111"})
+        feed.release({"NFO|111"})
+        shoonya._api.unsubscribe.assert_called_once()
+        assert shoonya._api.unsubscribe.call_args[0][0] == ["NFO|111"]
+
+    def test_release_does_not_unsubscribe_while_still_referenced(self):
+        """Two independent subscribers of the same token: releasing one must
+        not unsubscribe from the broker while the other still needs it."""
+        feed, shoonya = _make_feed()
+        feed.ensure_subscribed({"NFO|111"})
+        feed.ensure_subscribed({"NFO|111"})  # second reference
+        feed.release({"NFO|111"})
+        shoonya._api.unsubscribe.assert_not_called()
+        assert feed._subscribed_tokens["NFO|111"] == 1
+
+    def test_release_of_unknown_token_does_not_raise(self):
+        feed, shoonya = _make_feed()
+        feed.release({"NFO|999"})  # never subscribed
+        shoonya._api.unsubscribe.assert_called_once()  # still reported as "to remove"
+
+
+# ── tick exception surfacing ──────────────────────────────────────────────
 
 class TestTickExceptionSurfacing:
 
@@ -56,6 +138,41 @@ class TestTickExceptionSurfacing:
 
         mock_logger.error.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_sync_handler_is_called_directly_without_scheduling(self):
+        feed, _ = _make_feed()
+        feed._async_loop = asyncio.get_running_loop()
+
+        calls = []
+
+        def _sync_handler(instrument_key, tick):
+            calls.append((instrument_key, tick))
+
+        feed.on_tick(_sync_handler)
+        feed._on_tick({"t": "tf", "e": "NFO", "tk": "111", "lp": "65.0"})
+
+        assert calls == [("NFO|111", {"ltp": 65.0})]
+
+    def test_ignores_non_touchline_message_types(self):
+        feed, _ = _make_feed()
+        calls = []
+        feed.on_tick(lambda k, t: calls.append((k, t)))
+        feed._on_tick({"t": "ck", "e": "NFO", "tk": "111"})  # order update, not touchline
+        assert calls == []
+
+    def test_ignores_tick_missing_exchange_or_token(self):
+        feed, _ = _make_feed()
+        calls = []
+        feed.on_tick(lambda k, t: calls.append((k, t)))
+        feed._on_tick({"t": "tf", "lp": "65.0"})  # no 'e'/'tk'
+        assert calls == []
+
+    def test_malformed_tick_does_not_raise(self):
+        feed, _ = _make_feed()
+        feed._on_tick(None)  # must not raise -- caught by the broad except
+
+
+# ── start() closes prior socket ───────────────────────────────────────────
 
 class TestStartClosesPriorSocket:
 
@@ -137,14 +254,10 @@ class TestStartClosesPriorSocket:
     def test_reconnect_force_stops_zombie_thread_when_close_websocket_is_a_noop(self):
         """Regression test for the production thread-leak bug: NorenApi's own
         close_websocket() silently does nothing once __websocket_connected is
-        already False (exactly the state after our own reconnect fires, since
-        that only happens after NorenApi's on_close callback already flipped
-        it) - it never sets the internal stop_event, so the old
+        already False - it never sets the internal stop_event, so the old
         __ws_run_forever thread spins forever and is never joined, leaking
         one OS thread per failed reconnect. start() must force-stop it
         directly instead of trusting close_websocket() alone."""
-        import threading
-
         feed, shoonya = _make_feed()
 
         old_api = MagicMock()
@@ -175,17 +288,73 @@ class TestStartClosesPriorSocket:
         zombie_thread.join(timeout=1)
         assert not zombie_thread.is_alive()
 
+    def test_reconnect_flag_cleared_on_fresh_start(self):
+        """A fresh external start() (broker reconnect) must supersede
+        whatever internal reconnect loop was previously scheduled."""
+        feed, shoonya = _make_feed()
+        feed._reconnecting = True
 
-class TestOnCloseSignalsStopImmediately:
+        async def _run():
+            feed.start()
+
+        asyncio.run(_run())
+        assert feed._reconnecting is False
+
+
+class TestClose:
+
+    def test_close_stops_the_instance_the_socket_was_opened_on(self):
+        feed, shoonya = _make_feed()
+
+        async def _run():
+            feed.start()
+
+        asyncio.run(_run())
+        opened_api = shoonya._api
+
+        # Simulate self._shoonya._api having moved on already (token refresh)
+        shoonya._api = MagicMock()
+
+        feed.close()
+
+        opened_api.close_websocket.assert_called_once()
+
+    def test_close_before_any_start_does_not_raise(self):
+        feed, shoonya = _make_feed()
+        feed.close()  # must not raise
+
+
+# ── on_open resubscribes after (re)connect ────────────────────────────────
+
+class TestOnOpen:
+
+    def test_on_open_resubscribes_previously_subscribed_tokens(self):
+        feed, shoonya = _make_feed()
+        feed.ensure_subscribed({"NFO|111", "NFO|222"})
+        shoonya._api.subscribe.reset_mock()
+
+        feed._on_open()
+
+        shoonya._api.subscribe.assert_called_once()
+        called_tokens = set(shoonya._api.subscribe.call_args[0][0])
+        assert called_tokens == {"NFO|111", "NFO|222"}
+
+    def test_on_open_with_no_tokens_does_not_call_subscribe(self):
+        feed, shoonya = _make_feed()
+        feed._on_open()
+        shoonya._api.subscribe.assert_not_called()
+
+
+# ── on_close / on_error schedule reconnect ─────────────────────────────────
+
+class TestReconnectSignaling:
 
     def test_on_close_stops_dead_instance_before_the_5s_reconnect_delay(self):
         """Regression test: NorenApi's own __ws_run_forever loop keeps
         retrying the dead connection every 100ms on its own, independent of
-        our reconnect timer, until its stop_event is set. Previously nothing
-        set that event until our own start() ran RECONNECT_DELAY_SECS later -
-        two unsynchronized retry loops hammering a broker that keeps
-        rejecting every attempt. _on_close/_on_error must signal the old
-        instance to stop immediately, not wait for the delayed reconnect."""
+        our reconnect timer, until its stop_event is set. _on_close/_on_error
+        must signal the old instance to stop immediately, not wait for the
+        delayed reconnect."""
         feed, _ = _make_feed()
         feed._async_loop = MagicMock()  # truthy, so _schedule_reconnect proceeds
 
@@ -213,8 +382,6 @@ class TestOnCloseSignalsStopImmediately:
         """_signal_stop_websocket must be safe to call from the WS's own
         thread (which is exactly where _on_close/_on_error run) - it must
         never join, since a thread can't join itself."""
-        import threading
-
         api = MagicMock()
         thread = MagicMock(spec=threading.Thread)
         api._NorenApi__ws_thread = thread
@@ -222,9 +389,6 @@ class TestOnCloseSignalsStopImmediately:
         ShoonyaOptionFeed._signal_stop_websocket(api)
 
         thread.join.assert_not_called()
-
-
-class TestReconnectCallbacksAreExceptionSafe:
 
     def test_on_close_does_not_raise_when_schedule_reconnect_fails(self):
         feed, _ = _make_feed()
@@ -239,3 +403,52 @@ class TestReconnectCallbacksAreExceptionSafe:
 
         with patch.object(feed, "_schedule_reconnect", side_effect=RuntimeError("loop closed")):
             feed._on_error("some error")  # must not raise
+
+    def test_schedule_reconnect_is_idempotent_while_already_reconnecting(self):
+        feed, _ = _make_feed()
+        feed._async_loop = MagicMock()
+        feed._reconnecting = True
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_schedule:
+            feed._schedule_reconnect()
+
+        mock_schedule.assert_not_called()
+
+    def test_schedule_reconnect_noop_without_async_loop(self):
+        feed, _ = _make_feed()
+        feed._async_loop = None
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_schedule:
+            feed._schedule_reconnect()
+
+        mock_schedule.assert_not_called()
+        assert feed._reconnecting is False
+
+
+# ── reconnect loop retries on failure ───────────────────────────────────────
+
+class TestReconnectLoop:
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_calls_start_after_delay(self):
+        feed, shoonya = _make_feed()
+        feed._async_loop = asyncio.get_running_loop()
+
+        with patch("marketengine.ShoonyaOptionFeed.RECONNECT_DELAY_SECS", 0):
+            with patch.object(feed, "start") as mock_start:
+                await feed._reconnect_loop()
+
+        mock_start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_reschedules_itself_on_failure(self):
+        feed, shoonya = _make_feed()
+        feed._async_loop = asyncio.get_running_loop()
+
+        with patch("marketengine.ShoonyaOptionFeed.RECONNECT_DELAY_SECS", 0):
+            with patch.object(feed, "start", side_effect=RuntimeError("still down")):
+                with patch.object(feed, "_schedule_reconnect") as mock_schedule:
+                    await feed._reconnect_loop()
+
+        mock_schedule.assert_called_once()
+        assert feed._reconnecting is False
