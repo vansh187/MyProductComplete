@@ -41,6 +41,7 @@ class ExchangeType(str, Enum):
     NSE = "NSE"
     BSE = "BSE"
     NFO = "NFO"
+    BFO = "BFO"
     NCDEX = "NCDEX"
     MCXSX = "MCXSX"
 

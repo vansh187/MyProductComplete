@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from api.models import ExchangeType, OrderCreate, OrderSide, OrderType, ProductType, ValidityType
 from api.orders import router
 from service.executionEngine import ExecutionEngine
+from service.orderService import OrderService
 from service.tradeSettlementService import TradeSettlementService
 
 
@@ -480,6 +481,73 @@ class TestProcessTradesExecutionStates:
         mocks["TradeSettlementService"].return_value.settle_fill.assert_not_called()
 
 
+class TestFnoFullBuySellExecutionEndToEnd:
+    """The exact QA scenario end-to-end: user A (buyer) and user B (seller,
+    brand new, no prior position) place opposing F&O orders that fully
+    match. Runs the real ExecutionEngine._process_trades() with the real
+    TradeSettlementService/PositionService (only DB/cache/broker I/O
+    mocked) to prove the whole path - not just settle_fill in isolation -
+    reports a clean full EXECUTED status with no exception, and that both
+    sides' positions land correctly (buyer long, seller short)."""
+
+    def test_new_buyer_and_new_seller_full_match_reports_executed(self):
+        order = _buy_order(quantity=50)  # the "incoming" order driving this _process_trades() call
+        trade = MockTradeExecution(
+            buy_order_id=501, sell_order_id=502,
+            buy_user_id=10, sell_user_id=20,
+            symbol="NIFTY07JUL2623800CE", quantity=50, execution_price=120.0, remaining_qty=0,
+        )
+
+        fno_snapshot = {
+            "symbol": "NIFTY07JUL2623800CE", "exchange": "NFO",
+            "broker": "Shoonya", "token": "12345", "lot_size": 50,
+            "product_type": "NRML", "source": "SIMULATED",
+        }
+
+        with patch("service.executionEngine.OrderService") as MockOrderService, \
+             patch("service.executionEngine.portfolioService") as MockPortfolioService, \
+             patch("service.executionEngine.tradeService") as MockTradeService, \
+             patch("service.executionEngine.WalletBalanceService"), \
+             patch("service.positionService.PositionPersistence") as MockPersistence, \
+             patch("service.positionService.PositionCache") as MockCache, \
+             patch("service.positionService.positionTickService"), \
+             patch("service.positionService.OptionMaster.find_by_tsym", return_value=None):
+
+            MockOrderService.return_value.get_order_snapshot.return_value = fno_snapshot
+            MockTradeService.return_value.insertTradeOrders.return_value = 9001
+
+            # Neither the buyer nor the seller has a prior position anywhere
+            # (Postgres fallback or Redis cache) - the exact "brand new user" case.
+            MockPersistence.return_value.get_position.return_value = None
+            mock_cache_instance = MockCache.return_value
+            mock_cache_instance.get_position.return_value = None
+            mock_cache_instance.lock.return_value.__enter__ = MagicMock(return_value=None)
+            mock_cache_instance.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+            engine = ExecutionEngine(order, 501)
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+
+            # Must not raise "Insufficient holdings" (the reported bug) or
+            # anything else - this is the full reported scenario.
+            result = engine._process_trades(mock_conn, mock_cursor, [trade], order_book_id=1001, user_id=10)
+
+        assert result["success"] is True
+        assert result["status"] == "EXECUTED"
+        assert result["trade_id"] == 9001
+        mock_conn.commit.assert_called_once()
+        mock_conn.rollback.assert_not_called()
+
+        # Both sides' positions were saved: buyer long (+50), seller short (-50).
+        saved_positions = [c.args[0] for c in mock_cache_instance.save_open_position.call_args_list]
+        assert len(saved_positions) == 2
+        by_user = {p["user_id"]: p for p in saved_positions}
+        assert by_user[10]["netqty"] == 50    # buyer opened long
+        assert by_user[20]["netqty"] == -50   # seller opened short (sell-to-open)
+        assert by_user[10]["status"] == "OPEN"
+        assert by_user[20]["status"] == "OPEN"
+
+
 # ============================================================================
 # 2b. TradeSettlementService.settle_fill — the known mock-bug fix.
 #
@@ -549,6 +617,179 @@ class TestSettleFillCursorMocking:
 
         with pytest.raises(Exception, match="No holdings found"):
             service.settle_fill(1, "SELL", snapshot, quantity=5, price=100.0, cursor=mock_cursor)
+
+
+class TestOrderServiceExchangeResolution:
+    """OrderService.create_order() must resolve `exchange` server-side from
+    OptionMaster for any symbol it recognizes as a derivative - the same way
+    it already resolves `token` - instead of trusting the client-supplied
+    value (which defaults to NSE). Settlement routing (is_fo_exchange) relies
+    on this being correct; without it, an F&O sell-to-open with no prior
+    position gets wrongly routed through the equity holdings check and
+    raises "Insufficient holdings" (the reported bug)."""
+
+    def test_fno_symbol_resolves_exchange_to_nfo_regardless_of_client_input(self):
+        order = OrderCreate(
+            symbol="NIFTY07JUL2623800CE", exchange=ExchangeType.NSE, side=OrderSide.SELL,
+            quantity=50, order_type=OrderType.MARKET, product_type=ProductType.NRML,
+        )
+        service = OrderService()
+        service.order_persistence = MagicMock()
+        service.order_persistence.create_order.return_value = 101
+
+        with patch("service.orderService.OptionMaster.find_by_tsym") as mock_find:
+            mock_find.return_value = {
+                "token": "12345", "lot_size": 50, "exchange": "NFO",
+                "underlying": "NIFTY", "expiry": "2026-07-07", "strike": 23800.0, "option_type": "CE",
+            }
+            order_id = service.create_order(order, user_id=42)
+
+        assert order_id == 101
+        assert order.exchange == ExchangeType.NFO
+        assert order.token == "12345"
+
+    def test_bfo_symbol_resolves_exchange_to_bfo(self):
+        """Sensex options trade on BFO, not NFO - previously ExchangeType
+        had no BFO member at all, so this couldn't even be represented."""
+        order = OrderCreate(
+            symbol="SENSEX07JUL2680000CE", exchange=ExchangeType.NSE, side=OrderSide.SELL,
+            quantity=10, order_type=OrderType.MARKET, product_type=ProductType.NRML,
+        )
+        service = OrderService()
+        service.order_persistence = MagicMock()
+        service.order_persistence.create_order.return_value = 202
+
+        with patch("service.orderService.OptionMaster.find_by_tsym") as mock_find:
+            mock_find.return_value = {
+                "token": "999", "lot_size": 10, "exchange": "BFO",
+                "underlying": "SENSEX", "expiry": "2026-07-07", "strike": 80000.0, "option_type": "CE",
+            }
+            service.create_order(order, user_id=42)
+
+        assert order.exchange == ExchangeType.BFO
+
+    def test_equity_symbol_with_no_option_master_match_keeps_client_exchange(self):
+        """Regression guard: equity/CNC orders are unaffected - no OptionMaster
+        match means exchange stays exactly what the client submitted."""
+        order = OrderCreate(
+            symbol="RELIANCE", exchange=ExchangeType.NSE, side=OrderSide.BUY,
+            quantity=10, order_type=OrderType.MARKET, price=2500.0, product_type=ProductType.CNC,
+        )
+        service = OrderService()
+        service.order_persistence = MagicMock()
+        service.order_persistence.create_order.return_value = 303
+
+        with patch("service.orderService.OptionMaster.find_by_tsym") as mock_find:
+            mock_find.return_value = None
+            service.create_order(order, user_id=42)
+
+        assert order.exchange == ExchangeType.NSE
+
+    def test_unrecognized_exchange_from_option_master_does_not_raise(self):
+        """Defensive guard: even if OptionMaster ever returns an exchange
+        string that isn't a valid ExchangeType member, create_order() must
+        not raise - it should log and keep the client-supplied exchange
+        rather than crash order placement."""
+        order = OrderCreate(
+            symbol="NIFTY07JUL2623800CE", exchange=ExchangeType.NSE, side=OrderSide.SELL,
+            quantity=50, order_type=OrderType.MARKET, product_type=ProductType.NRML,
+        )
+        service = OrderService()
+        service.order_persistence = MagicMock()
+        service.order_persistence.create_order.return_value = 404
+
+        with patch("service.orderService.OptionMaster.find_by_tsym") as mock_find:
+            mock_find.return_value = {
+                "token": "555", "lot_size": 50, "exchange": "SOMETHING_UNKNOWN",
+                "underlying": "NIFTY", "expiry": "2026-07-07", "strike": 23800.0, "option_type": "CE",
+            }
+            order_id = service.create_order(order, user_id=42)
+
+        assert order_id == 404
+        assert order.exchange == ExchangeType.NSE  # unchanged, fell back safely
+        assert order.token == "555"  # token resolution still happened
+
+
+class TestFnoSettlementRouting:
+    """End-to-end regression test for the reported bug: an F&O SELL from a
+    user with no prior position must open a short position via
+    PositionService, and must never reach the equity holdings check
+    (portfolioPersistence.process_seller), which raises "Insufficient
+    holdings" on a fresh short."""
+
+    def test_fno_sell_to_open_routes_to_position_service_not_holdings_check(self):
+        service = TradeSettlementService()
+        service.position_service = MagicMock()
+        service.portfolio_service = MagicMock()
+        mock_cursor = MagicMock()
+
+        snapshot = {"symbol": "NIFTY07JUL2623800CE", "exchange": "NFO"}
+        service.settle_fill(1, "SELL", snapshot, quantity=50, price=120.0, cursor=mock_cursor)
+
+        service.position_service.apply_fill.assert_called_once_with(
+            1, "SELL", snapshot, 50, 120.0, mock_cursor
+        )
+        service.portfolio_service.process_seller.assert_not_called()
+        service.portfolio_service.process_buyer.assert_not_called()
+
+    def test_bfo_sell_to_open_also_routes_to_position_service(self):
+        service = TradeSettlementService()
+        service.position_service = MagicMock()
+        service.portfolio_service = MagicMock()
+        mock_cursor = MagicMock()
+
+        snapshot = {"symbol": "SENSEX07JUL2680000CE", "exchange": "BFO"}
+        service.settle_fill(1, "SELL", snapshot, quantity=10, price=200.0, cursor=mock_cursor)
+
+        service.position_service.apply_fill.assert_called_once()
+        service.portfolio_service.process_seller.assert_not_called()
+
+    def test_equity_sell_still_routes_to_holdings_check(self):
+        """Regression guard: CNC/equity sells must NOT change - still
+        routed through the holdings-checked portfolio_service path."""
+        service = TradeSettlementService()
+        service.position_service = MagicMock()
+        service.portfolio_service = MagicMock()
+        mock_cursor = MagicMock()
+
+        snapshot = {"symbol": "RELIANCE", "exchange": "NSE"}
+        service.settle_fill(1, "SELL", snapshot, quantity=5, price=2500.0, cursor=mock_cursor)
+
+        service.portfolio_service.process_seller.assert_called_once_with(
+            1, "RELIANCE", 5, 2500.0, mock_cursor
+        )
+        service.position_service.apply_fill.assert_not_called()
+
+    def test_real_apply_fill_opens_short_position_for_new_user_no_prior_position(self):
+        """The exact QA scenario: a brand-new user (no cached/DB position)
+        sells to open on an F&O contract. Uses the real PositionService
+        (not mocked away) with its DB/cache dependencies mocked, to prove
+        apply_fill() itself does not require - or check - any prior
+        position/holdings."""
+        with patch("service.positionService.PositionPersistence") as MockPersistence, \
+             patch("service.positionService.PositionCache") as MockCache, \
+             patch("service.positionService.positionTickService"), \
+             patch("service.positionService.OptionMaster.find_by_tsym", return_value=None):
+            MockPersistence.return_value.get_position.return_value = None
+            mock_cache_instance = MockCache.return_value
+            mock_cache_instance.get_position.return_value = None
+            mock_cache_instance.lock.return_value.__enter__ = MagicMock(return_value=None)
+            mock_cache_instance.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+            service = TradeSettlementService()
+            snapshot = {
+                "symbol": "NIFTY07JUL2623800CE", "exchange": "NFO",
+                "broker": "Shoonya", "token": "12345", "lot_size": 50,
+                "product_type": "NRML", "source": "SIMULATED",
+            }
+            mock_cursor = MagicMock()
+
+            # Must not raise - this is the reported bug's exact failure point.
+            service.settle_fill(99, "SELL", snapshot, quantity=50, price=120.0, cursor=mock_cursor)
+
+            saved_position = mock_cache_instance.save_open_position.call_args.args[0]
+            assert saved_position["netqty"] == -50
+            assert saved_position["status"] == "OPEN"
 
 
 # ============================================================================

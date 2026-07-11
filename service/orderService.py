@@ -7,6 +7,7 @@ import logging
 from typing import Optional, List, Dict, Any
 
 from appconfig import OptionMaster
+from api.models import ExchangeType
 from database.orderPersistence import OrderPersistence
 from database.portfolioPersistence import portfolioPersistence
 from service.tradeHistoryService import TradeHistoryService
@@ -56,6 +57,25 @@ class OrderService:
                 token_match = OptionMaster.find_by_tsym(order.symbol)
                 if token_match:
                     order.token = token_match["token"]
+                    # Exchange must be server-resolved, not client-trusted: F&O
+                    # settlement routing (is_fo_exchange in tradeSettlementService)
+                    # depends on this being correct, and a client-supplied default
+                    # of NSE on a derivative symbol would wrongly route a sell-to-open
+                    # through the equity holdings check instead of position building.
+                    # Never let an unrecognized exchange string from OptionMaster
+                    # (today it only ever returns NFO/BFO, but this must not be
+                    # able to break order creation if that ever changes) turn into
+                    # an unhandled ValueError - fall back to the client-supplied
+                    # exchange and log it instead.
+                    resolved_exchange = token_match.get("exchange")
+                    try:
+                        order.exchange = ExchangeType(resolved_exchange)
+                    except ValueError:
+                        self.logger.error(
+                            f"OptionMaster returned unrecognized exchange "
+                            f"'{resolved_exchange}' for symbol {order.symbol}; "
+                            f"keeping client-supplied exchange {order.exchange}"
+                        )
 
                 if(os.getenv("IS_PROD_ENVIRONMENT") is True):
                     order.source='LIVE'
