@@ -71,12 +71,20 @@ class TieredPriceResolver(ReferencePriceResolver):
             return tier3
         attempted.append({"tier": 3, "source": "VERIFIED_INTERNAL", "result": "OUTSIDE_VERIFICATION_BAND_OR_MISSING"})
 
-        # Tier 4: contract's own strike (options) / client order price (futures) as a proxy.
-        if contract_type == "OPTION" and strike is not None:
-            return PriceResolution(price=Decimal(str(strike)), source="STRIKE_PROXY", tier=4)
-        if contract_type == "FUTURES" and order_price is not None and order_price > 0:
+        # Tier 4: client's own submitted order price as a last-resort proxy,
+        # for both instrument classes. This field feeds OptionsMarginCalculator's
+        # premium_component directly (premium_per_unit * lot_size * qty) -
+        # it must be a genuine premium signal, never the strike. Strike is a
+        # separate, deliberately-independent fallback the calculator already
+        # uses for the *notional* reference price only (spot-or-strike, see
+        # OptionsMarginCalculator.calculate()) - conflating the two here by
+        # returning strike as this field previously meant a real ~Rs120
+        # option premium got treated as a ~Rs23,700 "premium", overstating
+        # required margin by roughly the strike/premium ratio (a bug found
+        # via a live production order, not a design choice).
+        if order_price is not None and order_price > 0:
             return PriceResolution(price=Decimal(str(order_price)), source="ORDER_PRICE_PROXY", tier=4)
-        attempted.append({"tier": 4, "source": "STRIKE_OR_ORDER_PRICE_PROXY", "result": "UNAVAILABLE"})
+        attempted.append({"tier": 4, "source": "ORDER_PRICE_PROXY", "result": "UNAVAILABLE"})
 
         # Tier 5: terminal - nothing resolved.
         self.logger.error(f"Reference price unresolved for {tsym}: {attempted}")
