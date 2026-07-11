@@ -101,11 +101,12 @@ class RazorPayManagerService:
                 background_tasks.add_task(
                    run_background_insert 
                 )"""
-                return True   
+                return True
         except Exception as ex:
-            print("Error in verification of payment"+ex)
-    
-    
+            print(f"Error in verification of payment: {ex}")
+            return False
+
+
     def verify_webhook_signature(self, raw_body, webhook_signature) -> bool:
         """
         Validates the incoming webhook signature using the raw request body bytes.
@@ -176,8 +177,9 @@ class RazorPayManagerService:
                 
                 return True   
         except Exception as ex:
-            print("Error in verification of payment"+ex)    
-            
+            print(f"Error in verification of payment: {ex}")
+            return False
+
     def invokeCallToDatabase(self,razorpay_order_id,razorpay_payment_id,userId):
         print("calling to database")
         razorPayPersistence=RazorPayPersistence()

@@ -105,7 +105,7 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
                 logger.warning(f"No wallet found for user {user_id}")
                 raise HTTPException(status_code=400, detail="User wallet not initialized")
 
-            available_balance = Decimal(str(wallet.get("balance", 0)))
+            available_balance = Decimal(str(wallet.get("balance") or 0))
 
             if available_balance < required_balance:
                 logger.warning(
@@ -132,7 +132,7 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
                 blocked_amount = Decimal(str(order.quantity)) * Decimal(str(order.price))
                 wallet_service = WalletBalanceService()
                 wallet = wallet_service.getWalletBalance(user_id)
-                current_balance = Decimal(str(wallet.get("balance", 0)))
+                current_balance = Decimal(str(wallet.get("balance") or 0))
                 new_balance = current_balance - blocked_amount
 
                 # Update wallet in database
