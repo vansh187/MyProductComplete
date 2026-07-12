@@ -121,11 +121,6 @@ class RazorPayManagerService:
             # test that Razorpay's dashboard for this webhook is configured
             # with the value now stored in RAZORPAY_WEBHOOK_SECRET.
             webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-            # TEMP DEBUG - remove once confirmed which value is actually
-            # loaded in the deployed environment. Printing a real secret to
-            # logs is a leak risk (hosting/log-aggregator retention) - do
-            # not leave this in place longer than needed.
-            print(f"[DEBUG] RAZORPAY_WEBHOOK_SECRET loaded as: {webhook_secret!r}", flush=True)
             if not webhook_secret:
                 print("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
                 return False
