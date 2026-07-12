@@ -112,8 +112,13 @@ class RazorPayManagerService:
         Validates the incoming webhook signature using the raw request body bytes.
         """
         try:
-            #This is the secret passphrase you will set in the Razorpay Dashboard
-            webhook_secret = "WEBHOOK_9897"#os.getenv("RAZORPAY_WEBHOOK_SECRET")""
+            # Read from environment - test mode and live mode use different
+            # secrets issued by Razorpay's dashboard, so this must be a
+            # config value, never a hardcoded literal (a hardcoded secret
+            # here would either verify every webhook against a fixed,
+            # guessable value or reject every live webhook outright once
+            # a real live-mode secret is configured).
+            webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
             if not webhook_secret:
                 print("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
                 return False

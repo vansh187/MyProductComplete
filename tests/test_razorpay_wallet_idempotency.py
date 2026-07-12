@@ -383,3 +383,79 @@ class TestInvokeCallToDatabaseGating:
             RazorPayManagerService().invokeCallToDatabase("order_xyz", "pay_abc", 99)
 
             instance.updatePaymentStatus.assert_called_once_with("order_xyz", "pay_abc", 99)
+
+
+class TestVerifyWebhookSignature:
+    """
+    Guards against the fixed regression where the webhook secret was a
+    hardcoded literal ("WEBHOOK_9897") with the real
+    os.getenv("RAZORPAY_WEBHOOK_SECRET") call commented out right next to
+    it - meaning every webhook was verified against a fixed, guessable
+    value regardless of environment, and would have rejected every real
+    webhook once a genuine live-mode secret was ever configured (test mode
+    and live mode use different secrets issued by Razorpay's dashboard).
+    """
+
+    def test_reads_secret_from_environment_not_a_hardcoded_literal(self):
+        fake_client = MagicMock()
+        fake_client.utility.verify_webhook_signature.return_value = None  # no raise = valid
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "real_env_configured_secret",
+             }):
+            result = RazorPayManagerService().verify_webhook_signature(b'{"event":"payment.captured"}', "sig123")
+
+        assert result is True
+        # The secret actually passed to the SDK's verifier must be the
+        # env-configured value, never the old hardcoded "WEBHOOK_9897".
+        call_args = fake_client.utility.verify_webhook_signature.call_args.args
+        assert call_args[2] == "real_env_configured_secret"
+        assert call_args[2] != "WEBHOOK_9897"
+
+    def test_missing_env_var_fails_closed_not_a_silent_fallback(self):
+        """If RAZORPAY_WEBHOOK_SECRET isn't set at all, verification must
+        fail closed (return False) rather than silently falling back to
+        any hardcoded value - a missing config should never be
+        indistinguishable from a validly-configured one."""
+        with patch.dict("os.environ", {}, clear=True):
+            result = RazorPayManagerService().verify_webhook_signature(b"{}", "sig123")
+
+        assert result is False
+
+    def test_different_secrets_for_different_environments_are_actually_used(self):
+        """Simulates switching from test mode to live mode purely via env
+        config (no code change) - the SDK call must reflect whichever
+        secret is currently configured."""
+        fake_client = MagicMock()
+        fake_client.utility.verify_webhook_signature.return_value = None
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "test_mode_secret",
+             }):
+            RazorPayManagerService().verify_webhook_signature(b"{}", "sig123")
+        assert fake_client.utility.verify_webhook_signature.call_args.args[2] == "test_mode_secret"
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "live_mode_secret",
+             }):
+            RazorPayManagerService().verify_webhook_signature(b"{}", "sig123")
+        assert fake_client.utility.verify_webhook_signature.call_args.args[2] == "live_mode_secret"
+
+    def test_sdk_rejection_returns_false_not_an_exception(self):
+        fake_client = MagicMock()
+        fake_client.utility.verify_webhook_signature.side_effect = Exception("Invalid signature")
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "real_secret",
+             }):
+            result = RazorPayManagerService().verify_webhook_signature(b"{}", "bad_sig")
+
+        assert result is False
