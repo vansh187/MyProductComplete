@@ -18,7 +18,8 @@ from service.tradeHistoryService import TradeHistoryService as tradeService
 from service.walletbalance.WalletBalanceService import WalletBalanceService
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from service.matchingEngine.matchingEngine import MatchingEngine
-from api.models import OrderCreate, OrderSide
+from service.stopOrderTriggerService import stopOrderTriggerService
+from api.models import OrderCreate, OrderSide, is_dormant_order_type, order_type_str
 
 MAX_MATCH_RETRIES = 3
 RETRY_DELAY_SECS = 0.005
@@ -52,12 +53,20 @@ class ExecutionEngine:
         self.order_id = order_id
         self.logger = logger
 
-    def execute_order(self, user_id: int) -> Dict[str, Any]:
+    def execute_order(self, user_id: int, existing_order_book_id: int = None) -> Dict[str, Any]:
         """
         Execute order with matching logic.
 
         Args:
             user_id: User ID who placed the order
+            existing_order_book_id: When set, this is a previously-dormant
+                STOP/STOPLIMIT order that StopOrderTriggerService has just
+                flipped from PENDING_TRIGGER to PENDING - Phase 2 (order_book
+                creation) is skipped since the row already exists (creating
+                a second one would duplicate a resting order for the same
+                underlying order_id), and Phase 3 matching always runs
+                regardless of order_type (the caller has already confirmed
+                this order is no longer dormant).
 
         Returns:
             Execution result dictionary
@@ -69,6 +78,10 @@ class ExecutionEngine:
         if user_id is None or user_id <= 0:
             self.logger.error(f"execute_order() received invalid user_id: {user_id}")
             raise ValueError("User ID must be a positive integer")
+
+        if existing_order_book_id is not None and existing_order_book_id <= 0:
+            self.logger.error(f"execute_order() received invalid existing_order_book_id: {existing_order_book_id}")
+            raise ValueError("Order book ID must be a positive integer")
 
         conn = None
         cursor = None
@@ -85,19 +98,46 @@ class ExecutionEngine:
 
             self.logger.info(f"Starting order execution: order_id={self.order_id}, user_id={user_id}, symbol={self.order.symbol}")
 
-            # Phase 2: Register order in order book
-            portfolio_service = portfolioService()
-            if portfolio_service is None:
-                raise Exception("Failed to initialize portfolio service")
+            if existing_order_book_id is not None:
+                order_book_id = existing_order_book_id
+            else:
+                # Phase 2: Register order in order book
+                portfolio_service = portfolioService()
+                if portfolio_service is None:
+                    raise Exception("Failed to initialize portfolio service")
 
-            #order book craetion will be connect to real time
-            order_book_id = self._create_order_book_entry(conn, cursor, portfolio_service, user_id)
+                #order book craetion will be connect to real time
+                order_book_id = self._create_order_book_entry(conn, cursor, portfolio_service, user_id)
 
-            if order_book_id is None or order_book_id <= 0:
-                raise Exception("Failed to create order book entry")
+                if order_book_id is None or order_book_id <= 0:
+                    raise Exception("Failed to create order book entry")
 
-            self.logger.info(f"Order book entry created: order_book_id={order_book_id}")
-            conn.commit()
+                self.logger.info(f"Order book entry created: order_book_id={order_book_id}")
+                conn.commit()
+
+                # STOP/STOPLIMIT orders must not be matched against the
+                # resting book the instant they're created - they start
+                # dormant (order_book/orders status PENDING_TRIGGER, see
+                # database/portfolioPersistence.py.createTradeinOrderBook)
+                # and only become matchable once StopOrderTriggerService
+                # sees a trade price/tick cross trigger_price and calls back
+                # into this same method with existing_order_book_id set.
+                # Without this check, a freshly-placed STOP order would
+                # still match immediately against any compatible resting
+                # order already in the book - exactly the bug this whole
+                # feature exists to fix, just missed for the order's own
+                # creation-time matching pass.
+                if is_dormant_order_type(self.order.order_type):
+                    self.logger.info(
+                        f"Order {self.order_id} is a dormant {order_type_str(self.order.order_type)} order - "
+                        f"skipping immediate matching until triggered"
+                    )
+                    return {
+                        "success": True,
+                        "status": "PENDING_TRIGGER",
+                        "message": "Order created, awaiting trigger price",
+                        "order_id": self.order_id
+                    }
 
             # Phase 3: Execute matching with retry logic
             execution_result = self._execute_matching(conn, cursor, order_book_id, user_id)
@@ -320,6 +360,7 @@ class ExecutionEngine:
             transaction_id = None
             total_matched_qty = 0
             processed_count = 0
+            executed_prices = []
 
             self.logger.info(f"Processing {len(trade_executions)} matched trades")
 
@@ -443,12 +484,45 @@ class ExecutionEngine:
                 )
 
                 processed_count += 1
+                executed_prices.append(match_found.execution_price)
                 self.logger.info(
                     f"Trade processed: transaction_id={transaction_id}, qty={match_found.quantity}, "
                     f"buyer={match_found.buy_user_id}, seller={match_found.sell_user_id}"
                 )
 
             conn.commit()
+
+            # Every real trade price is a trustworthy fresh signal for this
+            # symbol - check dormant STOP/STOPLIMIT orders resting on it now
+            # that this trade has actually committed (see
+            # service/stopOrderTriggerService.py). Runs on its own connection,
+            # after this transaction's commit, so a trigger-check failure can
+            # never roll back or block trades that already succeeded. The
+            # ENTIRE block (including the OptionMaster import/lookup, not just
+            # check_and_trigger itself) must be inside this try/except - code
+            # review caught that the import/lookup were previously unguarded,
+            # meaning a failure there would propagate up through
+            # _execute_matching/execute_order and mark this ALREADY-COMMITTED,
+            # already-successful trade as FAILED, turning a real fill into a
+            # false 500 for the caller - the exact "false failure" mirror of
+            # the "false success" bug this module's other comments warn about.
+            try:
+                from appconfig.OptionMaster import find_tsym_aliases
+                symbols_to_check = find_tsym_aliases(self.order.symbol) or [self.order.symbol]
+                for price in executed_prices:
+                    for symbol in symbols_to_check:
+                        try:
+                            stopOrderTriggerService.check_and_trigger(symbol, price)
+                        except Exception as trigger_ex:
+                            self.logger.error(
+                                f"Stop-order trigger check failed for symbol={symbol}: {str(trigger_ex)}",
+                                exc_info=True,
+                            )
+            except Exception as alias_ex:
+                self.logger.error(
+                    f"Stop-order trigger alias resolution failed for symbol={self.order.symbol}: {str(alias_ex)}",
+                    exc_info=True,
+                )
 
             if processed_count == 0:
                 # The matching engine proposed candidate(s) (trade_executions was

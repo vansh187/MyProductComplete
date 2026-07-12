@@ -42,8 +42,9 @@ select_portfolio_with_pnl: |
 insert_order_book: |
   INSERT INTO order_book
     (user_id, symbol, side, order_type, quantity, remaining_quantity,
-     price, status, created_at, updated_at, order_id)
-  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
+     price, trigger_price, exchange, product_type, validity, client_order_id,
+     status, created_at, updated_at, order_id)
+  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
   RETURNING id
 
 update_counterparty_order_book: |
@@ -55,3 +56,35 @@ update_incoming_order_book: |
   UPDATE order_book
   SET remaining_quantity = %s, status = %s, updated_at = NOW()
   WHERE id = %s
+
+select_pending_trigger_orders_by_symbol: |
+  SELECT id, user_id, order_id, symbol, side, order_type, quantity,
+         remaining_quantity, price, trigger_price, exchange, product_type,
+         validity, client_order_id
+  FROM order_book
+  WHERE symbol = %s AND status = 'PENDING_TRIGGER'
+  FOR UPDATE
+
+mark_order_book_triggered: |
+  UPDATE order_book
+  SET status = 'PENDING', price = COALESCE(%s, price), updated_at = NOW()
+  WHERE id = %s
+
+mark_orders_triggered: |
+  UPDATE orders
+  SET status = 'PENDING', price = COALESCE(%s, price), updated_at = NOW()
+  WHERE id = %s
+
+cancel_order_book_by_order_id: |
+  UPDATE order_book
+  SET status = 'CANCELLED', updated_at = NOW()
+  WHERE order_id = %s AND status IN ('PENDING', 'PARTIALLY_EXECUTED', 'PENDING_TRIGGER')
+
+modify_order_book_by_order_id: |
+  UPDATE order_book
+  SET price = COALESCE(%s, price),
+      quantity = COALESCE(%s, quantity),
+      remaining_quantity = COALESCE(%s, remaining_quantity),
+      trigger_price = COALESCE(%s, trigger_price),
+      updated_at = NOW()
+  WHERE order_id = %s AND status IN ('PENDING', 'PENDING_TRIGGER')

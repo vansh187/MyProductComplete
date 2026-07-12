@@ -241,19 +241,18 @@ class OrderService:
         try:
             self.logger.info(f"Cancelling order {order_id} for user {user_id}")
 
-            # Fetch order details BEFORE cancelling - side/quantity/price/
-            # symbol/exchange never change after creation in this system
-            # (only status/filled_qty do), so reading them first is safe,
-            # and it's what lets us compute the correct wallet refund below
-            # without a second query racing against anything. cancel_order
-            # only ever matches status='PENDING' (queries/orders.yaml), and
-            # a partial fill flips status to PARTIALLY_EXECUTED before this
-            # can run - so a successful cancel here always means the FULL
-            # original quantity was unfilled; the full originally-debited
-            # amount (quantity * price) is always the correct refund.
-            order_details = self.order_persistence.get_order_by_id(user_id, order_id)
-
-            was_cancelled = self.order_persistence.cancel_order_by_id(user_id, order_id)
+            # order_details now comes straight from the cancel UPDATE's own
+            # RETURNING clause (queries/orders.yaml cancel_order), not a
+            # separate pre-read - code review caught that a pre-read here
+            # could observe a stale price/quantity if a concurrent
+            # modify_order_by_id changed them between that read and this
+            # cancel actually taking effect, causing the refund below to use
+            # the wrong (pre-modify) amount. Reading the cancelled values
+            # from this exact statement's result closes that race - there is
+            # no longer a window between "read the order" and "cancel it"
+            # for another request to change price/quantity in between.
+            order_details = self.order_persistence.cancel_order_by_id(user_id, order_id)
+            was_cancelled = order_details is not None
 
             if was_cancelled:
                 self.logger.info(f"Order {order_id} cancelled successfully")
@@ -295,12 +294,16 @@ class OrderService:
         back - margin_engine.release_on_cancel() above only releases F&O
         margin blocks, a separate subsystem from the cash wallet debit.
 
-        Safe to always refund the FULL original quantity*price: this only
-        runs after order_persistence.cancel_order_by_id() actually matched
-        a row, and that query only ever matches status='PENDING'
-        (queries/orders.yaml) - a partial fill flips status to
-        PARTIALLY_EXECUTED first (service/executionEngine.py), so a
-        successful cancel here is always for an order with zero fills.
+        Safe to always refund the FULL quantity*price returned by the cancel
+        itself: this only runs after order_persistence.cancel_order_by_id()
+        actually matched a row, and that query matches status IN ('PENDING',
+        'PENDING_TRIGGER') (queries/orders.yaml) - a partial fill flips
+        status to PARTIALLY_EXECUTED first (service/executionEngine.py), so
+        a successful cancel here is always for an order with zero fills.
+        order_details comes straight from that UPDATE's own RETURNING clause
+        (not a separate read), so quantity/price here are guaranteed to be
+        exactly what was cancelled, even if the order had been amended by
+        ticket 15's modify endpoint beforehand.
 
         Best-effort like the margin release above and
         _refund_wallet_after_order_creation_failure in api/orders.py: the
@@ -349,6 +352,59 @@ class OrderService:
                 f"after cancelling order {order_id} (cancel already succeeded): {str(ex)}",
                 exc_info=True,
             )
+
+    def modify_order_by_id(self, user_id: int, order_id: int, price: Optional[float] = None,
+                            quantity: Optional[int] = None, trigger_price: Optional[float] = None,
+                            expected_price: Optional[float] = None, expected_quantity: Optional[int] = None,
+                            expected_trigger_price: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Amend a resting order's price/quantity/trigger_price in place.
+
+        Scope (ticket 15): only orders with status PENDING or PENDING_TRIGGER
+        (zero fills so far) can be modified - a partially-filled order's
+        remaining quantity/price semantics would need separate handling not
+        built here. Margin-required orders (OPTION SELL, FUTURES any side)
+        are rejected outright rather than half-supported: safely adjusting an
+        existing margin block for a changed price/quantity needs the same
+        release-then-reblock atomicity margin_engine doesn't yet expose
+        (release_on_cancel and check_and_block each own their own
+        transaction) - building that without a real risk of leaving a
+        resting F&O order under-margined is future work, not squeezed in
+        here. Cash-debited orders (BUY, non-FUTURES - same condition
+        api/orders.py uses at creation) instead have their wallet debit
+        adjusted by the exact price*qty delta, atomically, by the caller
+        (api/orders.py) before this runs - see that call site's comments.
+
+        expected_price/expected_quantity/expected_trigger_price: the values
+        the caller read just before computing that wallet delta - passed
+        straight through to the persistence layer's optimistic-concurrency
+        guard (see OrderPersistence.modify_order_by_id's docstring) so two
+        concurrent modify requests for the same order can't both succeed
+        against the same stale base - including a trigger_price-only change,
+        which previously wasn't covered by this guard at all.
+
+        Returns:
+            Dict describing what changed, for the API layer to report back.
+
+        Raises:
+            ValueError: If parameters are invalid, or no order is found.
+        """
+        if user_id is None or user_id <= 0:
+            raise ValueError("User ID must be a positive integer")
+        if order_id is None or order_id <= 0:
+            raise ValueError("Order ID must be a positive integer")
+        if price is None and quantity is None and trigger_price is None:
+            raise ValueError("At least one of price, quantity, trigger_price must be provided")
+
+        try:
+            was_modified = self.order_persistence.modify_order_by_id(
+                user_id, order_id, price, quantity, trigger_price,
+                expected_price, expected_quantity, expected_trigger_price
+            )
+            return {"modified": was_modified}
+        except Exception as ex:
+            self.logger.error(f"Error modifying order {order_id}: {str(ex)}")
+            raise
 
     def update_status(self, user_id: int, symbol: str, status: str,
                      buy_order_id: int, sell_order_id: int, cursor) -> None:

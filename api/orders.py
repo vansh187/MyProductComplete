@@ -9,7 +9,7 @@ from service.walletbalance.WalletBalanceService import WalletBalanceService
 from service.marginengine.margin_engine import MarginEngine
 from service.marginengine.exceptions import InsufficientMarginError, MarginEngineError, ReferencePriceUnresolvedError
 
-from api.models import OrderCreate, OrderSide, OrderType
+from api.models import OrderCreate, OrderModify, OrderSide, OrderType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -372,3 +372,157 @@ def cancel_order(order_id: int, current_user=Depends(get_current_user)):
     except Exception as ex:
         logger.error(f"Error cancelling order {order_id}: {str(ex)}")
         raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+
+@router.put("/orders/{order_id}")
+def modify_order(order_id: int, modify: OrderModify, current_user=Depends(get_current_user)):
+    """
+    Amend a resting (PENDING/PENDING_TRIGGER) order's price/quantity/
+    trigger_price in place - ticket 15.
+
+    Scope: only orders with zero fills so far can be amended. Margin-required
+    orders (OPTION SELL, FUTURES) are rejected - see OrderService.
+    modify_order_by_id's docstring for why. Cash-debited BUY orders
+    (equity/OPTION BUY, non-FUTURES - the same condition create_order uses)
+    have their wallet debit atomically adjusted by the exact price*quantity
+    delta before the row itself is updated; if the underlying order turns
+    out to have already been matched/cancelled by the time of the actual
+    write (a race lost to the matching engine), that wallet delta is
+    reversed and the request fails with 409 rather than silently debiting/
+    crediting for a modification that never took effect.
+
+    Raises:
+        HTTPException: If validation, funds, or the modification itself fails
+    """
+    try:
+        if current_user is None or "user_id" not in current_user:
+            logger.error("modify_order() received invalid current_user")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        user_id = current_user["user_id"]
+
+        if order_id is None or order_id <= 0:
+            raise HTTPException(status_code=400, detail="Invalid order ID")
+
+        if modify.price is None and modify.quantity is None and modify.trigger_price is None:
+            raise HTTPException(status_code=400, detail="At least one of price, quantity, trigger_price must be provided")
+
+        order_service = OrderService()
+        existing_order = order_service.get_order_by_id(user_id, order_id)
+
+        if existing_order is None:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        status_value = existing_order.get("status")
+        status_value = status_value.value if hasattr(status_value, "value") else str(status_value)
+        if status_value not in ("PENDING", "PENDING_TRIGGER"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only pending (unfilled) orders can be modified"
+            )
+
+        symbol = existing_order.get("symbol")
+        side = existing_order.get("side")
+        side_value = side.value if hasattr(side, "value") else str(side)
+        exchange = existing_order.get("exchange")
+        exchange_value = exchange.value if hasattr(exchange, "value") else str(exchange)
+        existing_price = existing_order.get("price")
+        existing_quantity = existing_order.get("quantity")
+        existing_trigger_price = existing_order.get("trigger_price")
+
+        new_quantity = modify.quantity if modify.quantity is not None else existing_quantity
+        margin_engine = MarginEngine()
+        instrument = margin_engine.resolve_contract_type(symbol, exchange_value, fallback_lot_size=new_quantity)
+        contract_type = instrument["contract_type"]
+
+        if margin_engine.is_margin_required(exchange_value, side_value, contract_type):
+            raise HTTPException(
+                status_code=400,
+                detail="Modifying a margin-required (F&O) order isn't supported yet - cancel it and place a new order instead"
+            )
+
+        wallet_service = WalletBalanceService()
+        wallet_delta_applied = Decimal("0")
+
+        if side_value == "BUY" and contract_type != "FUTURES":
+            new_price = modify.price if modify.price is not None else existing_price
+            if new_price is None or new_price <= 0:
+                raise HTTPException(status_code=400, detail="BUY orders require a valid price")
+
+            existing_price_decimal = Decimal(str(existing_price)) if existing_price is not None else Decimal("0")
+            old_required = Decimal(str(existing_quantity)) * existing_price_decimal
+            new_required = Decimal(str(new_quantity)) * Decimal(str(new_price))
+            delta = new_required - old_required
+
+            if delta > 0:
+                if not wallet_service.debitWalletIfSufficient(user_id, delta):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Insufficient balance to increase order value by ₹{delta:.2f}"
+                    )
+                wallet_delta_applied = delta
+            elif delta < 0:
+                wallet_service.creditWalletStandalone(user_id, -delta)
+                wallet_delta_applied = delta
+
+        try:
+            result = order_service.modify_order_by_id(
+                user_id, order_id,
+                price=modify.price, quantity=modify.quantity, trigger_price=modify.trigger_price,
+                expected_price=existing_price, expected_quantity=existing_quantity,
+                expected_trigger_price=existing_trigger_price
+            )
+        except Exception:
+            _reverse_wallet_delta(wallet_service, user_id, wallet_delta_applied)
+            raise
+
+        if not result.get("modified"):
+            # Lost a race against the matching engine (order got matched or
+            # cancelled), OR against another concurrent modify request for
+            # the same order (the optimistic-concurrency guard on
+            # expected_price/expected_quantity didn't match) - either way,
+            # reverse whatever wallet delta was already applied, since the
+            # modification itself never took effect.
+            _reverse_wallet_delta(wallet_service, user_id, wallet_delta_applied)
+            raise HTTPException(
+                status_code=409,
+                detail="Order could not be modified - it may have already been executed or cancelled"
+            )
+
+        logger.info(f"Order modified successfully: {order_id} for user {user_id}")
+
+        return {
+            "success": True,
+            "message": "Order modified successfully",
+            "order_id": order_id
+        }
+
+    except HTTPException:
+        raise
+
+    except ValueError as val_error:
+        logger.error(f"Validation error: {str(val_error)}")
+        raise HTTPException(status_code=400, detail=str(val_error))
+
+    except Exception as ex:
+        logger.error(f"Error modifying order {order_id}: {str(ex)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to modify order")
+
+
+def _reverse_wallet_delta(wallet_service: WalletBalanceService, user_id: int, delta_applied: Decimal) -> None:
+    """Undoes the wallet delta applied in modify_order() when the underlying
+    order turned out not to be modifiable after all. Never raises - logged
+    loudly instead, same rationale as _refund_wallet_after_order_creation_failure."""
+    if delta_applied == 0:
+        return
+    try:
+        if delta_applied > 0:
+            wallet_service.creditWalletStandalone(user_id, delta_applied)
+        else:
+            wallet_service.debitWalletIfSufficient(user_id, -delta_applied)
+    except Exception as ex:
+        logger.error(
+            f"Failed to reverse wallet delta of {delta_applied} for user {user_id} "
+            f"after a lost modify-order race: {str(ex)}",
+            exc_info=True,
+        )

@@ -1,5 +1,6 @@
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from utils.query_loader import QueryLoader
+from api.models import is_dormant_order_type, order_type_str
 import psycopg2.extras
 from dotenv import load_dotenv
 from decimal import Decimal
@@ -177,10 +178,22 @@ class portfolioPersistence:
 
     def createTradeinOrderBook(conn, cursor, order, userId, orderId):
         try:
+            order_type_value = order_type_str(order.order_type)
+            # STOP/STOPLIMIT orders must not be immediately matchable - they
+            # start dormant (PENDING_TRIGGER) until StopOrderTriggerService
+            # sees a trade price that crosses trigger_price. MARKET/LIMIT
+            # orders keep the existing PENDING (immediately matchable) behavior.
+            initial_status = "PENDING_TRIGGER" if is_dormant_order_type(order.order_type) else "PENDING"
+            exchange_value = order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange)
+            product_type_value = order.product_type.value if hasattr(order.product_type, "value") else str(order.product_type)
+            validity_value = order.validity.value if hasattr(order.validity, "value") else str(order.validity)
+
             cursor.execute(
                 QueryLoader.get('portfolio.yaml', 'insert_order_book'),
-                (userId, order.symbol, order.side.value, 'LIMIT',
-                 order.quantity, order.quantity, order.price, 'PENDING', orderId)
+                (userId, order.symbol, order.side.value, order_type_value,
+                 order.quantity, order.quantity, order.price, order.trigger_price,
+                 exchange_value, product_type_value, validity_value, order.client_order_id,
+                 initial_status, orderId)
             )
             row = cursor.fetchone()
             if row is None:
@@ -188,3 +201,65 @@ class portfolioPersistence:
             return row['id']
         except Exception as ex:
             raise Exception("Error in Inserting Data") from ex
+
+    @staticmethod
+    def get_pending_trigger_orders_by_symbol(symbol, cursor):
+        """Fetch resting STOP/STOPLIMIT order_book rows for a symbol, locked
+        FOR UPDATE so two concurrent trade-price signals can't both try to
+        trigger the same order. Caller owns the transaction/cursor."""
+        cursor.execute(
+            QueryLoader.get('portfolio.yaml', 'select_pending_trigger_orders_by_symbol'),
+            (symbol,)
+        )
+        return cursor.fetchall()
+
+    @staticmethod
+    def mark_order_book_triggered(order_book_id, new_price, cursor):
+        """Flips a triggered order_book row from PENDING_TRIGGER to PENDING so
+        it becomes visible to the matching engine's select_buy_orders/
+        select_sell_orders queries. new_price is only applied for plain STOP
+        orders (no existing limit price) - passing None leaves price
+        unchanged, which is correct for STOPLIMIT orders that already carry
+        their own limit price."""
+        cursor.execute(
+            QueryLoader.get('portfolio.yaml', 'mark_order_book_triggered'),
+            (new_price, order_book_id)
+        )
+
+    @staticmethod
+    def mark_orders_triggered(order_id, new_price, cursor):
+        """Mirrors mark_order_book_triggered on the orders table, so GET
+        /orders reflects PENDING (resting/matchable) instead of the stale
+        PENDING_TRIGGER (dormant) status once triggered."""
+        cursor.execute(
+            QueryLoader.get('portfolio.yaml', 'mark_orders_triggered'),
+            (new_price, order_id)
+        )
+
+    @staticmethod
+    def cancel_order_book_by_order_id(order_id, cursor):
+        """Cancels the order_book row for a cancelled order. Previously
+        missing entirely: cancel_order_by_id only updated the `orders` table,
+        leaving the order_book row (what select_buy_orders/select_sell_orders
+        in matching_engine.yaml actually query) still PENDING/PARTIALLY_EXECUTED
+        - a "cancelled" resting order could still be silently matched against
+        an incoming order. Also required for STOP-order correctness: without
+        this, cancelling a not-yet-triggered STOP order would leave its
+        order_book row at PENDING_TRIGGER, where a later trade could still
+        trigger and match an order the user believes they cancelled."""
+        cursor.execute(
+            QueryLoader.get('portfolio.yaml', 'cancel_order_book_by_order_id'),
+            (order_id,)
+        )
+
+    @staticmethod
+    def modify_order_book_by_order_id(order_id, price, quantity, remaining_quantity, trigger_price, cursor):
+        """Mirrors modify_order (orders.yaml) on the order_book row - see
+        OrderPersistence.modify_order_by_id's docstring. remaining_quantity
+        is passed as the same new quantity value (never independently), since
+        modify is only allowed on orders with zero fills so far
+        (status IN ('PENDING', 'PENDING_TRIGGER'))."""
+        cursor.execute(
+            QueryLoader.get('portfolio.yaml', 'modify_order_book_by_order_id'),
+            (price, quantity, remaining_quantity, trigger_price, order_id)
+        )

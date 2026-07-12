@@ -22,7 +22,19 @@ get_order_snapshot_by_id: |
 cancel_order: |
   UPDATE orders
   SET status = %s
-  WHERE user_id = %s AND id = %s AND status = %s
+  WHERE user_id = %s AND id = %s AND status IN ('PENDING', 'PENDING_TRIGGER')
+  RETURNING side, quantity, price, symbol, exchange
+
+modify_order: |
+  UPDATE orders
+  SET price = COALESCE(%s, price),
+      quantity = COALESCE(%s, quantity),
+      trigger_price = COALESCE(%s, trigger_price),
+      updated_at = NOW()
+  WHERE user_id = %s AND id = %s AND status IN ('PENDING', 'PENDING_TRIGGER')
+    AND price IS NOT DISTINCT FROM %s
+    AND quantity IS NOT DISTINCT FROM %s
+    AND trigger_price IS NOT DISTINCT FROM %s
 
 update_order_status: |
   UPDATE orders

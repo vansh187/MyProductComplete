@@ -19,6 +19,29 @@ class OrderType(str, Enum):
     STOPLIMIT = "STOPLIMIT"
 
 
+# Single source of truth for "does this order type start dormant
+# (PENDING_TRIGGER) instead of immediately matchable (PENDING)?" - see
+# service/stopOrderTriggerService.py. Previously this membership test was
+# duplicated verbatim across database/orderPersistence.py,
+# database/portfolioPersistence.py, and service/executionEngine.py; a future
+# order type added to only some of those copies could desync orders.status
+# from order_book.status, or leave a dormant order matchable at creation.
+DORMANT_UNTIL_TRIGGERED_ORDER_TYPES = (OrderType.STOP.value, OrderType.STOPLIMIT.value)
+
+
+def order_type_str(order_type) -> str:
+    """Normalizes an OrderType enum member OR a plain string to its string
+    value - the same `x.value if hasattr(x, "value") else str(x)` coercion
+    duplicated across the order-creation/trigger call chain, centralized
+    here so any future fix to the coercion applies everywhere at once."""
+    return order_type.value if hasattr(order_type, "value") else str(order_type)
+
+
+def is_dormant_order_type(order_type) -> bool:
+    """True for STOP/STOPLIMIT - see DORMANT_UNTIL_TRIGGERED_ORDER_TYPES."""
+    return order_type_str(order_type) in DORMANT_UNTIL_TRIGGERED_ORDER_TYPES
+
+
 class OrderSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
@@ -121,3 +144,16 @@ class OrderCreate(BaseModel):
                 "validity": "DAY"
             }
         }
+
+
+# ============================================
+# ORDER MODIFY MODEL
+# ============================================
+class OrderModify(BaseModel):
+    """Ticket 15: amend a resting (PENDING/PENDING_TRIGGER) order's
+    price/quantity/trigger_price in place, keeping the same order_id. Every
+    field is optional - only fields actually sent are changed - but at least
+    one must be provided, or there is nothing to modify."""
+    price: Optional[float] = Field(default=None, gt=0, description="New order price")
+    quantity: Optional[int] = Field(default=None, gt=0, description="New order quantity")
+    trigger_price: Optional[float] = Field(default=None, gt=0, description="New trigger price (STOP/STOPLIMIT only)")

@@ -9,6 +9,15 @@ only releases F&O margin blocks, a separate subsystem. A user could place
 a BUY LIMIT order, cancel it unfilled, and permanently lose that cash with
 no refund.
 
+Code review later caught a related race: cancel_order_by_id used to read
+order details via a SEPARATE get_order_by_id call before cancelling, so a
+concurrent modify_order_by_id (ticket 15) could change price/quantity in
+the gap between that read and the cancel taking effect, causing a wrong
+refund amount. Fixed by having OrderPersistence.cancel_order_by_id return
+the cancelled row directly via the UPDATE's own RETURNING clause - these
+tests now mock cancel_order_by_id returning that dict (or None) instead of
+a bool, with no separate get_order_by_id call at all.
+
 No real DB/network calls are made: OrderPersistence, MarginEngine, and
 WalletBalanceService are all mocked.
 """
@@ -24,8 +33,7 @@ from service.orderService import OrderService
 def _make_service(order_details=None, cancel_returns=True):
     service = OrderService()
     service.order_persistence = MagicMock()
-    service.order_persistence.get_order_by_id.return_value = order_details
-    service.order_persistence.cancel_order_by_id.return_value = cancel_returns
+    service.order_persistence.cancel_order_by_id.return_value = order_details if cancel_returns else None
     service.margin_engine = MagicMock()
     service.wallet_service = MagicMock()
     return service
@@ -98,12 +106,14 @@ class TestCancelRefundsBuyOrder:
         assert result is False
         service.wallet_service.creditWalletStandalone.assert_not_called()
 
-    def test_missing_order_details_does_not_crash_despite_successful_cancel(self):
-        """Defensive edge case: if order_details somehow came back None
-        despite the cancel succeeding, must log and return cleanly, not
-        raise (the cancel response to the user must not be broken by a
-        refund-lookup problem)."""
-        service = _make_service(order_details=None, cancel_returns=True)
+    def test_empty_order_details_does_not_crash_despite_successful_cancel(self):
+        """Defensive edge case: cancel_order_by_id's RETURNING clause always
+        gives back a full row when it actually cancels something, so an
+        empty/falsy-but-present order_details dict shouldn't happen in
+        practice - but _refund_wallet_for_cancelled_buy_order must still
+        handle it gracefully (log and return cleanly, not raise) rather than
+        assume the dict is always fully populated."""
+        service = _make_service(order_details={}, cancel_returns=True)
 
         result = service.cancel_order_by_id(42, 101)
 
