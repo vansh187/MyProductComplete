@@ -139,47 +139,6 @@ class RazorPayManagerService:
     
     
     
-    def verify_payment_signatureFromWebHook(self, razorpay_order_id: str, razorpay_payment_id: str, razorpay_signature: str,userId:int) -> bool:
-        """
-        Step 2: Cryptographically verifies the payment signature returned by the frontend checkout window.
-        Returns True if authentic, False if compromised.
-        """
-        # Construct the expected raw text blob payload
-        try:
-                self.key_id=os.getenv("RAZORPAY_API_KEY")
-                self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
-                self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
-                signature_payload = f"{razorpay_order_id}|{razorpay_payment_id}"
-                
-                # Generate local SHA256 HMAC hash using your secret key
-                valid_signature = hmac.new(
-                    bytes(str(str(self.key_secret)), "utf-8"),
-                    bytes(str(str(signature_payload)), "utf-8"),
-                    hashlib.sha256
-                    ).hexdigest()
-                
-                # Secure string comparison to prevent timing attacks
-                params_dict = {
-                    'razorpay_order_id': razorpay_order_id,
-                    'razorpay_payment_id': razorpay_payment_id,
-                    'razorpay_signature': valid_signature
-                }
-                self.client.utility.verify_payment_signature(params_dict)
-                razorPayPersistence=RazorPayPersistence()
-                
-                razorPayPersistence.updatePaymentStatus(
-                       razorpay_order_id , 
-                       razorpay_payment_id , 
-                        userId
-                    )
-                    
-                razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id)
-                
-                return True   
-        except Exception as ex:
-            print(f"Error in verification of payment: {ex}")
-            return False
-
     def invokeCallToDatabase(self,razorpay_order_id,razorpay_payment_id,userId):
         print("calling to database")
         razorPayPersistence=RazorPayPersistence()

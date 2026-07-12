@@ -181,17 +181,18 @@ class TestInsertUpdateWallet:
         assert cursor.execute.call_count == 1
         conn.commit.assert_not_called()
 
-    def test_db_error_during_credit_rolls_back_and_does_not_raise(self):
+    def test_db_error_during_credit_rolls_back_and_re_raises(self):
         """A DB failure mid-credit must roll back (never leave a half-applied
-        state) and must not propagate - the webhook background task has no
-        retry/dead-letter handling, so an unhandled exception here would
-        just vanish into FastAPI's background-task error logging with the
-        wallet never credited and nobody alerted synchronously. Swallowing
-        and logging matches the existing behavior for the rest of this
-        method; it does not silently pretend to succeed - the ledger row
-        stays PENDING->SUCCESS already transitioned by updatePaymentStatus,
-        but the wallet credit itself failed and is visible in logs for
-        reconciliation (see the nodal-account reconciliation job)."""
+        state) AND propagate to the caller. This method is only ever invoked
+        after updatePaymentStatus has already committed the ledger's
+        PENDING->SUCCESS transition, so a failure here is a payment Razorpay
+        has captured and our own ledger marks SUCCESS, with the wallet never
+        credited - and the idempotency gate means there is no other chance
+        to retry it. Silently swallowing this (the previous behavior) would
+        make the failure invisible; re-raising surfaces it to whatever is
+        watching the caller (background-task error logging, error tracking,
+        or a future retry/dead-letter mechanism) instead of vanishing into a
+        print() line with nobody alerted."""
         conn = MagicMock()
         cursor = MagicMock()
         cursor.fetchone.return_value = {
@@ -203,7 +204,8 @@ class TestInsertUpdateWallet:
             "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
             return_value=conn,
         ):
-            RazorPayPersistence().insertUpdateWallet(42, "order_1")  # must not raise
+            with pytest.raises(Exception, match="connection reset by peer"):
+                RazorPayPersistence().insertUpdateWallet(42, "order_1")
 
         conn.rollback.assert_called_once()
         conn.commit.assert_not_called()
@@ -381,48 +383,3 @@ class TestInvokeCallToDatabaseGating:
             RazorPayManagerService().invokeCallToDatabase("order_xyz", "pay_abc", 99)
 
             instance.updatePaymentStatus.assert_called_once_with("order_xyz", "pay_abc", 99)
-
-
-class TestVerifyPaymentSignatureFromWebhook:
-    """verify_payment_signatureFromWebHook is the synchronous verification
-    path that both checks the HMAC signature AND performs the (idempotent)
-    DB update + wallet credit inline."""
-
-    def test_valid_signature_updates_status_and_credits_wallet(self):
-        fake_client = MagicMock()
-        fake_client.utility.verify_payment_signature.return_value = None  # no raise = valid
-
-        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
-             patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence, \
-             patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret"}):
-            instance = MockPersistence.return_value
-
-            result = RazorPayManagerService().verify_payment_signatureFromWebHook(
-                "order_1", "pay_1", "sig_ignored_since_client_is_mocked", 42
-            )
-
-        assert result is True
-        instance.updatePaymentStatus.assert_called_once_with("order_1", "pay_1", 42)
-        instance.insertUpdateWallet.assert_called_once_with(42, "order_1")
-
-    def test_invalid_signature_does_not_touch_database(self):
-        """An invalid/failed signature check must never reach the DB
-        update or wallet-credit calls, and must fail cleanly (return
-        False) rather than raising (fixed regression — the except block
-        previously did `print("..."+ex)` on an Exception instance,
-        raising its own TypeError instead of returning False)."""
-        fake_client = MagicMock()
-        fake_client.utility.verify_payment_signature.side_effect = Exception("Signature verification failed")
-
-        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
-             patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence, \
-             patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret"}):
-            instance = MockPersistence.return_value
-
-            result = RazorPayManagerService().verify_payment_signatureFromWebHook(
-                "order_1", "pay_1", "bad_sig", 42
-            )
-
-        assert result is False
-        instance.updatePaymentStatus.assert_not_called()
-        instance.insertUpdateWallet.assert_not_called()

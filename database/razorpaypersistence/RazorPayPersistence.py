@@ -1,3 +1,5 @@
+import logging
+
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from utils.query_loader import QueryLoader
 import psycopg2.extras
@@ -6,6 +8,8 @@ from dotenv import load_dotenv
 from enum import Enum
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class RazorPayPersistence:
@@ -152,7 +156,23 @@ class RazorPayPersistence:
         except Exception as ex:
             if conn:
                 conn.rollback()
-            print(f"Error in updating wallet: {str(ex)}")
+            # Deliberately re-raised, not swallowed: updatePaymentStatus
+            # already committed the ledger's PENDING->SUCCESS transition
+            # before this method runs, so a failure here is a payment
+            # Razorpay has captured and our own ledger already marks
+            # SUCCESS, with the wallet never credited - and because the
+            # idempotency gate treats this payment as already processed,
+            # there is no other opportunity to retry it. This must
+            # surface loudly (logged at ERROR with a traceback, and
+            # propagated to the caller) rather than vanish into a print()
+            # line, so it reaches whatever alerting/reconciliation is
+            # watching the application logs instead of being lost.
+            logger.error(
+                "Wallet credit failed for user %s, order %s - payment already marked SUCCESS "
+                "but wallet was NOT credited and cannot be retried automatically: %s",
+                userId, razorpay_order_id, str(ex), exc_info=True,
+            )
+            raise
         finally:
             if cursor is not None:
                 cursor.close()
