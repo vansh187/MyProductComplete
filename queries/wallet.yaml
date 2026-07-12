@@ -13,3 +13,8 @@ update_wallet_balance: |
   UPDATE wallets
   SET balance = %s
   WHERE user_id = %s
+
+increment_wallet_balance: |
+  UPDATE wallets
+  SET balance = COALESCE(balance, 0) + %s
+  WHERE user_id = %s

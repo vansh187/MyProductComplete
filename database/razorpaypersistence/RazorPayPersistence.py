@@ -1,6 +1,7 @@
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from utils.query_loader import QueryLoader
 import psycopg2.extras
+from decimal import Decimal
 from dotenv import load_dotenv
 from enum import Enum
 
@@ -77,6 +78,26 @@ class RazorPayPersistence:
                 cursor.close()
 
     def insertUpdateWallet(self, userId, razorpay_order_id):
+        """
+        Credits a wallet for a confirmed Razorpay payment.
+
+        Previously this read the current balance, added the transaction
+        amount in Python, then wrote the total back in a separate
+        unlocked UPDATE - a classic lost-update race: two concurrent
+        credits for the same user (a retried webhook alongside a trade
+        settlement credit, or two deposits landing close together) could
+        both read the same stale balance and the second write would
+        silently clobber the first, losing real money with no error.
+
+        Fixed by never computing the new balance in application code:
+        the existing-wallet path uses a single atomic
+        `balance = balance + %s` UPDATE (Postgres serializes this at the
+        row level with no read step to go stale), and the brand-new-wallet
+        path takes a `pg_advisory_xact_lock` keyed on userId before
+        deciding whether to INSERT, since a not-yet-existing row can't be
+        protected by a row lock - this closes the one remaining race
+        (two concurrent first-ever deposits for the same new user).
+        """
         conn = None
         cursor = None
         try:
@@ -91,41 +112,52 @@ class RazorPayPersistence:
                 print(f"No wallet_ledger record found for order {razorpay_order_id}, skipping wallet update")
                 return
 
-            # FIX: Convert transaction_amount from display units to proper currency
-            # Ensure amount is treated as a float/decimal for proper calculations
-            transaction_amount = float(walletRecord["transaction_amount"])
-            current_balance = float(walletRecord["balance"]) if walletRecord["balance"] is not None else 0.0
-
-            print(f"DEBUG: userId={userId}, current_balance={current_balance}, transaction_amount={transaction_amount}")
+            transaction_amount = Decimal(str(walletRecord["transaction_amount"]))
+            print(f"DEBUG: userId={userId}, transaction_amount={transaction_amount}")
 
             if walletRecord["wallet_id"] is None:
-                # Create new wallet with funds
-                new_balance = transaction_amount
+                # No wallet row exists yet - serialize concurrent first-time
+                # credits for this user (a row lock can't protect a row
+                # that doesn't exist yet), then re-check under the lock
+                # before deciding to INSERT vs increment.
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (userId,))
                 cursor.execute(
-                    QueryLoader.get('razorpay.yaml', 'insert_wallet'),
-                    (userId, new_balance)
+                    QueryLoader.get('wallet.yaml', 'get_wallet_balance_for_update'),
+                    (userId,)
                 )
-                conn.commit()
-                print(f"insert wallet record with new funds: balance={new_balance}")
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        QueryLoader.get('razorpay.yaml', 'insert_wallet'),
+                        (userId, transaction_amount)
+                    )
+                    print(f"insert wallet record with new funds: balance={transaction_amount}")
+                else:
+                    cursor.execute(
+                        QueryLoader.get('wallet.yaml', 'increment_wallet_balance'),
+                        (transaction_amount, userId)
+                    )
+                    print(f"Wallet was created concurrently before lock acquired; credited {transaction_amount}")
             else:
-                # Update existing wallet - ADD the transaction amount to current balance
-                newWalletBalance = current_balance + transaction_amount
-                print(f"DEBUG: newWalletBalance={newWalletBalance} (was {current_balance}, added {transaction_amount})")
+                # Wallet already exists - atomic increment, no separate
+                # read+write, so no lost-update race even without an
+                # explicit application-level lock.
                 cursor.execute(
-                    QueryLoader.get('razorpay.yaml', 'update_wallet_balance'),
-                    (newWalletBalance, userId)
+                    QueryLoader.get('wallet.yaml', 'increment_wallet_balance'),
+                    (transaction_amount, userId)
                 )
-                conn.commit()
-                print(f"Transaction update is success: new balance={newWalletBalance}")
+                print(f"Wallet credited atomically: +{transaction_amount} for user {userId}")
+
+            conn.commit()
         except Exception as ex:
             if conn:
                 conn.rollback()
             print(f"Error in updating wallet: {str(ex)}")
         finally:
-            if conn is not None:
-                conn.close()
             if cursor is not None:
                 cursor.close()
+            if conn is not None:
+                conn.close()
 
     def get_user_id_by_order_id(self, razorpay_order_id):
         conn = None
