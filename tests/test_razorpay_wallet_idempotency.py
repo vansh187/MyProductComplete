@@ -459,3 +459,115 @@ class TestVerifyWebhookSignature:
             result = RazorPayManagerService().verify_webhook_signature(b"{}", "bad_sig")
 
         assert result is False
+
+
+class TestVerifyPaymentSignature:
+    """
+    Guards against the fixed regression in verify_payment_signature()
+    (used by POST /v1/VerifyFundPayements, the client-side checkout
+    confirmation endpoint - confirmed actively called by the deployed
+    frontend): it received the client's real razorpay_signature as a
+    parameter but never used it, instead recomputing its own HMAC and
+    checking that self-computed value against itself - so it returned
+    True ("Payment Verified") for ANY order_id/payment_id pair regardless
+    of whether the actual signature the client sent was valid, tampered,
+    or garbage.
+
+    No mocking of the Razorpay SDK here - these compute real HMAC-SHA256
+    signatures the exact same way razorpay.utility.Utility.
+    verify_payment_signature() does internally (msg = "order_id|payment_id",
+    HMAC with the key secret), so a genuinely correct signature and a
+    genuinely wrong one are used, not simulated via mocks.
+    """
+
+    REAL_SECRET = "real_test_secret_key"
+
+    def _real_signature(self, order_id: str, payment_id: str, secret: str = None) -> str:
+        import hashlib
+        import hmac as hmac_module
+        secret = secret or self.REAL_SECRET
+        msg = f"{order_id}|{payment_id}"
+        return hmac_module.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def test_genuinely_valid_signature_is_accepted(self):
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        signature = self._real_signature(order_id, payment_id)
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=signature, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is True
+
+    def test_tampered_signature_is_rejected(self):
+        """Core regression test: before the fix, this returned True
+        regardless of what signature was passed in, because the function
+        ignored razorpay_signature entirely and verified its own
+        recomputed value against itself."""
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        forged_signature = "0" * 64  # syntactically valid-looking hex, but not a real HMAC
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=forged_signature, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_signature_for_different_order_is_rejected(self):
+        """A signature genuinely valid for one order_id/payment_id pair
+        must not verify against a different pair - proves the check is
+        bound to the actual request, not just 'any real-looking hash'."""
+        signature_for_other_order = self._real_signature("order_OTHER", "pay_OTHER")
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id="order_abc123", razorpay_payment_id="pay_xyz789",
+                razorpay_signature=signature_for_other_order, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_wrong_secret_produces_rejected_signature(self):
+        """A signature computed with a different secret than the one
+        actually configured must be rejected."""
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        signature_with_wrong_secret = self._real_signature(order_id, payment_id, secret="a_different_secret")
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=signature_with_wrong_secret, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_sdk_exception_returns_false_not_raised(self):
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id="order_abc123", razorpay_payment_id="pay_xyz789",
+                razorpay_signature=None, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_valid_signature_never_touches_the_database(self):
+        """The DB-write path in verify_payment_signature() is intentionally
+        dead code - the webhook remains the sole source of truth for
+        crediting wallets. Even a genuinely valid signature here must not
+        reach RazorPayPersistence at all."""
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        signature = self._real_signature(order_id, payment_id)
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}), \
+             patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=signature, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is True
+        MockPersistence.assert_not_called()
