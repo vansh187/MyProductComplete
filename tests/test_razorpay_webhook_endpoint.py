@@ -122,14 +122,19 @@ class TestRazorpayWebhookEndpointRealSignature:
         MockPersistence.return_value.insertUpdateWallet.assert_not_called()
 
     def test_wrong_secret_produces_rejected_signature(self):
-        """Simulates the exact regression this fix targets: if the wrong
-        secret were ever used (e.g. a stale hardcoded value instead of the
-        real configured one), a signature computed with the WRONG secret
-        must be rejected, not accepted."""
+        """Simulates the exact regression this fix targets: if a DIFFERENT
+        secret than the one actually configured in RAZORPAY_WEBHOOK_SECRET
+        were ever used (e.g. a stale hardcoded literal, or an out-of-sync
+        .env value), a signature computed with that wrong secret must be
+        rejected, not accepted. Deliberately does not assume any specific
+        string is "the wrong one" - WEBHOOK_9897 turned out to be the
+        REAL secret Razorpay's dashboard uses for this endpoint (confirmed
+        via a live test), so this just uses an arbitrary different value
+        instead of hardcoding an assumption about which literal is wrong."""
         app = _make_app()
         payload = _payment_captured_payload()
         body_bytes = json.dumps(payload).encode("utf-8")
-        wrong_signature = _sign(body_bytes, "WEBHOOK_9897")  # the old hardcoded literal
+        wrong_signature = _sign(body_bytes, "some_other_secret_not_configured_anywhere")
 
         with patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
             client = TestClient(app)
