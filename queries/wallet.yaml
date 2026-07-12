@@ -18,3 +18,8 @@ increment_wallet_balance: |
   UPDATE wallets
   SET balance = COALESCE(balance, 0) + %s
   WHERE user_id = %s
+
+debit_wallet_balance_if_sufficient: |
+  UPDATE wallets
+  SET balance = balance - %s
+  WHERE user_id = %s AND balance >= %s

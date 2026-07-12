@@ -103,14 +103,16 @@ class MockTradeExecution:
 
 
 @contextmanager
-def _client_with_wallet(balance_value, deduction_db_ok=True):
+def _client_with_wallet(balance_value):
     """
-    TestClient whose WalletBalanceService.getWalletBalance() returns a wallet
-    row with the given balance. balance_value=None simulates no wallet row.
+    TestClient whose WalletBalanceService.debitWalletIfSufficient() succeeds
+    or fails based on the given balance_value compared against whatever
+    amount a test's order actually requires (quantity * price, mirroring
+    api/orders.py's own calculation) - models the real atomic
+    check-and-debit semantics. getWalletBalance() is mocked separately: the
+    real code only consults it on the failure path now, to build a precise
+    error message or detect "no wallet row at all" (balance_value=None).
     OrderService and ExecutionEngine are mocked so no DB/matching runs.
-    The wallet-deduction DB write (api/orders.py's local
-    PostgresConnectionFactory import) is also mocked so a real Postgres
-    connection is never attempted.
     """
     from utils.auth_dependency import get_current_user
 
@@ -121,10 +123,16 @@ def _client_with_wallet(balance_value, deduction_db_ok=True):
 
     with patch("api.orders.WalletBalanceService") as MockWallet, \
          patch("api.orders.OrderService") as MockOrder, \
-         patch("api.orders.ExecutionEngine") as MockEngine, \
-         patch("database.PostgresConnectionFactory.PostgresConnectionFactory") as MockConnFactory:
+         patch("api.orders.ExecutionEngine") as MockEngine:
 
         mock_wallet_instance = MagicMock()
+
+        def debit_side_effect(user_id, amount):
+            if balance_value is None:
+                return False
+            return Decimal(str(balance_value)) >= Decimal(str(amount))
+
+        mock_wallet_instance.debitWalletIfSufficient.side_effect = debit_side_effect
         mock_wallet_instance.getWalletBalance.return_value = wallet_row
         MockWallet.return_value = mock_wallet_instance
 
@@ -137,13 +145,6 @@ def _client_with_wallet(balance_value, deduction_db_ok=True):
             "success": True, "status": "EXECUTED", "order_id": 101, "trade_id": 999
         }
         MockEngine.return_value = mock_engine_instance
-
-        if deduction_db_ok:
-            mock_conn = MagicMock()
-            mock_conn.cursor.return_value = MagicMock()
-            MockConnFactory.create_connection.return_value = mock_conn
-        else:
-            MockConnFactory.create_connection.side_effect = Exception("DB unreachable")
 
         yield TestClient(app, raise_server_exceptions=False), mock_wallet_instance, mock_order_instance, mock_engine_instance
 
@@ -830,9 +831,11 @@ class TestBuyOrderBalanceCheck:
         assert resp.json()["detail"] == "User wallet not initialized"
 
     def test_buy_wallet_missing_balance_key_returns_400(self):
-        """wallet row exists but has no 'balance' key at all -> dict.get()
-        default of 0 kicks in -> treated as insufficient funds (400), NOT
-        the same code path as a None-valued balance (see below)."""
+        """debitWalletIfSufficient fails (mocked False, as it would for a
+        wallet row with no usable balance), and the failure-path
+        getWalletBalance read tolerates a row with no 'balance' key at all
+        via dict.get()'s default of 0 -> still a clean 400 "insufficient
+        balance", not a crash."""
         from utils.auth_dependency import get_current_user
 
         app = _make_app()
@@ -841,6 +844,7 @@ class TestBuyOrderBalanceCheck:
         with patch("api.orders.WalletBalanceService") as MockWallet, \
              patch("api.orders.OrderService"), \
              patch("api.orders.ExecutionEngine"):
+            MockWallet.return_value.debitWalletIfSufficient.return_value = False
             MockWallet.return_value.getWalletBalance.return_value = {"user_id": 42}
             client = TestClient(app, raise_server_exceptions=False)
             resp = client.post("/orders", json=_buy_payload(quantity=5, price=100.00))
@@ -849,12 +853,12 @@ class TestBuyOrderBalanceCheck:
         assert "Insufficient balance" in resp.json()["detail"]
 
     def test_buy_wallet_balance_none_field_returns_400(self):
-        """Wallet row exists but balance is EXPLICITLY None (e.g. a NULL
-        DB column). `wallet.get("balance") or 0` treats a None/falsy
-        balance as ₹0, so this now returns a clean 400 "Insufficient
-        balance" instead of crashing Decimal(str(None)) into an opaque
-        500 (fixed regression — previously the `or 0` fallback was
-        missing and this raised decimal.InvalidOperation)."""
+        """debitWalletIfSufficient fails (mocked False, as it genuinely
+        would in Postgres since `balance >= %s` is never true against
+        NULL), and the failure-path getWalletBalance read tolerates a
+        row with balance EXPLICITLY None via `wallet.get("balance") or 0`
+        -> a clean 400 "Insufficient balance" instead of crashing
+        Decimal(str(None)) into an opaque 500."""
         from utils.auth_dependency import get_current_user
 
         app = _make_app()
@@ -863,6 +867,7 @@ class TestBuyOrderBalanceCheck:
         with patch("api.orders.WalletBalanceService") as MockWallet, \
              patch("api.orders.OrderService"), \
              patch("api.orders.ExecutionEngine"):
+            MockWallet.return_value.debitWalletIfSufficient.return_value = False
             MockWallet.return_value.getWalletBalance.return_value = {"user_id": 42, "balance": None}
             client = TestClient(app, raise_server_exceptions=False)
             resp = client.post("/orders", json=_buy_payload(quantity=5, price=100.00))
@@ -877,6 +882,7 @@ class TestBuyOrderBalanceCheck:
             resp = client.post("/orders", json=_buy_payload(price=None))
         assert resp.status_code == 400
         assert "require a valid price" in resp.json()["detail"]
+        wallet_svc.debitWalletIfSufficient.assert_not_called()
         wallet_svc.getWalletBalance.assert_not_called()
 
     def test_buy_insufficient_balance_does_not_create_order_or_execute(self):
@@ -885,15 +891,43 @@ class TestBuyOrderBalanceCheck:
         order_svc.create_order.assert_not_called()
         engine.execute_order.assert_not_called()
 
-    def test_buy_wallet_service_called_twice_check_then_deduct(self):
-        """WalletBalanceService.getWalletBalance() is invoked once for the
-        pre-flight balance check and a second time when computing the
-        deduction amount — two calls total for a single successful BUY."""
+    def test_buy_success_debits_wallet_exactly_once_atomically(self):
+        """The atomic debitWalletIfSufficient() call replaces the old
+        unlocked check-then-separately-deduct pattern - a successful BUY
+        calls it exactly once, and never calls getWalletBalance() at all
+        (that's reserved for the failure path only now)."""
         with _client_with_wallet(9999.00) as (client, wallet_svc, *_):
             resp = client.post("/orders", json=_buy_payload())
         assert resp.status_code == 200
-        assert wallet_svc.getWalletBalance.call_count == 2
-        wallet_svc.getWalletBalance.assert_called_with(_FAKE_USER["user_id"])
+        assert wallet_svc.debitWalletIfSufficient.call_count == 1
+        wallet_svc.getWalletBalance.assert_not_called()
+
+    def test_buy_order_creation_failure_refunds_the_debit(self):
+        """If order creation itself fails AFTER the wallet was already
+        atomically debited (a DB error unrelated to funds), the debit
+        must be refunded rather than leaving the user out of pocket for
+        an order that was never created."""
+        with _client_with_wallet(9999.00) as (client, wallet_svc, order_svc, *_):
+            order_svc.create_order.return_value = None
+            resp = client.post("/orders", json=_buy_payload(quantity=10, price=250.00))
+        assert resp.status_code == 500
+        wallet_svc.creditWalletStandalone.assert_called_once()
+        refund_user_id, refund_amount = wallet_svc.creditWalletStandalone.call_args.args
+        assert refund_user_id == _FAKE_USER["user_id"]
+        assert Decimal(str(refund_amount)) == Decimal("2500.00")
+
+    def test_buy_debit_db_error_fails_the_order_cleanly(self):
+        """A DB error during the atomic debit itself (e.g. connection
+        dropped) must fail the order with a clean 500, not silently
+        continue and let the order execute unfunded - this is the fixed
+        regression for the old post-creation debit's
+        `except: log and continue` bug (ticket A3)."""
+        with _client_with_wallet(9999.00) as (client, wallet_svc, order_svc, engine):
+            wallet_svc.debitWalletIfSufficient.side_effect = Exception("connection reset")
+            resp = client.post("/orders", json=_buy_payload())
+        assert resp.status_code == 500
+        order_svc.create_order.assert_not_called()
+        engine.execute_order.assert_not_called()
 
 
 class TestSellOrderNoBalanceCheck:

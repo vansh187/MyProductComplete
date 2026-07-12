@@ -18,3 +18,17 @@ class WalletBalanceService:
             return walletBalancePersistence.creditWallet(cursor, userId, amount)
         except Exception as ex:
             raise Exception(f"WalletBalanceService error: {str(ex)}") from ex
+
+    def debitWalletIfSufficient(self, userId, amount) -> bool:
+        try:
+            walletBalancePersistence = WalletBalancePersistence()
+            return walletBalancePersistence.debitWalletIfSufficient(userId, amount)
+        except Exception as ex:
+            raise Exception(f"WalletBalanceService error: {str(ex)}") from ex
+
+    def creditWalletStandalone(self, userId, amount) -> None:
+        try:
+            walletBalancePersistence = WalletBalancePersistence()
+            walletBalancePersistence.creditWalletStandalone(userId, amount)
+        except Exception as ex:
+            raise Exception(f"WalletBalanceService error: {str(ex)}") from ex

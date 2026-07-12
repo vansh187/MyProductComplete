@@ -27,6 +27,23 @@ def _cancel_after_margin_failure(order_service: OrderService, user_id: int, orde
         logger.error(f"Failed to auto-cancel order {order_id} after margin failure: {str(ex)}")
 
 
+def _refund_wallet_after_order_creation_failure(wallet_service: WalletBalanceService, user_id: int, amount: Decimal) -> None:
+    """Best-effort refund of a wallet debit taken atomically before order
+    creation, for the rare case order creation itself then fails (a DB
+    error unrelated to funds). Never raises - the caller is already about
+    to raise the real 500 for the order-creation failure, and that must
+    not be masked by a secondary refund error. A refund failure here is
+    logged at ERROR (not swallowed silently) since it leaves a user
+    debited for an order that was never created."""
+    try:
+        wallet_service.creditWalletStandalone(user_id, amount)
+    except Exception as ex:
+        logger.error(
+            f"Failed to refund wallet debit of {amount} for user {user_id} after order creation failed: {str(ex)}",
+            exc_info=True,
+        )
+
+
 # ============================================
 # API ENDPOINTS
 # ============================================
@@ -114,11 +131,21 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
         contract_type = instrument["contract_type"]
         side_value = order.side.value if hasattr(order.side, "value") else str(order.side)
 
-        # BUY order: Check wallet balance
-        # IMPORTANT: This check is done outside a transaction lock. Between this check
-        # and order creation, another request could reduce the wallet balance (race condition).
-        # TODO: Implement transaction-level wallet locking using SELECT...FOR UPDATE in a database transaction
-        # to prevent wallet double-spend attacks from concurrent orders.
+        # BUY order: atomically check-and-debit the wallet in a single
+        # statement, before creating the order.
+        #
+        # Previously this was an unlocked read-then-compare pre-check here,
+        # followed by a SEPARATE unlocked read-then-compute-then-write debit
+        # after order creation (below, now removed) that didn't even
+        # re-verify sufficiency at write time - two concurrent BUY orders
+        # could both pass the pre-check and both debit, overspending.
+        # debitWalletIfSufficient() (WalletBalancePersistence) closes this
+        # with a single `UPDATE ... SET balance = balance - %s WHERE
+        # balance >= %s`: Postgres serializes concurrent UPDATEs to the same
+        # row, so the second concurrent debit's sufficiency check is
+        # evaluated against the first debit's already-committed balance,
+        # never a stale read - and it costs one round trip instead of two
+        # reads plus a write.
         #
         # FUTURES BUY orders are excluded from this cash-debit path entirely:
         # a future has no premium, so debiting quantity*price as if it were
@@ -127,6 +154,8 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
         # OPTION BUY orders (opening or closing a short) keep this path
         # unchanged - buying an option, including buying one back to cover
         # a short, always costs real premium cash.
+        wallet_debited = False
+        wallet_service = WalletBalanceService()
         if order.side == OrderSide.BUY and contract_type != "FUTURES":
             if order.price is None or order.price <= 0:
                 raise HTTPException(
@@ -136,16 +165,20 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
 
             required_balance = Decimal(str(order.quantity)) * Decimal(str(order.price))
 
-            wallet_service = WalletBalanceService()
-            wallet = wallet_service.getWalletBalance(user_id)
+            if wallet_service.debitWalletIfSufficient(user_id, required_balance):
+                wallet_debited = True
+                logger.info(f"Wallet debited: user={user_id}, amount={required_balance}")
+            else:
+                # Debit didn't apply (insufficient funds or no wallet row) -
+                # only now do a plain read, purely to build a precise error
+                # message; the outcome itself was already determined
+                # atomically above, so this read isn't racy with anything.
+                wallet = wallet_service.getWalletBalance(user_id)
+                if wallet is None:
+                    logger.warning(f"No wallet found for user {user_id}")
+                    raise HTTPException(status_code=400, detail="User wallet not initialized")
 
-            if wallet is None:
-                logger.warning(f"No wallet found for user {user_id}")
-                raise HTTPException(status_code=400, detail="User wallet not initialized")
-
-            available_balance = Decimal(str(wallet.get("balance") or 0))
-
-            if available_balance < required_balance:
+                available_balance = Decimal(str(wallet.get("balance") or 0))
                 logger.warning(
                     f"Insufficient balance: user={user_id}, "
                     f"required={required_balance}, available={available_balance}"
@@ -160,6 +193,8 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
         order_id = order_service.create_order(order, user_id)
 
         if order_id is None or order_id <= 0:
+            if wallet_debited:
+                _refund_wallet_after_order_creation_failure(wallet_service, user_id, required_balance)
             raise HTTPException(status_code=500, detail="Failed to create order")
 
         logger.info(f"Order created: ID={order_id}, User={user_id}, Symbol={order.symbol}")
@@ -203,44 +238,6 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
                 logger.error(f"Margin engine error for order {order_id}, user {user_id}: {str(margin_ex)}")
                 _cancel_after_margin_failure(order_service, user_id, order_id)
                 raise HTTPException(status_code=500, detail="Failed to process margin for this order")
-
-        # For BUY orders: Deduct balance from wallet (funds are blocked)
-        # Excludes FUTURES BUY - see the matching exclusion on the pre-creation
-        # check above; futures margin was already blocked by check_and_block.
-        if order.side == OrderSide.BUY and contract_type != "FUTURES":
-            try:
-                blocked_amount = Decimal(str(order.quantity)) * Decimal(str(order.price))
-                wallet_service = WalletBalanceService()
-                wallet = wallet_service.getWalletBalance(user_id)
-                current_balance = Decimal(str(wallet.get("balance") or 0))
-                new_balance = current_balance - blocked_amount
-
-                # Update wallet in database
-                from database.PostgresConnectionFactory import PostgresConnectionFactory
-                from utils.query_loader import QueryLoader
-                conn = None
-                try:
-                    conn = PostgresConnectionFactory.create_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        QueryLoader.get('wallet.yaml', 'update_wallet_balance'),
-                        (new_balance, user_id)
-                    )
-                    conn.commit()
-                    logger.info(f"Wallet deducted: user={user_id}, amount={blocked_amount}, new_balance={new_balance}")
-                except Exception as ex:
-                    if conn:
-                        conn.rollback()
-                    logger.error(f"Error deducting wallet balance: {str(ex)}")
-                    # Don't fail the order if wallet deduction fails - log and continue
-                finally:
-                    if cursor:
-                        cursor.close()
-                    if conn:
-                        conn.close()
-            except Exception as ex:
-                logger.error(f"Error in wallet deduction logic: {str(ex)}")
-                # Don't fail the order due to wallet error
 
         # Execute order
         execution_engine = ExecutionEngine(order, order_id)
