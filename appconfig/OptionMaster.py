@@ -61,13 +61,40 @@ def get_strike_chain(underlying: str, expiry: str) -> dict[str, dict]:
 _BFO_UNDERLYINGS = {"SENSEX"}
 
 
+def _suffix_convention_alias(native_tsym: str, strike: str, infix_letter: str, suffix: str) -> str:
+    """
+    Converts Shoonya's native '{prefix}{C|P}{strike}' tradingsymbol (e.g.
+    'NIFTY14JUL26C23950', as stored in master_options.json / returned by
+    build_option_master.py) into the alternate '{prefix}{strike}{CE|PE}'
+    convention (e.g. 'NIFTY14JUL2623950CE') that OrderCreate's own field
+    description and callers historically assumed - these are NOT the same
+    string, and find_by_tsym() previously only matched the native form, so
+    any order/position lookup using the CE/PE-suffix convention silently
+    found nothing: token/exchange never resolved at order creation
+    (service/orderService.py), underlying/expiry/strike/option_type stayed
+    None at position building (service/positionService.py), and
+    margin_engine.resolve_contract_type() couldn't even recognize the
+    order as an OPTION - meaning margin could go unblocked entirely for an
+    option order using this convention. Returns "" (never matches) if
+    native_tsym doesn't end with infix_letter+strike as expected.
+    """
+    marker = infix_letter + strike
+    if not native_tsym.endswith(marker):
+        return ""
+    prefix = native_tsym[: -len(marker)]
+    return f"{prefix}{strike}{suffix}"
+
+
 def find_by_tsym(tsym: str) -> dict | None:
     """
     Reverse lookup for order placement and position building: tradingsymbol
-    (e.g. 'NIFTY07JUL2623800CE') -> {token, lot_size, exchange, underlying,
-    expiry, strike, option_type}. Tradingsymbols are unique per contract, so
-    this scans every underlying/expiry/strike without needing to parse the
-    symbol string.
+    -> {token, lot_size, exchange, underlying, expiry, strike, option_type}.
+    Accepts both Shoonya's native tradingsymbol convention
+    ('NIFTY14JUL26C23950' - C/P immediately after the expiry date) and the
+    CE/PE-suffix convention ('NIFTY14JUL2623950CE' - strike then CE/PE),
+    since callers have historically sent either. Tradingsymbols are unique
+    per contract, so this scans every underlying/expiry/strike without
+    needing to parse the symbol string.
     """
     if not tsym:
         return None
@@ -77,9 +104,11 @@ def find_by_tsym(tsym: str) -> dict | None:
             if expiry == "expiries":
                 continue
             for strike, info in strikes.items():
-                if info.get("ce_tsym", "").upper() == tsym:
+                ce_tsym = info.get("ce_tsym", "").upper()
+                pe_tsym = info.get("pe_tsym", "").upper()
+                if tsym == ce_tsym or tsym == _suffix_convention_alias(ce_tsym, strike, "C", "CE"):
                     leg_token, option_type = info["ce_token"], "CE"
-                elif info.get("pe_tsym", "").upper() == tsym:
+                elif tsym == pe_tsym or tsym == _suffix_convention_alias(pe_tsym, strike, "P", "PE"):
                     leg_token, option_type = info["pe_token"], "PE"
                 else:
                     continue

@@ -80,10 +80,15 @@ class OrderService:
                             f"keeping client-supplied exchange {order.exchange}"
                         )
 
-                if(os.getenv("IS_PROD_ENVIRONMENT") is True):
-                    order.source='LIVE'
+                # os.getenv() always returns a str or None, never the
+                # Python bool True - `os.getenv(...) is True` was always
+                # False regardless of the env var's actual value, so every
+                # order was silently persisted with source='SIMULATED'
+                # even in a real "prod" deployment.
+                if os.getenv("IS_PROD_ENVIRONMENT", "false").strip().lower() == "true":
+                    order.source = 'LIVE'
                 else:
-                    order.source='SIMULATED'
+                    order.source = 'SIMULATED'
                         
                 order_id = self.order_persistence.create_order(order, user_id)
 
