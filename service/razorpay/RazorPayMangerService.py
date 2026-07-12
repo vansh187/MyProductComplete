@@ -118,7 +118,7 @@ class RazorPayManagerService:
             # with THIS secret rather than .env's RAZORPAY_WEBHOOK_SECRET.
             # Put back to `webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")`
             # once done debugging - see commit dcbd203.
-            webhook_secret = "WEBHOOK_9897"
+            webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
             if not webhook_secret:
                 print("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
                 return False
