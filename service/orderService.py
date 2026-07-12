@@ -4,6 +4,7 @@ Production-grade code with comprehensive error handling
 """
 
 import logging
+from decimal import Decimal
 from typing import Optional, List, Dict, Any
 
 from appconfig import OptionMaster
@@ -11,6 +12,7 @@ from api.models import ExchangeType
 from database.orderPersistence import OrderPersistence
 from database.portfolioPersistence import portfolioPersistence
 from service.tradeHistoryService import TradeHistoryService
+from service.walletbalance.WalletBalanceService import WalletBalanceService
 from service.marginengine.margin_engine import MarginEngine
 from service.marginengine.exceptions import MarginEngineError
 from dotenv import load_dotenv
@@ -26,6 +28,7 @@ class OrderService:
         """Initialize OrderService."""
         self.order_persistence = OrderPersistence()
         self.margin_engine = MarginEngine()
+        self.wallet_service = WalletBalanceService()
         self.logger = logger
 
     def create_order(self, order: Any, user_id: int) -> int:
@@ -238,6 +241,18 @@ class OrderService:
         try:
             self.logger.info(f"Cancelling order {order_id} for user {user_id}")
 
+            # Fetch order details BEFORE cancelling - side/quantity/price/
+            # symbol/exchange never change after creation in this system
+            # (only status/filled_qty do), so reading them first is safe,
+            # and it's what lets us compute the correct wallet refund below
+            # without a second query racing against anything. cancel_order
+            # only ever matches status='PENDING' (queries/orders.yaml), and
+            # a partial fill flips status to PARTIALLY_EXECUTED before this
+            # can run - so a successful cancel here always means the FULL
+            # original quantity was unfilled; the full originally-debited
+            # amount (quantity * price) is always the correct refund.
+            order_details = self.order_persistence.get_order_by_id(user_id, order_id)
+
             was_cancelled = self.order_persistence.cancel_order_by_id(user_id, order_id)
 
             if was_cancelled:
@@ -252,6 +267,8 @@ class OrderService:
                         f"Margin release failed for cancelled order {order_id} "
                         f"(cancel already succeeded): {str(margin_ex)}"
                     )
+
+                self._refund_wallet_for_cancelled_buy_order(user_id, order_id, order_details)
             else:
                 self.logger.warning(f"No pending order found to cancel: {order_id}")
 
@@ -264,6 +281,74 @@ class OrderService:
         except Exception as ex:
             self.logger.error(f"Error cancelling order {order_id}: {str(ex)}")
             raise
+
+    def _refund_wallet_for_cancelled_buy_order(self, user_id: int, order_id: int,
+                                                order_details: Optional[Dict[str, Any]]) -> None:
+        """
+        Refunds the cash debited at order-creation time (api/orders.py) for
+        a BUY order (equity or OPTION BUY - never FUTURES, which was never
+        cash-debited in the first place) that just cancelled successfully.
+
+        Previously nothing refunded this at all: a user who placed a BUY
+        LIMIT order (debited immediately) and cancelled it before it filled
+        permanently lost that cash from their wallet with no way to get it
+        back - margin_engine.release_on_cancel() above only releases F&O
+        margin blocks, a separate subsystem from the cash wallet debit.
+
+        Safe to always refund the FULL original quantity*price: this only
+        runs after order_persistence.cancel_order_by_id() actually matched
+        a row, and that query only ever matches status='PENDING'
+        (queries/orders.yaml) - a partial fill flips status to
+        PARTIALLY_EXECUTED first (service/executionEngine.py), so a
+        successful cancel here is always for an order with zero fills.
+
+        Best-effort like the margin release above and
+        _refund_wallet_after_order_creation_failure in api/orders.py: the
+        cancellation itself has already committed by the time this runs,
+        so a refund failure must be logged loudly (not silently swallowed)
+        rather than raised - there is nothing left to roll back.
+        """
+        if not order_details:
+            self.logger.error(
+                f"Cannot refund wallet for cancelled order {order_id}: order details "
+                f"were not found despite the cancel succeeding - manual reconciliation needed"
+            )
+            return
+
+        side = order_details.get("side")
+        side_value = side.value if hasattr(side, "value") else str(side)
+        if side_value != "BUY":
+            return
+
+        price = order_details.get("price")
+        quantity = order_details.get("quantity")
+        if price is None or price <= 0 or quantity is None or quantity <= 0:
+            return
+
+        symbol = order_details.get("symbol")
+        exchange = order_details.get("exchange")
+        exchange_value = exchange.value if hasattr(exchange, "value") else str(exchange)
+
+        try:
+            instrument = self.margin_engine.resolve_contract_type(
+                symbol, exchange_value, fallback_lot_size=quantity
+            )
+            if instrument["contract_type"] == "FUTURES":
+                # Futures BUY was never cash-debited at creation - margin
+                # release above already covers it.
+                return
+
+            refund_amount = Decimal(str(quantity)) * Decimal(str(price))
+            self.wallet_service.creditWalletStandalone(user_id, refund_amount)
+            self.logger.info(
+                f"Wallet refunded for cancelled order {order_id}: user={user_id}, amount={refund_amount}"
+            )
+        except Exception as ex:
+            self.logger.error(
+                f"Failed to refund wallet of {quantity}*{price} for user {user_id} "
+                f"after cancelling order {order_id} (cancel already succeeded): {str(ex)}",
+                exc_info=True,
+            )
 
     def update_status(self, user_id: int, symbol: str, status: str,
                      buy_order_id: int, sell_order_id: int, cursor) -> None:
