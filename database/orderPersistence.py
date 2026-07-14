@@ -458,6 +458,152 @@ class OrderPersistence:
             if conn is not None:
                 conn.close()
 
+    @staticmethod
+    def set_broker_order_id(order_id: int, broker_order_id: str) -> None:
+        """
+        Persists the real Shoonya order number (norenordno) onto an order
+        immediately after a successful live placement
+        (LiveOrderRoutingService.place_live_order) - this is the lookup key
+        the order-update feed (service/orderUpdateService.py) uses to route
+        a broker fill/reject/cancel notification back to the right internal
+        order. A missed write here would leave a real, live broker order
+        with no way to route its fill back into positions/wallet.
+
+        Raises:
+            ValueError: If parameters are invalid
+            Exception: If the database write fails (caller must treat this
+                as a "status uncertain" case, same as any other post-placement
+                failure - the broker order still exists regardless)
+        """
+        if order_id is None or order_id <= 0:
+            raise ValueError("Order ID must be a positive integer")
+        if not broker_order_id or not str(broker_order_id).strip():
+            raise ValueError("broker_order_id cannot be empty")
+
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            if conn is None:
+                raise Exception("Failed to establish database connection")
+
+            cursor = conn.cursor()
+            query = QueryLoader.get('orders.yaml', 'set_broker_order_id')
+            if query is None:
+                raise Exception("Query 'set_broker_order_id' not found in orders.yaml")
+
+            cursor.execute(query, (broker_order_id, order_id))
+            conn.commit()
+
+            if cursor.rowcount == 0:
+                logger.error(f"set_broker_order_id() matched no row for order_id={order_id} - order may not exist")
+
+        except psycopg2.Error as db_error:
+            if conn:
+                conn.rollback()
+            logger.error(f"Database error setting broker_order_id for order {order_id}: {str(db_error)}")
+            raise Exception(f"Database error: {str(db_error)}") from db_error
+
+        except Exception as ex:
+            if conn:
+                conn.rollback()
+            logger.error(f"Error setting broker_order_id for order {order_id}: {str(ex)}")
+            raise Exception(f"Error setting broker_order_id: {str(ex)}") from ex
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+    @staticmethod
+    def get_order_by_id_only(order_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single order by ID with no user_id filter - used only by
+        OrderUpdateService's remarks-based fallback lookup (order updates are
+        a server-to-server broker notification, not a user request, so there
+        is no user_id to check against; the broker_order_id is the real
+        authorization boundary there).
+
+        Raises:
+            ValueError: If order_id is invalid
+            Exception: If the database operation fails
+        """
+        if order_id is None or order_id <= 0:
+            raise ValueError("Order ID must be a positive integer")
+
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            if conn is None:
+                raise Exception("Failed to establish database connection")
+
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = QueryLoader.get('orders.yaml', 'get_order_by_id_only')
+            if query is None:
+                raise Exception("Query 'get_order_by_id_only' not found in orders.yaml")
+
+            cursor.execute(query, (order_id,))
+            return cursor.fetchone()
+
+        except psycopg2.Error as db_error:
+            logger.error(f"Database error fetching order by id_only={order_id}: {str(db_error)}")
+            raise Exception(f"Database error: {str(db_error)}") from db_error
+
+        except Exception as ex:
+            logger.error(f"Error fetching order by id_only={order_id}: {str(ex)}")
+            raise Exception(f"Error fetching order by id_only: {str(ex)}") from ex
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+    @staticmethod
+    def get_order_by_broker_order_id(broker_order_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Looks up the internal order for a real Shoonya order number - the
+        entry point the order-update feed uses to route a broker fill/
+        reject/cancel notification (service/orderUpdateService.py).
+
+        Raises:
+            ValueError: If broker_order_id is empty
+            Exception: If the database operation fails
+        """
+        if not broker_order_id or not str(broker_order_id).strip():
+            raise ValueError("broker_order_id cannot be empty")
+
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            if conn is None:
+                raise Exception("Failed to establish database connection")
+
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = QueryLoader.get('orders.yaml', 'get_order_by_broker_order_id')
+            if query is None:
+                raise Exception("Query 'get_order_by_broker_order_id' not found in orders.yaml")
+
+            cursor.execute(query, (broker_order_id,))
+            return cursor.fetchone()
+
+        except psycopg2.Error as db_error:
+            logger.error(f"Database error fetching order by broker_order_id={broker_order_id}: {str(db_error)}")
+            raise Exception(f"Database error: {str(db_error)}") from db_error
+
+        except Exception as ex:
+            logger.error(f"Error fetching order by broker_order_id={broker_order_id}: {str(ex)}")
+            raise Exception(f"Error fetching order by broker_order_id: {str(ex)}") from ex
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
 
 # Legacy function names for backward compatibility
 def create_order(order, user_id):

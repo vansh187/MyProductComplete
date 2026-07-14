@@ -196,12 +196,60 @@ class TestModifyOrderEndpoint:
         _, delta = MockWallet.return_value.debitWalletIfSufficient.call_args.args
         assert Decimal(str(delta)) == Decimal("12500.00")
 
+    @patch("api.orders.MarginEngine")
+    @patch("api.orders.WalletBalanceService")
+    @patch("api.orders.OrderService")
+    def test_live_broker_order_cannot_be_modified(self, MockOrderService, MockWallet, MockMargin):
+        """An order already routed to the real Shoonya broker
+        (broker_order_id set) must be blocked outright - modifying only the
+        internal row here would desync from the real resting order, which
+        keeps filling on its original, unmodified terms at the exchange."""
+        MockOrderService.return_value.get_order_by_id.return_value = _equity_buy_order(
+            symbol="NIFTY14JUL2623950CE", exchange="NFO", broker_order_id="20052000000017",
+        )
+        client = _make_client()
+        resp = client.put("/orders/101", json={"price": 105.0})
+
+        assert resp.status_code == 400
+        assert "broker" in resp.json()["detail"].lower()
+        MockOrderService.return_value.modify_order_by_id.assert_not_called()
+        MockWallet.return_value.debitWalletIfSufficient.assert_not_called()
+
     def test_negative_or_zero_price_is_rejected_by_pydantic(self):
         client = _make_client()
         resp = client.put("/orders/101", json={"price": 0})
         assert resp.status_code == 422
         resp = client.put("/orders/101", json={"quantity": -5})
         assert resp.status_code == 422
+
+
+class TestCancelOrderLiveGuard:
+
+    @patch("api.orders.OrderService")
+    def test_live_broker_order_cannot_be_cancelled(self, MockOrderService):
+        """Same reasoning as the modify guard above: cancelling only the
+        internal row for an order already routed to the real broker would
+        refund the wallet/release margin while the real order stays resting
+        and can still fill for real later - an unfunded real position."""
+        MockOrderService.return_value.get_order_by_id.return_value = _equity_buy_order(
+            symbol="NIFTY14JUL2623950CE", exchange="NFO", broker_order_id="20052000000017",
+        )
+        client = _make_client()
+        resp = client.post("/orders/101/cancel")
+
+        assert resp.status_code == 400
+        assert "broker" in resp.json()["detail"].lower()
+        MockOrderService.return_value.cancel_order_by_id.assert_not_called()
+
+    @patch("api.orders.OrderService")
+    def test_non_live_order_cancels_normally(self, MockOrderService):
+        MockOrderService.return_value.get_order_by_id.return_value = _equity_buy_order()
+        MockOrderService.return_value.cancel_order_by_id.return_value = True
+        client = _make_client()
+        resp = client.post("/orders/101/cancel")
+
+        assert resp.status_code == 200
+        MockOrderService.return_value.cancel_order_by_id.assert_called_once_with(42, 101)
 
     @patch("api.orders.MarginEngine")
     @patch("api.orders.WalletBalanceService")

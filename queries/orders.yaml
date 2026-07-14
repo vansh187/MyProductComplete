@@ -4,13 +4,13 @@ create_order: |
   RETURNING id
 
 get_orders: |
-  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, created_at, updated_at
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, created_at, updated_at
   FROM orders
   WHERE user_id = %s
   ORDER BY created_at DESC
 
 get_order_by_id: |
-  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, created_at, updated_at
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, created_at, updated_at
   FROM orders
   WHERE user_id = %s AND id = %s
 
@@ -18,6 +18,25 @@ get_order_snapshot_by_id: |
   SELECT symbol, broker, source, token, lot_size, product_type, exchange
   FROM orders
   WHERE id = %s
+
+set_broker_order_id: |
+  UPDATE orders
+  SET broker_order_id = %s, updated_at = NOW()
+  WHERE id = %s
+
+get_order_by_broker_order_id: |
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, lot_size, token, created_at, updated_at
+  FROM orders
+  WHERE broker_order_id = %s
+
+get_order_by_id_only: |
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, lot_size, token, created_at, updated_at
+  FROM orders
+  WHERE id = %s
+
+insert_processed_broker_fill: |
+  INSERT INTO processed_broker_fills (flid, order_id)
+  VALUES (%s, %s)
 
 cancel_order: |
   UPDATE orders

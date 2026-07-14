@@ -20,6 +20,7 @@ from api.topMovers import router as topMoversRouter, start_background_refresh as
 from api.candles import router as candlesRouter
 from api.optionChain import router as optionChainRouter, _optionChainService
 from service.positionTickService import positionTickService
+from service.orderUpdateService import OrderUpdateService
 from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
 from appconfig.FutureMaster import schedule_daily_refresh as future_master_daily_refresh
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,6 +153,14 @@ async def lifespan(app: FastAPI):
                 option_feed.start()
                 _optionChainService.set_feed(option_feed)
                 positionTickService.set_feed(option_feed)
+                # Live Shoonya order placement (POST /createLiveOrder) - real
+                # fill/reject/cancel notifications for the master account
+                # arrive on this SAME WebSocket (Shoonya's order updates and
+                # price ticks share one connection) and are the sole source
+                # of truth for those orders' positions/status.
+                order_update_service = OrderUpdateService()
+                option_feed.on_order_update(order_update_service.handle_order_update)
+                app.state.order_update_service = order_update_service
                 app.state.option_feed = option_feed
                 print("App starting... Option chain WebSocket feed started.")
             except Exception as e:

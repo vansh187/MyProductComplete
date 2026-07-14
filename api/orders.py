@@ -1,13 +1,21 @@
 import logging
 from decimal import Decimal
+from typing import Any, Dict, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from utils.auth_dependency import get_current_user
 from service.orderService import OrderService
 from service.executionEngine import ExecutionEngine
 from service.walletbalance.WalletBalanceService import WalletBalanceService
 from service.marginengine.margin_engine import MarginEngine
 from service.marginengine.exceptions import InsufficientMarginError, MarginEngineError, ReferencePriceUnresolvedError
+from service.liveOrderRoutingService import (
+    LiveOrderRoutingService,
+    LiveOrderRejectedError,
+    LiveOrderStatusUncertainError,
+    LotSizeMismatchError,
+    live_orders_enabled,
+)
 
 from api.models import OrderCreate, OrderModify, OrderSide, OrderType
 
@@ -88,9 +96,152 @@ def get_orders(current_user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="Failed to retrieve orders")
 
 
+def _create_order_row_with_checks(order: OrderCreate, user_id: int) -> Tuple[int, Optional[str], Dict[str, Any], MarginEngine, OrderService]:
+    """
+    Shared by both POST /orders (simulated, peer-matched) and POST
+    /createLiveOrder (real Shoonya order) - this is every DB-writing step
+    that happens regardless of how the order is ultimately executed: F&O
+    contract resolution, wallet debit-for-cash-BUY, the orders-table row
+    itself, and F&O margin check+block. Factored out (rather than
+    copy-pasted into the new live-order endpoint) so a future fix to any of
+    this logic can't be applied to one endpoint and missed on the other.
+
+    Raises HTTPException directly on any failure (funds/margin/creation),
+    exactly as create_order always has - callers should let it propagate
+    straight to FastAPI, not catch it.
+
+    Returns:
+        (order_id, contract_type, instrument, margin_engine, order_service)
+    """
+    # F&O classification, resolved up front so both the BUY and SELL
+    # branches below know whether this order needs the margin engine
+    # (OPTION/FUTURES) instead of - or in addition to - the cash-based
+    # wallet checks. contract_type is None for equity/unrecognized
+    # instruments, in which case behavior is completely unchanged from
+    # before the margin engine existed.
+    margin_engine = MarginEngine()
+    instrument = margin_engine.resolve_contract_type(
+        order.symbol, order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange),
+        fallback_lot_size=order.quantity,
+    )
+    contract_type = instrument["contract_type"]
+    side_value = order.side.value if hasattr(order.side, "value") else str(order.side)
+
+    # BUY order: atomically check-and-debit the wallet in a single
+    # statement, before creating the order.
+    #
+    # Previously this was an unlocked read-then-compare pre-check here,
+    # followed by a SEPARATE unlocked read-then-compute-then-write debit
+    # after order creation (below, now removed) that didn't even
+    # re-verify sufficiency at write time - two concurrent BUY orders
+    # could both pass the pre-check and both debit, overspending.
+    # debitWalletIfSufficient() (WalletBalancePersistence) closes this
+    # with a single `UPDATE ... SET balance = balance - %s WHERE
+    # balance >= %s`: Postgres serializes concurrent UPDATEs to the same
+    # row, so the second concurrent debit's sufficiency check is
+    # evaluated against the first debit's already-committed balance,
+    # never a stale read - and it costs one round trip instead of two
+    # reads plus a write.
+    #
+    # FUTURES BUY orders are excluded from this cash-debit path entirely:
+    # a future has no premium, so debiting quantity*price as if it were
+    # a cash purchase would be wrong - futures margin (both BUY and
+    # SELL) is handled below via MarginEngine.check_and_block() instead.
+    # OPTION BUY orders (opening or closing a short) keep this path
+    # unchanged - buying an option, including buying one back to cover
+    # a short, always costs real premium cash.
+    wallet_debited = False
+    required_balance = None
+    wallet_service = WalletBalanceService()
+    if order.side == OrderSide.BUY and contract_type != "FUTURES":
+        if order.price is None or order.price <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="BUY orders require a valid price"
+            )
+
+        required_balance = Decimal(str(order.quantity)) * Decimal(str(order.price))
+
+        if wallet_service.debitWalletIfSufficient(user_id, required_balance):
+            wallet_debited = True
+            logger.info(f"Wallet debited: user={user_id}, amount={required_balance}")
+        else:
+            # Debit didn't apply (insufficient funds or no wallet row) -
+            # only now do a plain read, purely to build a precise error
+            # message; the outcome itself was already determined
+            # atomically above, so this read isn't racy with anything.
+            wallet = wallet_service.getWalletBalance(user_id)
+            if wallet is None:
+                logger.warning(f"No wallet found for user {user_id}")
+                raise HTTPException(status_code=400, detail="User wallet not initialized")
+
+            available_balance = Decimal(str(wallet.get("balance") or 0))
+            logger.warning(
+                f"Insufficient balance: user={user_id}, "
+                f"required={required_balance}, available={available_balance}"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient balance. Required: ₹{required_balance:.2f}, Available: ₹{available_balance:.2f}"
+            )
+
+    # Create order in database
+    order_service = OrderService()
+    order_id = order_service.create_order(order, user_id)
+
+    if order_id is None or order_id <= 0:
+        if wallet_debited:
+            _refund_wallet_after_order_creation_failure(wallet_service, user_id, required_balance)
+        raise HTTPException(status_code=500, detail="Failed to create order")
+
+    logger.info(f"Order created: ID={order_id}, User={user_id}, Symbol={order.symbol}")
+
+    # F&O margin check + block, for any order the margin engine actually
+    # requires margin for (options SELL, futures BUY/SELL). Runs after
+    # order creation because the margin block row references order_id.
+    # On any margin failure the just-created order is cancelled (mirrors
+    # the existing fail-fast behavior of the equity wallet check above)
+    # so no order is left resting without margin behind it.
+    #
+    # order.exchange is authoritative here: OrderService.create_order()
+    # (just called above) server-resolves it from OptionMaster for any
+    # symbol it recognizes (see service/orderService.py) - the same
+    # exchange TradeSettlementService later uses to route fills.
+    margin_check_exchange = order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange)
+
+    if margin_engine.is_margin_required(margin_check_exchange, side_value, contract_type):
+        try:
+            margin_check = margin_engine.check_and_block(order, order_id, user_id)
+            logger.info(
+                f"Margin check passed: order={order_id}, user={user_id}, "
+                f"required_margin={margin_check.required_margin}"
+            )
+        except InsufficientMarginError as margin_ex:
+            logger.warning(f"Insufficient margin for order {order_id}, user {user_id}: {str(margin_ex)}")
+            _cancel_after_margin_failure(order_service, user_id, order_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient margin. Required: ₹{margin_ex.required_margin:.2f}, "
+                       f"Available: ₹{margin_ex.available_balance:.2f}, Shortfall: ₹{margin_ex.shortfall:.2f}"
+            )
+        except ReferencePriceUnresolvedError as margin_ex:
+            logger.error(f"Reference price unresolved for order {order_id}, user {user_id}: {str(margin_ex)}")
+            _cancel_after_margin_failure(order_service, user_id, order_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not resolve a reliable reference price for {margin_ex.tsym}. Please try again."
+            )
+        except MarginEngineError as margin_ex:
+            logger.error(f"Margin engine error for order {order_id}, user {user_id}: {str(margin_ex)}")
+            _cancel_after_margin_failure(order_service, user_id, order_id)
+            raise HTTPException(status_code=500, detail="Failed to process margin for this order")
+
+    return order_id, contract_type, instrument, margin_engine, order_service
+
+
 @router.post("/orders")
 def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
-    
+
     """
     Create a new order with wallet balance validation.
 
@@ -117,127 +268,7 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
             logger.error("create_order() received None order")
             raise HTTPException(status_code=400, detail="Order cannot be None")
 
-        # F&O classification, resolved up front so both the BUY and SELL
-        # branches below know whether this order needs the margin engine
-        # (OPTION/FUTURES) instead of - or in addition to - the cash-based
-        # wallet checks. contract_type is None for equity/unrecognized
-        # instruments, in which case behavior is completely unchanged from
-        # before the margin engine existed.
-        margin_engine = MarginEngine()
-        instrument = margin_engine.resolve_contract_type(
-            order.symbol, order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange),
-            fallback_lot_size=order.quantity,
-        )
-        contract_type = instrument["contract_type"]
-        side_value = order.side.value if hasattr(order.side, "value") else str(order.side)
-
-        # BUY order: atomically check-and-debit the wallet in a single
-        # statement, before creating the order.
-        #
-        # Previously this was an unlocked read-then-compare pre-check here,
-        # followed by a SEPARATE unlocked read-then-compute-then-write debit
-        # after order creation (below, now removed) that didn't even
-        # re-verify sufficiency at write time - two concurrent BUY orders
-        # could both pass the pre-check and both debit, overspending.
-        # debitWalletIfSufficient() (WalletBalancePersistence) closes this
-        # with a single `UPDATE ... SET balance = balance - %s WHERE
-        # balance >= %s`: Postgres serializes concurrent UPDATEs to the same
-        # row, so the second concurrent debit's sufficiency check is
-        # evaluated against the first debit's already-committed balance,
-        # never a stale read - and it costs one round trip instead of two
-        # reads plus a write.
-        #
-        # FUTURES BUY orders are excluded from this cash-debit path entirely:
-        # a future has no premium, so debiting quantity*price as if it were
-        # a cash purchase would be wrong - futures margin (both BUY and
-        # SELL) is handled below via MarginEngine.check_and_block() instead.
-        # OPTION BUY orders (opening or closing a short) keep this path
-        # unchanged - buying an option, including buying one back to cover
-        # a short, always costs real premium cash.
-        wallet_debited = False
-        wallet_service = WalletBalanceService()
-        if order.side == OrderSide.BUY and contract_type != "FUTURES":
-            if order.price is None or order.price <= 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="BUY orders require a valid price"
-                )
-
-            required_balance = Decimal(str(order.quantity)) * Decimal(str(order.price))
-
-            if wallet_service.debitWalletIfSufficient(user_id, required_balance):
-                wallet_debited = True
-                logger.info(f"Wallet debited: user={user_id}, amount={required_balance}")
-            else:
-                # Debit didn't apply (insufficient funds or no wallet row) -
-                # only now do a plain read, purely to build a precise error
-                # message; the outcome itself was already determined
-                # atomically above, so this read isn't racy with anything.
-                wallet = wallet_service.getWalletBalance(user_id)
-                if wallet is None:
-                    logger.warning(f"No wallet found for user {user_id}")
-                    raise HTTPException(status_code=400, detail="User wallet not initialized")
-
-                available_balance = Decimal(str(wallet.get("balance") or 0))
-                logger.warning(
-                    f"Insufficient balance: user={user_id}, "
-                    f"required={required_balance}, available={available_balance}"
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Insufficient balance. Required: ₹{required_balance:.2f}, Available: ₹{available_balance:.2f}"
-                )
-
-        # Create order in database
-        order_service = OrderService()
-        order_id = order_service.create_order(order, user_id)
-
-        if order_id is None or order_id <= 0:
-            if wallet_debited:
-                _refund_wallet_after_order_creation_failure(wallet_service, user_id, required_balance)
-            raise HTTPException(status_code=500, detail="Failed to create order")
-
-        logger.info(f"Order created: ID={order_id}, User={user_id}, Symbol={order.symbol}")
-
-        # F&O margin check + block, for any order the margin engine actually
-        # requires margin for (options SELL, futures BUY/SELL). Runs after
-        # order creation because the margin block row references order_id.
-        # On any margin failure the just-created order is cancelled (mirrors
-        # the existing fail-fast behavior of the equity wallet check above)
-        # so no order is left resting without margin behind it.
-        #
-        # order.exchange is authoritative here: OrderService.create_order()
-        # (just called above) server-resolves it from OptionMaster for any
-        # symbol it recognizes (see service/orderService.py) - the same
-        # exchange TradeSettlementService later uses to route fills.
-        margin_check_exchange = order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange)
-
-        if margin_engine.is_margin_required(margin_check_exchange, side_value, contract_type):
-            try:
-                margin_check = margin_engine.check_and_block(order, order_id, user_id)
-                logger.info(
-                    f"Margin check passed: order={order_id}, user={user_id}, "
-                    f"required_margin={margin_check.required_margin}"
-                )
-            except InsufficientMarginError as margin_ex:
-                logger.warning(f"Insufficient margin for order {order_id}, user {user_id}: {str(margin_ex)}")
-                _cancel_after_margin_failure(order_service, user_id, order_id)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Insufficient margin. Required: ₹{margin_ex.required_margin:.2f}, "
-                           f"Available: ₹{margin_ex.available_balance:.2f}, Shortfall: ₹{margin_ex.shortfall:.2f}"
-                )
-            except ReferencePriceUnresolvedError as margin_ex:
-                logger.error(f"Reference price unresolved for order {order_id}, user {user_id}: {str(margin_ex)}")
-                _cancel_after_margin_failure(order_service, user_id, order_id)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Could not resolve a reliable reference price for {margin_ex.tsym}. Please try again."
-                )
-            except MarginEngineError as margin_ex:
-                logger.error(f"Margin engine error for order {order_id}, user {user_id}: {str(margin_ex)}")
-                _cancel_after_margin_failure(order_service, user_id, order_id)
-                raise HTTPException(status_code=500, detail="Failed to process margin for this order")
+        order_id, contract_type, instrument, margin_engine, order_service = _create_order_row_with_checks(order, user_id)
 
         # Execute order
         execution_engine = ExecutionEngine(order, order_id)
@@ -265,6 +296,130 @@ def create_order(order: OrderCreate, current_user=Depends(get_current_user)):
         logger.error(f"Exception type: {type(ex).__name__}")
         logger.error(f"Full traceback:", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to create order: {str(ex)}")
+
+
+@router.post("/createLiveOrder")
+def create_live_order(request: Request, order: OrderCreate, current_user=Depends(get_current_user)):
+    """
+    Places a REAL order on the Shoonya master account for an F&O
+    (OPTION/FUTURES) order - separate from POST /orders (which always
+    peer-matches internally) so the existing simulated path is completely
+    untouched and this live path can be reasoned about/rolled back
+    independently.
+
+    Gated by SHOONYA_LIVE_ORDERS_ENABLED (see
+    service/liveOrderRoutingService.live_orders_enabled) - a single .env
+    switch between real and simulated. F&O orders placed through here do
+    NOT participate in internal peer-matching at all: the broker is the
+    sole source of truth for the fill (see service/orderUpdateService.py),
+    which is why this is a dedicated endpoint rather than a mode of the
+    existing one.
+
+    Reuses _create_order_row_with_checks (same wallet/margin/order-creation
+    logic as POST /orders) so both endpoints stay in sync automatically.
+
+    Raises:
+        HTTPException: If disabled, not F&O, quantity isn't a lot-size
+            multiple, funds/margin fail, or the broker call itself fails
+    """
+    try:
+        if current_user is None or "user_id" not in current_user:
+            logger.error("create_live_order() received invalid current_user")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        user_id = current_user["user_id"]
+
+        if order is None:
+            raise HTTPException(status_code=400, detail="Order cannot be None")
+
+        if not live_orders_enabled():
+            raise HTTPException(
+                status_code=400,
+                detail="Live order routing is currently disabled (SHOONYA_LIVE_ORDERS_ENABLED is not set to true)"
+            )
+
+        shoonya = getattr(request.app.state, "shoonya", None)
+        shoonya_api = getattr(shoonya, "_api", None) if shoonya is not None else None
+        if shoonya_api is None or not getattr(shoonya, "is_connected", False):
+            logger.error("create_live_order() called with no live Shoonya session")
+            raise HTTPException(status_code=503, detail="Shoonya session is not connected - cannot place a live order")
+
+        # Pre-check contract type and lot size BEFORE any DB writes/wallet
+        # debit, so a request for an equity symbol or a bad quantity fails
+        # cleanly with zero side effects - no order row, no wallet touch,
+        # nothing to unwind.
+        exchange_value = order.exchange.value if hasattr(order.exchange, "value") else str(order.exchange)
+        margin_engine_probe = MarginEngine()
+        instrument_probe = margin_engine_probe.resolve_contract_type(
+            order.symbol, exchange_value, fallback_lot_size=order.quantity
+        )
+        if instrument_probe["contract_type"] not in ("OPTION", "FUTURES"):
+            raise HTTPException(
+                status_code=400,
+                detail="createLiveOrder only supports F&O (OPTION/FUTURES) symbols - use POST /orders for equity"
+            )
+
+        lot_size = instrument_probe.get("lot_size")
+        if lot_size and order.quantity % lot_size != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Quantity must be a multiple of the lot size ({lot_size})"
+            )
+
+        order_id, contract_type, instrument, margin_engine, order_service = _create_order_row_with_checks(order, user_id)
+
+        live_order_routing_service = LiveOrderRoutingService(shoonya_api)
+        try:
+            live_result = live_order_routing_service.place_live_order(order, order_id, instrument)
+        except LotSizeMismatchError as lot_ex:
+            # Re-checked here since instrument (from _create_order_row_with_checks,
+            # which re-resolves the contract independently of instrument_probe
+            # above) is the authoritative source used for the actual placement -
+            # the pre-check above is a fast-fail convenience, not the only guard.
+            order_service.cancel_order_by_id(user_id, order_id)
+            raise HTTPException(status_code=400, detail=str(lot_ex))
+        except LiveOrderRejectedError as reject_ex:
+            # Broker explicitly said no - safe to cancel, which reuses the
+            # existing cancel path's wallet refund + margin release +
+            # order_book cancellation (OrderService.cancel_order_by_id) so
+            # nothing is left inconsistent.
+            order_service.cancel_order_by_id(user_id, order_id)
+            raise HTTPException(status_code=400, detail=f"Broker rejected the order: {reject_ex.reason}")
+        except LiveOrderStatusUncertainError as uncertain_ex:
+            # Deliberately NOT cancelled - the order may have actually gone
+            # through at the broker even though we didn't get clean
+            # confirmation. Left exactly as-is for manual reconciliation.
+            logger.error(
+                f"Live order status uncertain for order_id={order_id}, user={user_id}: {str(uncertain_ex)}",
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=202,
+                detail="Order was submitted but broker confirmation timed out - check order status before retrying"
+            )
+
+        logger.info(
+            f"Live order created: order_id={order_id}, broker_order_id={live_result['broker_order_id']}, "
+            f"user={user_id}, symbol={order.symbol}"
+        )
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "broker_order_id": live_result["broker_order_id"],
+            "status": live_result["status"],
+        }
+
+    except HTTPException:
+        raise
+
+    except ValueError as val_error:
+        logger.error(f"Validation error in create_live_order: {str(val_error)}")
+        raise HTTPException(status_code=400, detail=str(val_error))
+
+    except Exception as ex:
+        logger.error(f"Error creating live order: {str(ex)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create live order: {str(ex)}")
 
 
 @router.get("/orders/{order_id}")
@@ -345,6 +500,21 @@ def cancel_order(order_id: int, current_user=Depends(get_current_user)):
             raise HTTPException(status_code=400, detail="Invalid order ID")
 
         order_service = OrderService()
+        existing_order = order_service.get_order_by_id(user_id, order_id)
+        if existing_order is not None and existing_order.get("broker_order_id"):
+            # A real, live Shoonya order - this endpoint only ever touches
+            # internal state (wallet refund/margin release/order_book), it
+            # never calls the broker's own cancel_order. Cancelling "cleanly"
+            # here while the real order stays resting at the exchange would
+            # let it fill for real later with the wallet already refunded -
+            # a direct path to an unfunded real position. Blocked outright
+            # until live-order cancel is built, rather than half-supported.
+            raise HTTPException(
+                status_code=400,
+                detail="This order was routed to the real broker and cannot be cancelled here yet. "
+                       "Live-order cancellation isn't supported - manage it directly via the broker."
+            )
+
         was_cancelled = order_service.cancel_order_by_id(user_id, order_id)
 
         if not was_cancelled:
@@ -412,6 +582,17 @@ def modify_order(order_id: int, modify: OrderModify, current_user=Depends(get_cu
 
         if existing_order is None:
             raise HTTPException(status_code=404, detail="Order not found")
+
+        if existing_order.get("broker_order_id"):
+            # Same reasoning as cancel_order() above - modifying only the
+            # internal row would desync from the real resting order at the
+            # broker (wrong price/qty tracked internally while the real
+            # order fills on its original terms). Blocked outright.
+            raise HTTPException(
+                status_code=400,
+                detail="This order was routed to the real broker and cannot be modified here yet. "
+                       "Live-order modification isn't supported - cancel/replace directly via the broker."
+            )
 
         status_value = existing_order.get("status")
         status_value = status_value.value if hasattr(status_value, "value") else str(status_value)
