@@ -1,5 +1,3 @@
-import hmac
-import hashlib
 import razorpay
 import os
 from dotenv import load_dotenv
@@ -66,53 +64,62 @@ class RazorPayManagerService:
         """
         Step 2: Cryptographically verifies the payment signature returned by the frontend checkout window.
         Returns True if authentic, False if compromised.
+
+        Fixed regression: this previously recomputed its own HMAC from
+        order_id|payment_id and handed that SELF-COMPUTED value to the SDK
+        as the "razorpay_signature" to check - meaning it always verified
+        against itself and returned True for any order_id/payment_id pair,
+        regardless of whether the razorpay_signature the client actually
+        sent was valid, tampered, or garbage. The SDK call below now
+        receives the caller's real razorpay_signature parameter, exactly
+        the same delegation pattern verify_webhook_signature() already
+        uses correctly - the SDK does its own internal HMAC recomputation
+        and comparison, so no manual hmac/hashlib work belongs here at all.
+
+        This is a client-facing UI confirmation only (the DB-write path
+        below remains intentionally dead/commented out) - the webhook
+        (verify_webhook_signature / invokeCallToDatabase) is the sole
+        source of truth for actually crediting a wallet, since it's a
+        server-to-server call authenticated independently of anything the
+        client controls. Re-enabling that dead code without this fix
+        would have been a real financial hole, not just a misleading UI.
         """
-        # Construct the expected raw text blob payload
         try:
                 self.key_id=os.getenv("RAZORPAY_API_KEY")
                 self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
                 self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
-                signature_payload = f"{razorpay_order_id}|{razorpay_payment_id}"
-                
-                # Generate local SHA256 HMAC hash using your secret key
-                valid_signature = hmac.new(
-                    bytes(str(str(self.key_secret)), "utf-8"),
-                    bytes(str(str(signature_payload)), "utf-8"),
-                    hashlib.sha256
-                    ).hexdigest()
-                
-                # Secure string comparison to prevent timing attacks
+
                 params_dict = {
                     'razorpay_order_id': razorpay_order_id,
                     'razorpay_payment_id': razorpay_payment_id,
-                    'razorpay_signature': valid_signature
+                    'razorpay_signature': razorpay_signature
                 }
                 self.client.utility.verify_payment_signature(params_dict)
-                """razorPayPersistence=RazorPayPersistence()
-                def run_background_insert():
-                    razorPayPersistence.updatePaymentStatus(
-                       razorpay_order_id , 
-                       razorpay_payment_id , 
-                        userId
-                    )
-                    
-                    razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id)
-                
-                background_tasks.add_task(
-                   run_background_insert 
-                )"""
-                return True   
+                # Wallet crediting is intentionally NOT done here - see
+                # docstring above. The webhook path
+                # (verify_webhook_signature -> invokeCallToDatabase) is the
+                # sole source of truth for that, gated by
+                # updatePaymentStatus()'s PENDING->SUCCESS idempotency check.
+                return True
         except Exception as ex:
-            print("Error in verification of payment"+ex)
-    
-    
+            print(f"Error in verification of payment: {ex}")
+            return False
+
+
     def verify_webhook_signature(self, raw_body, webhook_signature) -> bool:
         """
         Validates the incoming webhook signature using the raw request body bytes.
         """
         try:
-            #This is the secret passphrase you will set in the Razorpay Dashboard
-            webhook_secret = "WEBHOOK_9897"#os.getenv("RAZORPAY_WEBHOOK_SECRET")""
+            # Read from environment - test mode and live mode use different
+            # secrets issued by Razorpay's dashboard, so this must be a
+            # config value, never a hardcoded literal (a hardcoded secret
+            # here would either verify every webhook against a fixed,
+            # guessable value or reject every live webhook outright once
+            # a real live-mode secret is configured). Confirmed via a live
+            # test that Razorpay's dashboard for this webhook is configured
+            # with the value now stored in RAZORPAY_WEBHOOK_SECRET.
+            webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
             if not webhook_secret:
                 print("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
                 return False
@@ -138,46 +145,6 @@ class RazorPayManagerService:
     
     
     
-    def verify_payment_signatureFromWebHook(self, razorpay_order_id: str, razorpay_payment_id: str, razorpay_signature: str,userId:int) -> bool:
-        """
-        Step 2: Cryptographically verifies the payment signature returned by the frontend checkout window.
-        Returns True if authentic, False if compromised.
-        """
-        # Construct the expected raw text blob payload
-        try:
-                self.key_id=os.getenv("RAZORPAY_API_KEY")
-                self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
-                self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
-                signature_payload = f"{razorpay_order_id}|{razorpay_payment_id}"
-                
-                # Generate local SHA256 HMAC hash using your secret key
-                valid_signature = hmac.new(
-                    bytes(str(str(self.key_secret)), "utf-8"),
-                    bytes(str(str(signature_payload)), "utf-8"),
-                    hashlib.sha256
-                    ).hexdigest()
-                
-                # Secure string comparison to prevent timing attacks
-                params_dict = {
-                    'razorpay_order_id': razorpay_order_id,
-                    'razorpay_payment_id': razorpay_payment_id,
-                    'razorpay_signature': valid_signature
-                }
-                self.client.utility.verify_payment_signature(params_dict)
-                razorPayPersistence=RazorPayPersistence()
-                
-                razorPayPersistence.updatePaymentStatus(
-                       razorpay_order_id , 
-                       razorpay_payment_id , 
-                        userId
-                    )
-                    
-                razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id)
-                
-                return True   
-        except Exception as ex:
-            print("Error in verification of payment"+ex)    
-            
     def invokeCallToDatabase(self,razorpay_order_id,razorpay_payment_id,userId):
         print("calling to database")
         razorPayPersistence=RazorPayPersistence()

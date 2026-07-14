@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 RECONNECT_DELAY_SECS = 5
 
 TickHandler = Callable[[str, dict], Awaitable[None] | None]
+OrderUpdateHandler = Callable[[dict], Awaitable[None] | None]
 
 
 def _safe_float(val, default=None):
@@ -69,7 +70,8 @@ class ShoonyaOptionFeed:
     def __init__(self, shoonya_connection):
         self._shoonya = shoonya_connection
         self._async_loop: asyncio.AbstractEventLoop | None = None
-        self._tick_handler: TickHandler | None = None
+        self._tick_handlers: list[TickHandler] = []
+        self._order_update_handlers: list[OrderUpdateHandler] = []
         self._subscribed_tokens: dict[str, int] = {}  # "EXCH|TOKEN" -> ref count
         self._lock = threading.Lock()
         self._reconnecting = False
@@ -84,8 +86,19 @@ class ShoonyaOptionFeed:
         self._api_instance = None
 
     def on_tick(self, handler: TickHandler) -> None:
-        """Registers the single callback invoked as handler(instrument_key, tick_fields)."""
-        self._tick_handler = handler
+        """Registers a callback invoked as handler(instrument_key, tick_fields)
+        on every tick. Multiple independent consumers (e.g. the option chain
+        cache and the position cache) can each register their own handler -
+        every registered handler receives every tick."""
+        self._tick_handlers.append(handler)
+
+    def on_order_update(self, handler: OrderUpdateHandler) -> None:
+        """Registers a callback invoked as handler(order_update) whenever the
+        broker pushes an order status change (fill, reject, cancel, etc.) for
+        THIS master account. Per Shoonya's own docs, order updates and price
+        ticks share the same WebSocket connection - no separate connection is
+        opened for this, it's the same socket start() already manages."""
+        self._order_update_handlers.append(handler)
 
     def start(self) -> None:
         """Opens the WebSocket connection. Safe to call again after a reconnect
@@ -114,6 +127,7 @@ class ShoonyaOptionFeed:
 
         api.start_websocket(
             subscribe_callback=self._on_tick,
+            order_update_callback=self._on_order_update,
             socket_open_callback=self._on_open,
             socket_close_callback=self._on_close,
             socket_error_callback=self._on_error,
@@ -224,19 +238,20 @@ class ShoonyaOptionFeed:
             instrument_key = f"{exch}|{token}"
 
             tick = normalize_touchline_tick(raw)
-            if not tick or self._tick_handler is None or self._async_loop is None:
+            if not tick or not self._tick_handlers or self._async_loop is None:
                 return
 
-            result = self._tick_handler(instrument_key, tick)
-            if inspect.isawaitable(result):
-                future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
-                # run_coroutine_threadsafe schedules `result` as a detached
-                # Task - nothing ever calls .result() on the returned Future,
-                # so an exception raised inside tick processing (e.g. a bad
-                # expiry date, a KeyError) would otherwise vanish silently:
-                # that option leg would simply stop updating with no log,
-                # metric, or alert anywhere. This surfaces it.
-                future.add_done_callback(self._log_tick_task_exception)
+            for handler in self._tick_handlers:
+                result = handler(instrument_key, tick)
+                if inspect.isawaitable(result):
+                    future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
+                    # run_coroutine_threadsafe schedules `result` as a detached
+                    # Task - nothing ever calls .result() on the returned Future,
+                    # so an exception raised inside tick processing (e.g. a bad
+                    # expiry date, a KeyError) would otherwise vanish silently:
+                    # that option leg would simply stop updating with no log,
+                    # metric, or alert anywhere. This surfaces it.
+                    future.add_done_callback(self._log_tick_task_exception)
         except Exception as e:
             logger.warning(f"[OptionFeed] Error processing tick {raw}: {e}")
 
@@ -248,6 +263,36 @@ class ShoonyaOptionFeed:
             return  # cancelled, or exception() itself unavailable - nothing to log
         if exc is not None:
             logger.error(f"[OptionFeed] Tick handler task failed: {exc!r}", exc_info=exc)
+
+    def _on_order_update(self, raw: dict) -> None:
+        """Fired on NorenApi's own WS thread for every order status change on
+        the master account (fill, reject, cancel, modify ack, etc.) - this is
+        the low-latency path for live F&O position tracking (see
+        service/orderUpdateService.py), used instead of polling the broker's
+        order book. Mirrors _on_tick's dispatch pattern exactly (same
+        run_coroutine_threadsafe + detached-task-exception-logging need,
+        since handlers may be async and this callback itself must never
+        raise back into NorenApi's WS loop)."""
+        try:
+            if not self._order_update_handlers or self._async_loop is None:
+                return
+
+            for handler in self._order_update_handlers:
+                result = handler(raw)
+                if inspect.isawaitable(result):
+                    future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
+                    future.add_done_callback(self._log_order_update_task_exception)
+        except Exception as e:
+            logger.warning(f"[OptionFeed] Error processing order update {raw}: {e}")
+
+    @staticmethod
+    def _log_order_update_task_exception(future: "asyncio.Future") -> None:
+        try:
+            exc = future.exception()
+        except Exception:
+            return
+        if exc is not None:
+            logger.error(f"[OptionFeed] Order-update handler task failed: {exc!r}", exc_info=exc)
 
     def _on_open(self) -> None:
         logger.info("[OptionFeed] WebSocket connected")

@@ -112,10 +112,18 @@ class CandleService:
                 })
                 return candles, errors
 
+            # Bounded like every other Shoonya REST call in this codebase
+            # (OptionChainService, TopMoversService, SectorPerformanceService,
+            # marketquotes._fetch_index_quote) - an un-timeout'd hang here
+            # blocks this request indefinitely and leaks a threadpool worker
+            # for as long as the broker call never returns.
             loop = asyncio.get_running_loop()
-            raw_candles = await loop.run_in_executor(
-                None,
-                lambda: shoonya.get_time_price_series(exchange, token, interval, days=_LOOKBACK_DAYS)
+            raw_candles = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: shoonya.get_time_price_series(exchange, token, interval, days=_LOOKBACK_DAYS)
+                ),
+                timeout=10.0
             )
 
             if not raw_candles:
