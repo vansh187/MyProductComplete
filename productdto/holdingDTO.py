@@ -8,3 +8,4 @@ class HoldingDTO:
     avg_price: float
     current_price: float
     pnl: float
+    asset_type: str

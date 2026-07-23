@@ -101,7 +101,8 @@ class MatchingEngineService:
                             execution_price=execution_price,
                             trade_value=execution_price * Decimal(trade_qty),
                             executed_at=datetime.now(),
-                            remaining_qty=remainingQty
+                            remaining_qty=remainingQty,
+                            counterparty_product_type=response.get("product_type")
                         )
                     )
 

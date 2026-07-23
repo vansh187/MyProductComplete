@@ -14,9 +14,10 @@ import psycopg2.errors
 from service.portfolioService import portfolioService
 from service.orderService import OrderService
 from service.tradeHistoryService import TradeHistoryService as tradeService
+from service.positionsService import PositionsService
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from service.matchingEngine.matchingEngine import MatchingEngine
-from api.models import OrderCreate, OrderSide
+from api.models import OrderCreate, OrderSide, DERIVATIVE_EXCHANGES
 
 MAX_MATCH_RETRIES = 3
 RETRY_DELAY_SECS = 0.005
@@ -312,6 +313,7 @@ class ExecutionEngine:
             order_service = OrderService()
             portfolio_service = portfolioService()
             trade_service = tradeService()
+            positions_service = PositionsService()
             transaction_id = None
             total_matched_qty = 0
 
@@ -382,8 +384,32 @@ class ExecutionEngine:
                     incoming_status, self.order_id, cursor
                 )
 
-                # Update holdings
-                if self.order.side == OrderSide.BUY:
+                # Update positions (F&O) or holdings (equity)
+                if self.order.exchange in DERIVATIVE_EXCHANGES:
+                    positions_service.applyFill(
+                        user_id, match_found.symbol, self.order.side.value,
+                        match_found.quantity, match_found.execution_price,
+                        self.order.product_type.value, self.order.exchange.value, cursor
+                    )
+
+                    # The resting order's owner is the other side of this
+                    # match, and must get their own position row updated too
+                    # (same symbol -> same exchange, since NFO derivative
+                    # symbols never trade on NSE/BSE). Their product_type may
+                    # differ from the incoming order's (e.g. MIS matched
+                    # against a resting NRML order), so use the counterparty's
+                    # own product_type, not self.order's.
+                    counterparty_user_id = (
+                        match_found.sell_user_id if self.order.side == OrderSide.BUY
+                        else match_found.buy_user_id
+                    )
+                    counterparty_side = "SELL" if self.order.side == OrderSide.BUY else "BUY"
+                    positions_service.applyFill(
+                        counterparty_user_id, match_found.symbol, counterparty_side,
+                        match_found.quantity, match_found.execution_price,
+                        match_found.counterparty_product_type, self.order.exchange.value, cursor
+                    )
+                elif self.order.side == OrderSide.BUY:
                     portfolio_service.process_buyer(
                         user_id, self.order.symbol,
                         match_found.quantity, match_found.execution_price,

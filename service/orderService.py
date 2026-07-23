@@ -214,7 +214,7 @@ class OrderService:
             raise ValueError("Database cursor cannot be None")
 
         try:
-            portfolioPersistence.updateStatus(user_id, symbol, status, buy_order_id, sell_order_id, cursor)
+            portfolioPersistence().updateStatus(user_id, symbol, status, buy_order_id, sell_order_id, cursor)
             self.logger.info(f"Updated order status: user={user_id}, symbol={symbol}, status={status}")
 
         except Exception as ex:
@@ -244,7 +244,7 @@ class OrderService:
             raise ValueError("Database cursor cannot be None")
 
         try:
-            portfolioPersistence.updateOrderStatusSingle(status, order_id, cursor)
+            portfolioPersistence().updateOrderStatusSingle(status, order_id, cursor)
             self.logger.info(f"Updated single order status: order_id={order_id}, status={status}")
 
         except Exception as ex:

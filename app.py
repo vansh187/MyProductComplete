@@ -5,9 +5,10 @@ from api.login import router as login_router
 from api.orders import router as orders_router
 from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
+from api.positions import router as fnoPositionsRouter
 from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
-from api.Dashboard import router as dashboardRouter
+from api.Dashboard import router as dashboardRouter, start_equity_curve_capture as equity_curve_refresh
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
 from api.auth_google import router as googleAuthRouter
@@ -43,6 +44,7 @@ async def lifespan(app: FastAPI):
     refresh_task         = None
     shoonya_refresh_task = None
     top_movers_task      = None
+    equity_curve_task    = None
     app.state.breeze     = None
     app.state.shoonya    = None
 
@@ -91,6 +93,9 @@ async def lifespan(app: FastAPI):
     else:
         print("App starting... Breeze unavailable.")
 
+    # ── Equity curve snapshot capture (Postgres-only, no market client) ─
+    equity_curve_task = asyncio.create_task(equity_curve_refresh())
+
     yield
 
     if refresh_task:
@@ -99,6 +104,8 @@ async def lifespan(app: FastAPI):
         shoonya_refresh_task.cancel()
     if top_movers_task:
         top_movers_task.cancel()
+    if equity_curve_task:
+        equity_curve_task.cancel()
     print("Server shutting down.")
 
 
@@ -108,6 +115,7 @@ app.include_router(signup_router)
 app.include_router(login_router)
 app.include_router(trade_history)
 app.include_router(user_portfolio)
+app.include_router(fnoPositionsRouter)
 app.include_router(dashboardRouter)
 app.include_router(razorPayPaymentRouter)
 app.include_router(verify_transaction)

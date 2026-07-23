@@ -16,3 +16,4 @@ class MatchingOrderDTO:
     trade_value: Decimal = Decimal("0")
     executed_at: datetime = None
     remaining_qty:int=0
+    counterparty_product_type: Optional[str] = None

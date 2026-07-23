@@ -20,15 +20,31 @@ select_trade_counts: |
 select_holdings_summary: |
   SELECT
     COALESCE(SUM(p.quantity * p.avg_price), 0) AS total_invested,
-    COALESCE(SUM(p.quantity * mp.current_price), 0) AS total_holdings,
-    COALESCE(SUM((mp.current_price - p.avg_price) * p.quantity), 0) AS unrealized_pnl,
+    COALESCE(SUM(p.quantity * COALESCE(mp.current_price, p.avg_price)), 0) AS total_holdings,
+    COALESCE(SUM((COALESCE(mp.current_price, p.avg_price) - p.avg_price) * p.quantity), 0) AS unrealized_pnl,
     COALESCE(
-      (SUM(p.quantity * mp.current_price) - SUM(p.quantity * p.avg_price)) * 100.0
+      (SUM(p.quantity * COALESCE(mp.current_price, p.avg_price)) - SUM(p.quantity * p.avg_price)) * 100.0
       / NULLIF(SUM(p.quantity * p.avg_price), 0),
       0
     ) AS return_percentage,
     COUNT(*) AS total_positions,
     MAX(mp.updated_at) AS last_updated
   FROM holdings p
-  INNER JOIN market_prices mp ON p.symbol = mp.symbol
+  LEFT JOIN market_prices mp ON p.symbol = mp.symbol
   WHERE p.user_id = %s AND p.quantity > 0
+
+select_holdings_summary_by_bucket: |
+  SELECT
+    COALESCE(SUM(p.quantity * p.avg_price), 0) AS total_invested,
+    COALESCE(SUM(p.quantity * COALESCE(mp.current_price, p.avg_price)), 0) AS total_holdings,
+    COALESCE(SUM((COALESCE(mp.current_price, p.avg_price) - p.avg_price) * p.quantity), 0) AS unrealized_pnl,
+    COALESCE(
+      (SUM(p.quantity * COALESCE(mp.current_price, p.avg_price)) - SUM(p.quantity * p.avg_price)) * 100.0
+      / NULLIF(SUM(p.quantity * p.avg_price), 0),
+      0
+    ) AS return_percentage,
+    COUNT(*) AS total_positions,
+    MAX(mp.updated_at) AS last_updated
+  FROM holdings p
+  LEFT JOIN market_prices mp ON p.symbol = mp.symbol
+  WHERE p.user_id = %s AND p.quantity > 0 AND p.asset_type = ANY(%s)
