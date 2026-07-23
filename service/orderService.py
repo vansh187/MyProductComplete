@@ -472,8 +472,6 @@ class OrderService:
             raise ValueError("Database cursor cannot be None")
 
         try:
-            portfolioPersistence().updateOrderStatusSingle(status, order_id, cursor)
-            self.logger.info(f"Updated single order status: order_id={order_id}, status={status}")
             avg_fill_price, filled_qty = TradeHistoryService().getFillStats(order_id, cursor)
             portfolioPersistence.updateOrderStatusSingle(
                 status, order_id, cursor, avg_fill_price, filled_qty, trigger_price, client_order_id

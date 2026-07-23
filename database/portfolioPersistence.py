@@ -69,7 +69,6 @@ class portfolioPersistence:
         except Exception as e:
             raise Exception(f"Exception in process_seller: {str(e)}") from e
 
-    def updateOrderStatusSingle(self, status, order_id, cursor):
     @staticmethod
     def updateOrderStatusSingle(status, order_id, cursor, avg_fill_price=0, filled_qty=0,
                                  trigger_price=None, client_order_id=None):
