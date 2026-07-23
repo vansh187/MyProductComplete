@@ -1,4 +1,40 @@
 select_position_for_update: |
+  SELECT * FROM positions
+  WHERE user_id = %s AND tsym = %s AND product_type = %s
+  FOR UPDATE NOWAIT
+
+insert_position: |
+  INSERT INTO positions (
+    user_id, tsym, broker, token, exchange, underlying, expiry, strike, option_type,
+    lot_size, product_type, source, netqty, netavgprc, buyqty, sellqty, buyavgprc,
+    sellavgprc, realized_pnl, status, contract_type
+  ) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s
+  )
+
+update_position: |
+  UPDATE positions
+  SET netqty = %s, netavgprc = %s, buyqty = %s, sellqty = %s, buyavgprc = %s,
+      sellavgprc = %s, realized_pnl = %s, status = %s, updated_at = NOW()
+  WHERE user_id = %s AND tsym = %s AND product_type = %s
+
+select_positions_for_user: |
+  SELECT * FROM positions
+  WHERE user_id = %s
+  ORDER BY status ASC, updated_at DESC
+
+select_positions_summary_for_user: |
+  SELECT
+    COALESCE(SUM(realized_pnl), 0) AS total_realized_pnl,
+    COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
+    MAX(updated_at) AS last_updated
+  FROM positions
+  WHERE user_id = %s
+
+select_distinct_users_with_positions: |
+  SELECT DISTINCT user_id FROM positions
   SELECT user_id, tsym, netqty, netavgprc, buyqty, sellqty, buyavgprc, sellavgprc,
          realized_pnl, status
   FROM positions

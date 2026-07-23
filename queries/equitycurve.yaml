@@ -1,0 +1,24 @@
+insert_snapshot: |
+  INSERT INTO portfolio_equity_snapshots
+    (user_id, bucket, net_value, total_unrealized_pnl, buying_power, captured_at)
+  VALUES (%s, %s, %s, %s, %s, NOW())
+
+select_snapshots_since: |
+  SELECT net_value, total_unrealized_pnl, buying_power, captured_at
+  FROM portfolio_equity_snapshots
+  WHERE user_id = %s AND bucket = %s AND captured_at >= %s
+  ORDER BY captured_at ASC
+
+select_first_snapshot_since: |
+  SELECT net_value, captured_at
+  FROM portfolio_equity_snapshots
+  WHERE user_id = %s AND bucket = %s AND captured_at >= %s
+  ORDER BY captured_at ASC
+  LIMIT 1
+
+select_latest_snapshot: |
+  SELECT captured_at
+  FROM portfolio_equity_snapshots
+  WHERE user_id = %s AND bucket = %s
+  ORDER BY captured_at DESC
+  LIMIT 1

@@ -171,6 +171,18 @@ Connection: `psycopg2` via `DATABASE_URL` (preferred) or individual `PG*` env va
 | `symbol` | varchar | |
 | `quantity` | int | |
 | `avg_price` | numeric | |
+| `asset_type` | varchar(20) | `EQUITY` / `FUTURE` / `OPTION`, derived from symbol pattern at insert time |
+
+**`portfolio_equity_snapshots`**
+| Column | Type | Notes |
+|--------|------|-------|
+| `snapshot_id` | serial PK | |
+| `user_id` | int FK → users | |
+| `bucket` | varchar(20) | `ALL` / `STOCKS` / `FNO` — see `utils/assetBuckets.py` |
+| `net_value` | numeric | buying power + mark-to-market value of the bucket's holdings |
+| `total_unrealized_pnl` | numeric | |
+| `buying_power` | numeric | account-wide wallet balance (not bucket-specific) |
+| `captured_at` | timestamp | indexed with `(user_id, bucket)`, captured periodically by a background task; powers the per-tab performance graph |
 
 **`trade_history`**
 | Column | Type | Notes |

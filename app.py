@@ -7,10 +7,11 @@ from api.login import router as login_router
 from api.orders import router as orders_router
 from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
+from api.positions import router as fnoPositionsRouter
 from api.positions import router as positionsRouter
 from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
-from api.Dashboard import router as dashboardRouter
+from api.Dashboard import router as dashboardRouter, start_equity_curve_capture as equity_curve_refresh
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
 from api.auth_google import router as googleAuthRouter
@@ -203,6 +204,9 @@ async def lifespan(app: FastAPI):
             print(f"[WARNING] Breeze session failed — stock quotes will be unavailable: {e}")
     else:
         print("App starting... Breeze unavailable.")
+
+    # ── Equity curve snapshot capture (Postgres-only, no market client) ─
+    equity_curve_task = asyncio.create_task(equity_curve_refresh())
 
     yield
 

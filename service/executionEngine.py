@@ -15,6 +15,10 @@ from service.portfolioService import portfolioService
 from service.orderService import OrderService
 from service.tradeSettlementService import TradeSettlementService
 from service.tradeHistoryService import TradeHistoryService as tradeService
+from service.positionsService import PositionsService
+from database.PostgresConnectionFactory import PostgresConnectionFactory
+from service.matchingEngine.matchingEngine import MatchingEngine
+from api.models import OrderCreate, OrderSide, DERIVATIVE_EXCHANGES
 from service.walletbalance.WalletBalanceService import WalletBalanceService
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from service.matchingEngine.matchingEngine import MatchingEngine
@@ -356,6 +360,7 @@ class ExecutionEngine:
             portfolio_service = portfolioService()
             trade_settlement_service = TradeSettlementService()
             trade_service = tradeService()
+            positions_service = PositionsService()
             wallet_service = WalletBalanceService()
             transaction_id = None
             total_matched_qty = 0
@@ -450,6 +455,37 @@ class ExecutionEngine:
                     trigger_price=float(self.order.trigger_price) if self.order.trigger_price else None,
                     client_order_id=self.order.client_order_id
                 )
+
+                # Update positions (F&O) or holdings (equity)
+                if self.order.exchange in DERIVATIVE_EXCHANGES:
+                    positions_service.applyFill(
+                        user_id, match_found.symbol, self.order.side.value,
+                        match_found.quantity, match_found.execution_price,
+                        self.order.product_type.value, self.order.exchange.value, cursor
+                    )
+
+                    # The resting order's owner is the other side of this
+                    # match, and must get their own position row updated too
+                    # (same symbol -> same exchange, since NFO derivative
+                    # symbols never trade on NSE/BSE). Their product_type may
+                    # differ from the incoming order's (e.g. MIS matched
+                    # against a resting NRML order), so use the counterparty's
+                    # own product_type, not self.order's.
+                    counterparty_user_id = (
+                        match_found.sell_user_id if self.order.side == OrderSide.BUY
+                        else match_found.buy_user_id
+                    )
+                    counterparty_side = "SELL" if self.order.side == OrderSide.BUY else "BUY"
+                    positions_service.applyFill(
+                        counterparty_user_id, match_found.symbol, counterparty_side,
+                        match_found.quantity, match_found.execution_price,
+                        match_found.counterparty_product_type, self.order.exchange.value, cursor
+                    )
+                elif self.order.side == OrderSide.BUY:
+                    portfolio_service.process_buyer(
+                        user_id, self.order.symbol,
+                        match_found.quantity, match_found.execution_price,
+                        cursor
                 
                 # Settle both sides of the match. match_found always carries both
                 # parties, regardless of which side placed the incoming (taker)
