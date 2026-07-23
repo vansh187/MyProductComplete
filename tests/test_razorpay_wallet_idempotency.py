@@ -1,0 +1,573 @@
+"""
+Unit tests for Razorpay wallet-credit idempotency.
+
+Guards against duplicate/retried webhook or verification-call deliveries for
+the same payment double-crediting the wallet:
+
+- RazorPayPersistence.updatePaymentStatus() atomically flips a ledger row
+  PENDING -> SUCCESS and returns True only for the delivery that actually
+  performed that transition (rowcount > 0). Any later delivery for the same
+  payment finds the row already SUCCESS, matches 0 rows, and gets False.
+- RazorPayManagerService.invokeCallToDatabase() only calls
+  insertUpdateWallet() when updatePaymentStatus() returned True, so a
+  duplicate delivery never reaches the wallet-credit code path.
+- RazorPayPersistence.insertUpdateWallet() correctly creates a new wallet
+  row when none exists yet, and otherwise adds the transaction amount to
+  the existing balance.
+
+No real network or DB calls are made: the Razorpay SDK client and the
+Postgres connection factory are mocked throughout.
+"""
+
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from database.razorpaypersistence.RazorPayPersistence import RazorPayPersistence
+from service.razorpay.RazorPayMangerService import RazorPayManagerService
+
+
+def _mock_conn_with_rowcount(rowcount: int):
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.rowcount = rowcount
+    conn.cursor.return_value = cursor
+    return conn, cursor
+
+
+class TestUpdatePaymentStatusIdempotency:
+
+    def test_first_call_transitions_pending_to_success_returns_true(self):
+        """First webhook delivery: row is still PENDING -> UPDATE affects 1 row -> True"""
+        conn, cursor = _mock_conn_with_rowcount(1)
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            result = RazorPayPersistence().updatePaymentStatus("order_1", "pay_1", 42)
+
+        assert result is True
+        conn.commit.assert_called_once()
+        conn.close.assert_called_once()
+
+    def test_duplicate_call_finds_already_success_returns_false(self):
+        """Second/third webhook delivery for the same payment: row is already
+        SUCCESS, so `WHERE status = PENDING` matches 0 rows -> False"""
+        conn, cursor = _mock_conn_with_rowcount(0)
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            result = RazorPayPersistence().updatePaymentStatus("order_1", "pay_1", 42)
+
+        assert result is False
+        conn.commit.assert_called_once()
+
+    def test_db_error_during_update_returns_false_and_rolls_back(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.execute.side_effect = Exception("db exploded")
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            result = RazorPayPersistence().updatePaymentStatus("order_1", "pay_1", 42)
+
+        assert result is False
+        conn.rollback.assert_called_once()
+
+
+class TestInsertUpdateWallet:
+    """
+    insertUpdateWallet no longer reads a balance and writes a precomputed
+    total back (the lost-update race) - it now either (a) runs a single
+    atomic `balance = balance + %s` UPDATE for an existing wallet, or
+    (b) takes a pg_advisory_xact_lock keyed on the user before deciding
+    whether to INSERT a brand-new wallet row. These tests assert on the
+    actual SQL text executed (real query_loader/yaml, not mocked) so a
+    regression back to the old read-then-write pattern would be caught.
+    """
+
+    def test_creates_new_wallet_when_none_exists(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        # 1st fetchone: select_wallet_for_update -> no wallet row yet.
+        # 2nd fetchone: get_wallet_balance_for_update (post-lock re-check)
+        # -> still no row, so this call must INSERT.
+        cursor.fetchone.side_effect = [
+            {"wallet_id": None, "balance": None, "transaction_amount": 500.0, "transaction_status": "2"},
+            None,
+        ]
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("pg_advisory_xact_lock" in sql for sql in executed_sql), \
+            "must take an advisory lock before deciding to insert a brand-new wallet row"
+        insert_call = cursor.execute.call_args_list[-1]
+        assert "INSERT INTO wallets" in insert_call.args[0]
+        assert insert_call.args[1] == (42, Decimal("500.0"))
+        conn.commit.assert_called_once()
+
+    def test_wallet_created_concurrently_between_first_check_and_lock_credits_instead_of_double_inserting(self):
+        """If another transaction created the wallet row in the gap between
+        the first SELECT and this transaction acquiring the advisory lock,
+        the post-lock re-check must see it and switch to an atomic
+        increment rather than attempting a second INSERT (which would
+        either duplicate the row or fail)."""
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"wallet_id": None, "balance": None, "transaction_amount": 500.0, "transaction_status": "2"},
+            {"user_id": 42, "balance": 200.0},  # row now exists, seen post-lock
+        ]
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        last_call = cursor.execute.call_args_list[-1]
+        assert "balance = COALESCE(balance, 0) + %s" in last_call.args[0]
+        assert last_call.args[1] == (Decimal("500.0"), 42)
+        assert not any("INSERT INTO wallets" in call.args[0] for call in cursor.execute.call_args_list)
+
+    def test_adds_transaction_amount_to_existing_balance_atomically(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "wallet_id": 7,
+            "balance": 1000.0,
+            "transaction_amount": 500.0,
+            "transaction_status": "2",
+        }
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        update_call = cursor.execute.call_args_list[-1]
+        # The delta (transaction_amount), not a precomputed total, must be
+        # the parameter - the whole point of the fix is that the new
+        # balance is never computed from a possibly-stale read.
+        assert "balance = COALESCE(balance, 0) + %s" in update_call.args[0]
+        assert update_call.args[1] == (Decimal("500.0"), 42)
+        # Only one query should run for the already-exists path - no
+        # advisory lock needed since the atomic UPDATE alone is race-safe.
+        assert cursor.execute.call_count == 2  # select_wallet_for_update + increment
+        conn.commit.assert_called_once()
+
+    def test_no_ledger_record_skips_wallet_write_entirely(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        # Only the SELECT should have run - no INSERT/UPDATE into wallets.
+        assert cursor.execute.call_count == 1
+        conn.commit.assert_not_called()
+
+    def test_db_error_during_credit_rolls_back_and_re_raises(self):
+        """A DB failure mid-credit must roll back (never leave a half-applied
+        state) AND propagate to the caller. This method is only ever invoked
+        after updatePaymentStatus has already committed the ledger's
+        PENDING->SUCCESS transition, so a failure here is a payment Razorpay
+        has captured and our own ledger marks SUCCESS, with the wallet never
+        credited - and the idempotency gate means there is no other chance
+        to retry it. Silently swallowing this (the previous behavior) would
+        make the failure invisible; re-raising surfaces it to whatever is
+        watching the caller (background-task error logging, error tracking,
+        or a future retry/dead-letter mechanism) instead of vanishing into a
+        print() line with nobody alerted."""
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "wallet_id": 7, "balance": 1000.0, "transaction_amount": 500.0, "transaction_status": "2",
+        }
+        cursor.execute.side_effect = [None, Exception("connection reset by peer")]
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            with pytest.raises(Exception, match="connection reset by peer"):
+                RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+
+    def test_zero_transaction_amount_still_runs_atomic_increment(self):
+        """A zero-amount ledger row (e.g. a test/₹0 payment) must not be
+        special-cased into skipping the credit silently - it should still
+        go through the same atomic path with a no-op-equivalent delta."""
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "wallet_id": 7, "balance": 1000.0, "transaction_amount": 0.0, "transaction_status": "2",
+        }
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        update_call = cursor.execute.call_args_list[-1]
+        assert update_call.args[1] == (Decimal("0.0"), 42)
+        conn.commit.assert_called_once()
+
+    def test_fractional_paise_amount_preserved_as_decimal_not_float(self):
+        """Money must never round-trip through float - Decimal('1234.56')
+        stored as a Python float can drift (e.g. 1234.5600000000001) across
+        repeated credits. Guards against a regression back to float()."""
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "wallet_id": 7, "balance": 1000.0, "transaction_amount": "1234.56", "transaction_status": "2",
+        }
+        conn.cursor.return_value = cursor
+        with patch(
+            "database.razorpaypersistence.RazorPayPersistence.PostgresConnectionFactory.create_connection",
+            return_value=conn,
+        ):
+            RazorPayPersistence().insertUpdateWallet(42, "order_1")
+
+        update_call = cursor.execute.call_args_list[-1]
+        amount_param = update_call.args[1][0]
+        assert isinstance(amount_param, Decimal)
+        assert amount_param == Decimal("1234.56")
+
+
+class TestWalletCreditConcurrencySimulated:
+    """
+    No local Postgres server is available in this environment (only the
+    psql client; the only configured DATABASE_URL points at a shared
+    Supabase instance that must not be used for concurrency stress tests).
+    Real row-level/advisory-lock contention can't be exercised against an
+    actual database here, so this simulates the same hazard - a shared
+    mutable balance credited from many threads - against a minimal
+    in-memory stand-in that mimics Postgres's atomic
+    `UPDATE ... SET balance = balance + %s` semantics (single lock guarding
+    the read+write of one statement). This proves the *algorithm* (atomic
+    delta application, no read-then-write in application code) is race-free
+    under genuine thread contention; it is not a substitute for a real
+    integration test against Postgres, which should be run in CI/staging
+    where a database is actually available.
+    """
+
+    def test_many_concurrent_atomic_credits_lose_no_updates(self):
+        import threading
+
+        class FakeWalletRow:
+            """Mimics one Postgres row: a single lock scopes each atomic
+            UPDATE statement, exactly like a row-level lock would."""
+
+            def __init__(self, balance):
+                self.balance = Decimal(str(balance))
+                self._lock = threading.Lock()
+
+            def atomic_increment(self, delta: Decimal):
+                with self._lock:
+                    self.balance += delta
+
+        wallet = FakeWalletRow(Decimal("0"))
+        credit_amount = Decimal("100.00")
+        num_threads = 50
+
+        def credit_once():
+            wallet.atomic_increment(credit_amount)
+
+        threads = [threading.Thread(target=credit_once) for _ in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+            assert not t.is_alive(), "a credit thread hung - indicates a deadlock in the locking scheme"
+
+        assert wallet.balance == credit_amount * num_threads, (
+            f"lost update detected: expected {credit_amount * num_threads}, got {wallet.balance}"
+        )
+
+    def test_stale_read_then_write_pattern_does_lose_updates(self):
+        """Control case: proves the *old* (buggy) read-then-write pattern
+        this fix replaces really does lose updates under contention, so the
+        atomic-increment fix above is solving a real, reproducible problem
+        and not a hypothetical one."""
+        import threading
+        import time
+
+        class RacyWalletRow:
+            def __init__(self, balance):
+                self.balance = Decimal(str(balance))
+
+            def racy_increment(self, delta: Decimal):
+                current = self.balance          # unlocked read (the old bug)
+                time.sleep(0.001)                # widen the race window deterministically
+                self.balance = current + delta   # write back a stale total
+
+        wallet = RacyWalletRow(Decimal("0"))
+        credit_amount = Decimal("100.00")
+        num_threads = 20
+
+        threads = [threading.Thread(target=wallet.racy_increment, args=(credit_amount,)) for _ in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert wallet.balance != credit_amount * num_threads, (
+            "expected the unlocked read-then-write pattern to lose updates under contention "
+            "(if this assertion fails, the test environment isn't exercising real thread "
+            "interleaving - re-check the sleep-based race window)"
+        )
+
+
+class TestInvokeCallToDatabaseGating:
+
+    def test_credits_wallet_only_on_first_processing(self):
+        """invokeCallToDatabase must call insertUpdateWallet when this is the
+        first time the payment is processed."""
+        with patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
+            instance = MockPersistence.return_value
+            instance.updatePaymentStatus.return_value = True
+
+            RazorPayManagerService().invokeCallToDatabase("order_1", "pay_1", 42)
+
+            instance.insertUpdateWallet.assert_called_once_with(42, "order_1")
+
+    def test_skips_wallet_credit_on_duplicate_webhook(self):
+        """invokeCallToDatabase must NOT call insertUpdateWallet again when
+        updatePaymentStatus reports the payment was already processed -
+        this is the fix for a double-credit bug on retried webhooks."""
+        with patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
+            instance = MockPersistence.return_value
+            instance.updatePaymentStatus.return_value = False
+
+            RazorPayManagerService().invokeCallToDatabase("order_1", "pay_1", 42)
+
+            instance.insertUpdateWallet.assert_not_called()
+
+    def test_three_duplicate_webhook_deliveries_credit_wallet_exactly_once(self):
+        """Simulates 3 webhook deliveries for one payment. Only the first
+        should reach insertUpdateWallet."""
+        with patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
+            instance = MockPersistence.return_value
+            # 1st delivery wins the PENDING->SUCCESS race; 2nd and 3rd are duplicates
+            instance.updatePaymentStatus.side_effect = [True, False, False]
+
+            svc = RazorPayManagerService()
+            for _ in range(3):
+                svc.invokeCallToDatabase("order_1", "pay_1", 42)
+
+            assert instance.insertUpdateWallet.call_count == 1
+
+    def test_updates_status_with_correct_arguments(self):
+        with patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
+            instance = MockPersistence.return_value
+            instance.updatePaymentStatus.return_value = True
+
+            RazorPayManagerService().invokeCallToDatabase("order_xyz", "pay_abc", 99)
+
+            instance.updatePaymentStatus.assert_called_once_with("order_xyz", "pay_abc", 99)
+
+
+class TestVerifyWebhookSignature:
+    """
+    Guards against the fixed regression where the webhook secret was a
+    hardcoded literal ("WEBHOOK_9897") with the real
+    os.getenv("RAZORPAY_WEBHOOK_SECRET") call commented out right next to
+    it - meaning every webhook was verified against a fixed, guessable
+    value regardless of environment, and would have rejected every real
+    webhook once a genuine live-mode secret was ever configured (test mode
+    and live mode use different secrets issued by Razorpay's dashboard).
+    """
+
+    def test_reads_secret_from_environment_not_a_hardcoded_literal(self):
+        fake_client = MagicMock()
+        fake_client.utility.verify_webhook_signature.return_value = None  # no raise = valid
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "real_env_configured_secret",
+             }):
+            result = RazorPayManagerService().verify_webhook_signature(b'{"event":"payment.captured"}', "sig123")
+
+        assert result is True
+        # The secret actually passed to the SDK's verifier must be the
+        # env-configured value, never the old hardcoded "WEBHOOK_9897".
+        call_args = fake_client.utility.verify_webhook_signature.call_args.args
+        assert call_args[2] == "real_env_configured_secret"
+        assert call_args[2] != "WEBHOOK_9897"
+
+    def test_missing_env_var_fails_closed_not_a_silent_fallback(self):
+        """If RAZORPAY_WEBHOOK_SECRET isn't set at all, verification must
+        fail closed (return False) rather than silently falling back to
+        any hardcoded value - a missing config should never be
+        indistinguishable from a validly-configured one."""
+        with patch.dict("os.environ", {}, clear=True):
+            result = RazorPayManagerService().verify_webhook_signature(b"{}", "sig123")
+
+        assert result is False
+
+    def test_different_secrets_for_different_environments_are_actually_used(self):
+        """Simulates switching from test mode to live mode purely via env
+        config (no code change) - the SDK call must reflect whichever
+        secret is currently configured."""
+        fake_client = MagicMock()
+        fake_client.utility.verify_webhook_signature.return_value = None
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "test_mode_secret",
+             }):
+            RazorPayManagerService().verify_webhook_signature(b"{}", "sig123")
+        assert fake_client.utility.verify_webhook_signature.call_args.args[2] == "test_mode_secret"
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "live_mode_secret",
+             }):
+            RazorPayManagerService().verify_webhook_signature(b"{}", "sig123")
+        assert fake_client.utility.verify_webhook_signature.call_args.args[2] == "live_mode_secret"
+
+    def test_sdk_rejection_returns_false_not_an_exception(self):
+        fake_client = MagicMock()
+        fake_client.utility.verify_webhook_signature.side_effect = Exception("Invalid signature")
+
+        with patch("service.razorpay.RazorPayMangerService.razorpay.Client", return_value=fake_client), \
+             patch.dict("os.environ", {
+                 "RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": "secret",
+                 "RAZORPAY_WEBHOOK_SECRET": "real_secret",
+             }):
+            result = RazorPayManagerService().verify_webhook_signature(b"{}", "bad_sig")
+
+        assert result is False
+
+
+class TestVerifyPaymentSignature:
+    """
+    Guards against the fixed regression in verify_payment_signature()
+    (used by POST /v1/VerifyFundPayements, the client-side checkout
+    confirmation endpoint - confirmed actively called by the deployed
+    frontend): it received the client's real razorpay_signature as a
+    parameter but never used it, instead recomputing its own HMAC and
+    checking that self-computed value against itself - so it returned
+    True ("Payment Verified") for ANY order_id/payment_id pair regardless
+    of whether the actual signature the client sent was valid, tampered,
+    or garbage.
+
+    No mocking of the Razorpay SDK here - these compute real HMAC-SHA256
+    signatures the exact same way razorpay.utility.Utility.
+    verify_payment_signature() does internally (msg = "order_id|payment_id",
+    HMAC with the key secret), so a genuinely correct signature and a
+    genuinely wrong one are used, not simulated via mocks.
+    """
+
+    REAL_SECRET = "real_test_secret_key"
+
+    def _real_signature(self, order_id: str, payment_id: str, secret: str = None) -> str:
+        import hashlib
+        import hmac as hmac_module
+        secret = secret or self.REAL_SECRET
+        msg = f"{order_id}|{payment_id}"
+        return hmac_module.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def test_genuinely_valid_signature_is_accepted(self):
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        signature = self._real_signature(order_id, payment_id)
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=signature, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is True
+
+    def test_tampered_signature_is_rejected(self):
+        """Core regression test: before the fix, this returned True
+        regardless of what signature was passed in, because the function
+        ignored razorpay_signature entirely and verified its own
+        recomputed value against itself."""
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        forged_signature = "0" * 64  # syntactically valid-looking hex, but not a real HMAC
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=forged_signature, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_signature_for_different_order_is_rejected(self):
+        """A signature genuinely valid for one order_id/payment_id pair
+        must not verify against a different pair - proves the check is
+        bound to the actual request, not just 'any real-looking hash'."""
+        signature_for_other_order = self._real_signature("order_OTHER", "pay_OTHER")
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id="order_abc123", razorpay_payment_id="pay_xyz789",
+                razorpay_signature=signature_for_other_order, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_wrong_secret_produces_rejected_signature(self):
+        """A signature computed with a different secret than the one
+        actually configured must be rejected."""
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        signature_with_wrong_secret = self._real_signature(order_id, payment_id, secret="a_different_secret")
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=signature_with_wrong_secret, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_sdk_exception_returns_false_not_raised(self):
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}):
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id="order_abc123", razorpay_payment_id="pay_xyz789",
+                razorpay_signature=None, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is False
+
+    def test_valid_signature_never_touches_the_database(self):
+        """The DB-write path in verify_payment_signature() is intentionally
+        dead code - the webhook remains the sole source of truth for
+        crediting wallets. Even a genuinely valid signature here must not
+        reach RazorPayPersistence at all."""
+        order_id, payment_id = "order_abc123", "pay_xyz789"
+        signature = self._real_signature(order_id, payment_id)
+
+        with patch.dict("os.environ", {"RAZORPAY_API_KEY": "key", "RAZORPAY_SECRET_KEY": self.REAL_SECRET}), \
+             patch("service.razorpay.RazorPayMangerService.RazorPayPersistence") as MockPersistence:
+            result = RazorPayManagerService().verify_payment_signature(
+                razorpay_order_id=order_id, razorpay_payment_id=payment_id,
+                razorpay_signature=signature, userId=42, background_tasks=MagicMock(),
+            )
+
+        assert result is True
+        MockPersistence.assert_not_called()

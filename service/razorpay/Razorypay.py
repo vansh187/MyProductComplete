@@ -49,18 +49,6 @@ class Razorpay:
         return  razorPayManger.verify_webhook_signature(raw_body,webhook_signature)
     
     
-    def verifyPaymentSignatureWebhook(self,payment_entity,user_id):
-         razorPayManagerService=RazorPayManagerService()
-         secret = os.getenv("RAZORPAY_SECRET_KEY")
-         razorpay_order_id=payment_entity.razorpay_order_id
-         is_authentic = razorPayManagerService.verify_webhook_signature(
-            payload=payment_entity,
-            razorpay_signature=razorpay_order_id,
-            userId=user_id 
-        )
-    
-    
-    
     def verifyPaymentSignatureWebHook(self, payload, userId):
         razorPayManagerService = RazorPayManagerService()
         print("inside verifyPaymentSignatureWebHook after backgroundprocess")

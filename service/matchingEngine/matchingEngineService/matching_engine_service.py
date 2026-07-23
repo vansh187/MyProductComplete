@@ -34,7 +34,7 @@ class MatchingEngineService:
     def matchtradeOrderforUser(self, order, userId, status, cursor, order_id):
 
         matchingPersistence = MatchingPersistence()
-        matchFoundOrderResponse = matchingPersistence.matchtradingOrderforUser(order, status, cursor)
+        matchFoundOrderResponse = matchingPersistence.matchtradingOrderforUser(order, status, cursor, userId)
 
         if matchFoundOrderResponse is None:
             return {
@@ -66,6 +66,17 @@ class MatchingEngineService:
                         break
 
                     if not self.price_match(incomingOrder, response):
+                        continue
+
+                    # Defense-in-depth: the persistence query already
+                    # excludes the incoming user's own resting orders
+                    # (user_id != %s), but this guard keeps a same-user row
+                    # from ever being able to silently consume incoming_qty
+                    # here even if that filter is ever bypassed - critically,
+                    # `continue` here does NOT decrement incoming_qty, so a
+                    # legitimate opposite-user order further down the
+                    # price-priority list still gets evaluated.
+                    if response.get("user_id") == userId:
                         continue
 
                     # FIX 2: safe access for DB rows

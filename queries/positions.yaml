@@ -35,3 +35,40 @@ select_positions_summary_for_user: |
 
 select_distinct_users_with_positions: |
   SELECT DISTINCT user_id FROM positions
+  SELECT user_id, tsym, netqty, netavgprc, buyqty, sellqty, buyavgprc, sellavgprc,
+         realized_pnl, status
+  FROM positions
+  WHERE user_id = %s AND tsym = %s
+  FOR UPDATE
+
+upsert_position: |
+  INSERT INTO positions (
+    user_id, tsym, broker, token, exchange, underlying, expiry, strike, option_type,
+    lot_size, product_type, source, netqty, netavgprc, buyqty, sellqty, buyavgprc,
+    sellavgprc, realized_pnl, status, created_at, updated_at
+  )
+  VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, NOW(), NOW()
+  )
+  ON CONFLICT (user_id, tsym) DO UPDATE SET
+    broker = EXCLUDED.broker,
+    token = EXCLUDED.token,
+    exchange = EXCLUDED.exchange,
+    underlying = EXCLUDED.underlying,
+    expiry = EXCLUDED.expiry,
+    strike = EXCLUDED.strike,
+    option_type = EXCLUDED.option_type,
+    lot_size = EXCLUDED.lot_size,
+    product_type = EXCLUDED.product_type,
+    source = EXCLUDED.source,
+    netqty = EXCLUDED.netqty,
+    netavgprc = EXCLUDED.netavgprc,
+    buyqty = EXCLUDED.buyqty,
+    sellqty = EXCLUDED.sellqty,
+    buyavgprc = EXCLUDED.buyavgprc,
+    sellavgprc = EXCLUDED.sellavgprc,
+    realized_pnl = EXCLUDED.realized_pnl,
+    status = EXCLUDED.status,
+    updated_at = NOW()

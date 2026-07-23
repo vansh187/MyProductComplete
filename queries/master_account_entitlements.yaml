@@ -1,0 +1,20 @@
+insert_entitlement: |
+  INSERT INTO master_account_order_entitlements
+    (broker_order_id, internal_order_id, user_id, symbol, side, quantity, created_at, updated_at)
+  VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+  RETURNING id
+
+set_broker_order_id: |
+  UPDATE master_account_order_entitlements
+  SET broker_order_id = %s, updated_at = NOW()
+  WHERE id = %s
+
+get_entitlements_for_broker_order: |
+  SELECT id, broker_order_id, internal_order_id, user_id, symbol, side, quantity, created_at
+  FROM master_account_order_entitlements
+  WHERE broker_order_id = %s
+
+get_entitlement_for_internal_order: |
+  SELECT id, broker_order_id, internal_order_id, user_id, symbol, side, quantity, created_at
+  FROM master_account_order_entitlements
+  WHERE internal_order_id = %s

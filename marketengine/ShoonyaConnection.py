@@ -2,6 +2,7 @@ import os
 import asyncio
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,15 @@ except ImportError:
 class _ShoonyaApi(_NorenApi):
     def __init__(self, api_url: str):
         api_url = api_url.rstrip("/")
-        ws_url  = api_url.replace("https://", "wss://").replace("NorenWClientAPI", "NorenWSAPI")
+        # Strip whatever scheme api_url has (http/https/ws/wss, any case) and
+        # always force wss:// - a plain substring .replace("https://", "wss://")
+        # silently leaves the scheme untouched (and NorenApi.start_websocket()
+        # then hands an http(s):// URL straight to websocket-client, which
+        # rejects it with "scheme https is invalid") for anything that isn't
+        # an exact lowercase "https://" prefix, e.g. a differently-cased
+        # scheme or a URL with no scheme at all.
+        host_and_path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", api_url)
+        ws_url = "wss://" + host_and_path.replace("NorenWClientAPI", "NorenWSAPI")
         super().__init__(host=api_url, websocket=ws_url)
 
 
@@ -237,6 +246,35 @@ class ShoonyaConnection:
             print(f"[Shoonya] get_index_quote error {exchange}:{token}: {exc}")
             return None
 
+    def get_option_quote(self, exchange: str, token: str) -> dict | None:
+        """
+        REST snapshot for a single option contract - used to seed OI/LTP/bid/
+        ask immediately when a strike chain is first subscribed, before
+        touchline ticks start arriving (WS updates only carry the fields that
+        changed, so a fresh contract has nothing until the first tick).
+        Returns a normalised dict or None on failure.
+        Keys: ltp, bid, ask, oi, volume
+        """
+        if not self._connected or self._api is None:
+            return None
+        try:
+            ret = self._api.get_quotes(exchange=exchange, token=token)
+            if not ret or ret.get("stat") != "Ok":
+                print(f"[Shoonya] get_option_quote failed {exchange}:{token} → {ret}")
+                return None
+
+            return {
+                "ltp":    _safe_float(ret.get("lp")),
+                "bid":    _safe_float(ret.get("bp1")),
+                "ask":    _safe_float(ret.get("sp1")),
+                "oi":     int(_safe_float(ret.get("oi"))) if ret.get("oi") not in (None, "") else None,
+                "volume": int(_safe_float(ret.get("v"))) if ret.get("v") not in (None, "") else None,
+            }
+
+        except Exception as exc:
+            print(f"[Shoonya] get_option_quote error {exchange}:{token}: {exc}")
+            return None
+
     def get_time_price_series(self, exchange: str, token: str, interval: str, days: int = 1) -> list[dict] | None:
         """
         Fetch OHLC candle data from Shoonya for a given timeframe.
@@ -244,7 +282,9 @@ class ShoonyaConnection:
         Args:
             exchange: 'NSE' or 'BSE'
             token: Security token (e.g. '26000' for Nifty 50)
-            interval: Candle interval ('1minute', '3minute', '5minute', '15minute', '1hour', '1day')
+            interval: Candle interval in minutes as a string, one of
+                '1', '3', '5', '15', '60' (NorenApi's TPSeries only supports
+                minute granularity - no sub-minute intervals).
             days: Number of days of history to fetch (default 1 = today)
 
         Returns:
@@ -254,38 +294,48 @@ class ShoonyaConnection:
         if not self._connected or self._api is None:
             return None
 
+        if not interval:
+            return None
+
         try:
+            starttime = time.time() - (days * 86400)
+
             ret = self._api.get_time_price_series(
                 exchange=exchange,
                 token=token,
-                starttime=0,
+                starttime=starttime,
                 interval=interval,
-                lastn=500  # Get last 500 candles (covers ~8 hours of 1m data)
             )
 
-            if not ret or ret.get("stat") != "Ok":
+            # NorenApi returns a plain list of candle dicts on success, or a
+            # dict (e.g. {"stat": "Not_Ok", "emsg": ...}) on failure.
+            if not ret or not isinstance(ret, list):
                 print(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
                 return None
 
-            candles = ret.get("jdata", [])
-            if not candles:
-                return None
-
-            # Parse Shoonya's timestamp format and normalize
-            result = []
-            for candle in candles:
+            # Parse Shoonya's TPSeries field names and normalize. TPSeries
+            # returns candles newest-first, but callers expect chronological
+            # (oldest-first) order for charting/trimming, so sort by the
+            # broker's own timestamp before returning.
+            parsed = []
+            for candle in ret:
                 try:
-                    result.append({
-                        "timestamp": candle.get("time"),  # Already ISO-8601 from Shoonya
-                        "open":      _safe_float(candle.get("o")),
-                        "high":      _safe_float(candle.get("h")),
-                        "low":       _safe_float(candle.get("l")),
-                        "close":     _safe_float(candle.get("c")),
-                        "volume":    int(candle.get("v", 0)) if candle.get("v") else 0,
-                    })
+                    raw_time = candle.get("time")
+                    sort_key = datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S")
+                    parsed.append((sort_key, {
+                        "timestamp": raw_time,
+                        "open":      _safe_float(candle.get("into")),
+                        "high":      _safe_float(candle.get("inth")),
+                        "low":       _safe_float(candle.get("intl")),
+                        "close":     _safe_float(candle.get("intc")),
+                        "volume":    int(_safe_float(candle.get("intv"))),
+                    }))
                 except Exception as e:
                     print(f"[Shoonya] Error parsing candle {candle}: {e}")
                     continue
+
+            parsed.sort(key=lambda item: item[0])
+            result = [candle for _, candle in parsed]
 
             return result if result else None
 
@@ -520,6 +570,21 @@ async def schedule_daily_refresh(app):
             ok = False
         if ok:
             app.state.shoonya = shoonya
+
+            # connect() (called inside auto_login) builds a BRAND NEW NorenApi
+            # instance every time, so any option-chain WebSocket opened on the
+            # previous instance is now orphaned — without this, option-chain
+            # ticks would go permanently dead after every reconnect (daily
+            # 8:30 AM refresh, or a retry after an outage) even though REST
+            # endpoints keep working fine since they resolve self._api fresh
+            # on every call.
+            option_feed = getattr(app.state, "option_feed", None)
+            if option_feed is not None:
+                try:
+                    option_feed.start()
+                    print("[Shoonya] Option chain WS feed restarted after reconnect")
+                except Exception as exc:
+                    print(f"[Shoonya] Failed to restart option chain feed after reconnect: {exc}")
         return ok
 
     while True:

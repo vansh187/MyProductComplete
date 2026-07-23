@@ -1,7 +1,7 @@
 select_order_counts: |
   SELECT
     COUNT(*) AS total_orders,
-    COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pending_orders,
+    COALESCE(SUM(CASE WHEN status IN ('PENDING', 'PENDING_TRIGGER') THEN 1 ELSE 0 END), 0) AS pending_orders,
     COALESCE(SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END), 0) AS executed_orders,
     COALESCE(SUM(CASE WHEN status = 'PARTIALLY_EXECUTED' THEN 1 ELSE 0 END), 0) AS partially_executed_orders,
     COALESCE(SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled_orders,

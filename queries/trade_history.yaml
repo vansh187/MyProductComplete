@@ -10,3 +10,10 @@ get_trade_history_by_user: |
   FROM trade_history
   WHERE user_id = %s
   ORDER BY executed_at DESC
+
+get_fill_stats_by_order_id: |
+  SELECT
+    COALESCE(SUM(quantity * execution_price) / NULLIF(SUM(quantity), 0), 0) AS avg_fill_price,
+    COALESCE(SUM(quantity), 0) AS filled_qty
+  FROM trade_history
+  WHERE buy_order_id = %s OR sell_order_id = %s

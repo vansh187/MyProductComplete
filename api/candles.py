@@ -25,13 +25,13 @@ def _get_shoonya(request: Request):
 @router.get("/nifty/candles")
 async def get_nifty_candles(
     request: Request,
-    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("1m", description="Supported: 1m, 3m, 5m, 15m, 1h"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
     Returns OHLC candle data for Nifty 50 at the specified timeframe.
 
-    Timeframes: 5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d
+    Timeframes: 1m, 3m, 5m, 15m, 1h (Shoonya's TPSeries has no sub-minute or daily granularity)
     Limit: 1-500 candles (default 100)
 
     Response:
@@ -45,7 +45,7 @@ async def get_nifty_candles(
       "errors": []
     }
     """
-    if timeframe not in ("5s", "10s", "1m", "3m", "5m", "15m", "1h", "1d"):
+    if timeframe not in CandleService.SUPPORTED_TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe: {timeframe}")
 
     shoonya = _get_shoonya(request)
@@ -71,16 +71,16 @@ async def get_nifty_candles(
 @router.get("/banknifty/candles")
 async def get_banknifty_candles(
     request: Request,
-    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("1m", description="Supported: 1m, 3m, 5m, 15m, 1h"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
     Returns OHLC candle data for Bank Nifty at the specified timeframe.
 
-    Timeframes: 5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d
+    Timeframes: 1m, 3m, 5m, 15m, 1h (Shoonya's TPSeries has no sub-minute or daily granularity)
     Limit: 1-500 candles (default 100)
     """
-    if timeframe not in ("5s", "10s", "1m", "3m", "5m", "15m", "1h", "1d"):
+    if timeframe not in CandleService.SUPPORTED_TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe: {timeframe}")
 
     shoonya = _get_shoonya(request)
@@ -106,16 +106,16 @@ async def get_banknifty_candles(
 @router.get("/finnifty/candles")
 async def get_finnifty_candles(
     request: Request,
-    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("1m", description="Supported: 1m, 3m, 5m, 15m, 1h"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
     Returns OHLC candle data for Fin Nifty at the specified timeframe.
 
-    Timeframes: 5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d
+    Timeframes: 1m, 3m, 5m, 15m, 1h (Shoonya's TPSeries has no sub-minute or daily granularity)
     Limit: 1-500 candles (default 100)
     """
-    if timeframe not in ("5s", "10s", "1m", "3m", "5m", "15m", "1h", "1d"):
+    if timeframe not in CandleService.SUPPORTED_TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe: {timeframe}")
 
     shoonya = _get_shoonya(request)
@@ -141,16 +141,16 @@ async def get_finnifty_candles(
 @router.get("/sensex/candles")
 async def get_sensex_candles(
     request: Request,
-    timeframe: str = Query("5s", description="5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d"),
+    timeframe: str = Query("1m", description="Supported: 1m, 3m, 5m, 15m, 1h"),
     limit: int = Query(100, ge=1, le=500, description="Number of candles to return"),
 ):
     """
     Returns OHLC candle data for Sensex (BSE) at the specified timeframe.
 
-    Timeframes: 5s, 10s, 1m, 3m, 5m, 15m, 1h, 1d
+    Timeframes: 1m, 3m, 5m, 15m, 1h (Shoonya's TPSeries has no sub-minute or daily granularity)
     Limit: 1-500 candles (default 100)
     """
-    if timeframe not in ("5s", "10s", "1m", "3m", "5m", "15m", "1h", "1d"):
+    if timeframe not in CandleService.SUPPORTED_TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe: {timeframe}")
 
     shoonya = _get_shoonya(request)

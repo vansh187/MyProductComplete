@@ -30,4 +30,7 @@ class TradeHistoryService:
         
 
     def getTradeOrdersById(self, userId):
-        return tradeHist.getTradeOrdersById(userId)    
+        return tradeHist.getTradeOrdersById(userId)
+
+    def getFillStats(self, order_id, cursor):
+        return tradeHist.getFillStatsByOrderId(order_id, cursor)

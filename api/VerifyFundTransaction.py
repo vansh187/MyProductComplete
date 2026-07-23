@@ -29,7 +29,7 @@ def verifyFundPayments(payload:VeriFyTransaction,background_tasks: BackgroundTas
         }
 
 @router.post("/v1/razorpay-webhook", status_code=status.HTTP_200_OK)
-async def verifyRazorPayWebhook(request: Request, x_razorpay_signature: str = Header(None)):
+async def verifyRazorPayWebhook(request: Request, background_tasks: BackgroundTasks, x_razorpay_signature: str = Header(None)):
         payload_bytes = await request.body()
 
         try:
@@ -50,7 +50,7 @@ async def verifyRazorPayWebhook(request: Request, x_razorpay_signature: str = He
             )
 
         print("before process webhook data in background")
-        process_webhook_data_in_background(payload_dict)
+        background_tasks.add_task(process_webhook_data_in_background, payload_dict)
         print("after process webhook data in background")
         return {"status": "accepted", "message": "Webhook authenticated and queued"}
 

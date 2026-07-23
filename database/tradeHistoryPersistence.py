@@ -33,6 +33,17 @@ class TradeHistoryPersistence:
         except Exception as ex:
             raise Exception(f"Error inserting trade history: {str(ex)}") from ex
 
+    def getFillStatsByOrderId(order_id, cursor):
+        """Weighted avg fill price + total filled qty across ALL trade_history rows for this order_id."""
+        cursor.execute(
+            QueryLoader.get('trade_history.yaml', 'get_fill_stats_by_order_id'),
+            (order_id, order_id)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return 0, 0
+        return row['avg_fill_price'], row['filled_qty']
+
     def getTradeOrdersById(userId):
         conn = None
         cursor = None
