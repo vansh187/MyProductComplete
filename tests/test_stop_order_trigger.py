@@ -211,7 +211,7 @@ class TestCreateTradeInOrderBookDormantStatus:
         cursor.fetchone.return_value = {"id": 1}
         with patch("database.portfolioPersistence.QueryLoader") as mock_loader:
             mock_loader.get.return_value = "INSERT ..."
-            portfolioPersistence.createTradeinOrderBook(MagicMock(), cursor, order, 7, 900)
+            portfolioPersistence().createTradeinOrderBook(MagicMock(), cursor, order, 7, 900)
         params = cursor.execute.call_args.args[1]
         return params
 
