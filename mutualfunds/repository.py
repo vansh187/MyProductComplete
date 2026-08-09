@@ -21,6 +21,13 @@ class MFSchemeRepository:
         etc. are filled in later by the backfill staleness check via mark_active_and_backfilled."""
         if not schemes:
             return
+        # mfapi.in's scheme list genuinely contains duplicate scheme_code
+        # entries. execute_values puts every row of a batch into ONE
+        # multi-row INSERT, and Postgres's ON CONFLICT DO UPDATE cannot
+        # apply twice to the same conflicting key within a single statement
+        # (raises CardinalityViolation) - dedupe by scheme_code first so a
+        # batch containing a duplicate never reaches that statement.
+        deduped = {s["scheme_code"]: s["scheme_name"] for s in schemes}
         conn = None
         cursor = None
         try:
@@ -30,7 +37,7 @@ class MFSchemeRepository:
             # execute_values batches rows into a handful of multi-row INSERTs
             # instead of executemany's one-round-trip-per-row - matters here
             # since the daily sync upserts the full ~50k-75k scheme catalog.
-            psycopg2.extras.execute_values(cursor, query, [(s["scheme_code"], s["scheme_name"]) for s in schemes])
+            psycopg2.extras.execute_values(cursor, query, list(deduped.items()))
             conn.commit()
         except Exception as ex:
             if conn is not None:
