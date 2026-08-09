@@ -103,7 +103,16 @@ class MutualFundService:
 
         if page == 1:
             curated_rows = await self._run_sync(self._curated_picks_repository.get_picks, key)
-            if curated_rows:
+            # Curated picks are capped (MFCurationService writes at most ~10
+            # per collection) - only serve them as-is when that's enough to
+            # fill the caller's requested page_size. A shorter curated list
+            # served as a "full" page 1 would make a paginating client see
+            # results.length < page_size and stop requesting further pages,
+            # permanently hiding real funds beyond the curated cap even
+            # though the category has more (top_by_category below would
+            # return them). Falling through to the live query instead always
+            # returns as many real matches as actually exist for the page.
+            if len(curated_rows) >= page_size:
                 return [self._row_to_summary(row) for row in curated_rows[:page_size]]
 
         offset = max(page - 1, 0) * page_size

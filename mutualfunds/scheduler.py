@@ -10,6 +10,7 @@ logger = logging.getLogger("mutualfunds.scheduler")
 
 _BACKFILL_BATCH_SIZE = 4000
 _REFRESH_INTERVAL_SECONDS = 24 * 3600
+_CACHE_EVICTION_INTERVAL_SECONDS = 15 * 60  # well below the cache's own 10-min TTL
 
 
 class MutualFundBackgroundJobRunner:
@@ -49,3 +50,26 @@ async def schedule_daily_refresh(app=None) -> None:
         except Exception as exc:
             logger.error(f"[MutualFunds] daily job sequence failed: {exc}")
         await asyncio.sleep(_REFRESH_INTERVAL_SECONDS)
+
+
+async def schedule_cache_eviction(app=None) -> None:
+    """
+    Background task entry point: periodically sweeps MFInMemoryCache for
+    expired entries. get_nav_series() already self-cleans on read, but a
+    scheme that's viewed once and never opened again would otherwise sit in
+    memory past its TTL forever (get_nav_chart calls get/set_nav_series for
+    every distinct scheme_code ever viewed) - this bounds that to at most
+    _CACHE_EVICTION_INTERVAL_SECONDS of staleness instead of the life of the
+    process.
+    """
+    cache = getattr(app.state, "mf_cache", None)
+    if cache is None:
+        logger.warning("[MutualFunds] cache not initialized - skipping eviction loop")
+        return
+
+    while True:
+        await asyncio.sleep(_CACHE_EVICTION_INTERVAL_SECONDS)
+        try:
+            await cache.evict_expired()
+        except Exception as exc:
+            logger.error(f"[MutualFunds] cache eviction failed: {exc}")

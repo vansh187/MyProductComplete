@@ -1,6 +1,6 @@
-upsert_scheme: |
+upsert_schemes_bulk: |
   INSERT INTO mf_schemes (scheme_code, scheme_name)
-  VALUES (%s, %s)
+  VALUES %s
   ON CONFLICT (scheme_code) DO UPDATE SET
     scheme_name = EXCLUDED.scheme_name,
     updated_at = NOW()

@@ -26,8 +26,11 @@ class MFSchemeRepository:
         try:
             conn = self._connection_factory()
             cursor = conn.cursor()
-            query = QueryLoader.get('mutual_funds.yaml', 'upsert_scheme')
-            cursor.executemany(query, [(s["scheme_code"], s["scheme_name"]) for s in schemes])
+            query = QueryLoader.get('mutual_funds.yaml', 'upsert_schemes_bulk')
+            # execute_values batches rows into a handful of multi-row INSERTs
+            # instead of executemany's one-round-trip-per-row - matters here
+            # since the daily sync upserts the full ~50k-75k scheme catalog.
+            psycopg2.extras.execute_values(cursor, query, [(s["scheme_code"], s["scheme_name"]) for s in schemes])
             conn.commit()
         except Exception as ex:
             if conn is not None:

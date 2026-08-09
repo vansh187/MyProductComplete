@@ -31,7 +31,14 @@ class MFInMemoryCache:
     async def get_nav_series(self, scheme_code: int) -> list[NavPointDTO] | None:
         async with self._lock:
             entry = self._entries.get(scheme_code)
-            if entry is None or entry.expires_at < time.monotonic():
+            if entry is None:
+                return None
+            if entry.expires_at < time.monotonic():
+                # Self-clean on read so a scheme that's viewed once and never
+                # again doesn't sit in memory forever after expiry - the
+                # periodic evict_expired() sweep (see scheduler.py) still
+                # catches entries that are set but never read again.
+                del self._entries[scheme_code]
                 return None
             return entry.value
 

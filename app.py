@@ -38,7 +38,11 @@ from mutualfunds.providers.mfapi_provider import MfApiInProvider
 from mutualfunds.repository import MFSchemeRepository
 from mutualfunds.returns_calculator import MFReturnsCalculator
 from mutualfunds.returns_repository import MFReturnsRepository
-from mutualfunds.scheduler import MutualFundBackgroundJobRunner, schedule_daily_refresh as mutual_fund_daily_refresh
+from mutualfunds.scheduler import (
+    MutualFundBackgroundJobRunner,
+    schedule_daily_refresh as mutual_fund_daily_refresh,
+    schedule_cache_eviction as mutual_fund_cache_eviction_refresh,
+)
 from mutualfunds.service import MutualFundService
 from mutualfunds.sync_service import MFSchemeMasterSyncService
 from fastapi.middleware.cors import CORSMiddleware
@@ -140,12 +144,14 @@ async def lifespan(app: FastAPI):
     option_master_task   = None
     future_master_task   = None
     mutual_fund_task      = None
+    mutual_fund_cache_eviction_task = None
     app.state.breeze       = None
     app.state.shoonya      = None
     app.state.option_feed  = None
     app.state.mutual_fund_service     = None
     app.state.mutual_fund_job_runner  = None
     app.state.mf_http_client          = None
+    app.state.mf_cache                = None
 
     # ── Mutual Funds (mfapi.in-backed, Supabase-owned, LLM-curated) ──
     try:
@@ -160,6 +166,7 @@ async def lifespan(app: FastAPI):
         mf_collections = MFCollectionsCatalog()
 
         app.state.mf_http_client = mf_http_client
+        app.state.mf_cache = mf_cache
         app.state.mutual_fund_service = MutualFundService(
             scheme_repository=mf_scheme_repo,
             nav_history_repository=mf_nav_repo,
@@ -201,6 +208,9 @@ async def lifespan(app: FastAPI):
         )
         mutual_fund_task = asyncio.create_task(
             _supervised_background_task(mutual_fund_daily_refresh, "mutual_fund_refresh", app)
+        )
+        mutual_fund_cache_eviction_task = asyncio.create_task(
+            _supervised_background_task(mutual_fund_cache_eviction_refresh, "mutual_fund_cache_eviction", app)
         )
         print("App starting... Mutual funds module initialized.")
     except Exception as e:
@@ -315,6 +325,8 @@ async def lifespan(app: FastAPI):
         future_master_task.cancel()
     if mutual_fund_task:
         mutual_fund_task.cancel()
+    if mutual_fund_cache_eviction_task:
+        mutual_fund_cache_eviction_task.cancel()
     if app.state.option_feed:
         app.state.option_feed.close()
     if app.state.mf_http_client is not None:
