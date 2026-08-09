@@ -10,8 +10,22 @@ load_dotenv()
 
 class portfolioPersistence:
 
-    @staticmethod
-    def process_buyer(userId, symbol, quantity, price, cursor):
+    def __init__(self):
+        pass
+
+    def _infer_asset_type(self, symbol: str) -> str:
+        """Derives asset_type from the symbol pattern (derivatives encode
+        their type in the symbol itself, e.g. NIFTY07JUL2623800CE). The
+        strike price digit immediately before CE/PE is what distinguishes
+        a real option symbol from an equity symbol that merely ends in
+        those letters (e.g. RELIANCE)."""
+        if len(symbol) > 2 and symbol[-2:] in ("CE", "PE") and symbol[-3].isdigit():
+            return "OPTION"
+        if symbol.endswith("FUT"):
+            return "FUTURE"
+        return "EQUITY"
+
+    def process_buyer(self, userId, symbol, quantity, price, cursor):
         if price is None or not isinstance(price, (int, float, Decimal)) or price <= 0:
             raise ValueError(f"Invalid price for buyer: {price}")
         try:
@@ -36,8 +50,7 @@ class portfolioPersistence:
         except Exception as ex:
             raise Exception(f"Exception in process_buyer: {str(ex)}") from ex
 
-    @staticmethod
-    def process_seller(userId, symbol, quantity, price, cursor):
+    def process_seller(self, userId, symbol, quantity, price, cursor):
         if quantity <= 0:
             raise Exception("Quantity must be greater than zero")
         try:
@@ -64,20 +77,17 @@ class portfolioPersistence:
             (status, avg_fill_price, filled_qty, trigger_price, client_order_id, order_id)
         )
 
-    @staticmethod
-    def updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id):
+    def updateorderStatus(self, cursor, userId, symbol, status, buy_order_id, sell_order_id):
         value = status if status is not None else "EXECUTED"
         cursor.execute(
             QueryLoader.get('orders.yaml', 'update_order_status'),
             (value, buy_order_id, sell_order_id)
         )
 
-    @staticmethod
-    def updateStatus(userId, symbol, status, buy_order_id, sell_order_id, cursor):
-        portfolioPersistence.updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id)
+    def updateStatus(self, userId, symbol, status, buy_order_id, sell_order_id, cursor):
+        self.updateorderStatus(cursor, userId, symbol, status, buy_order_id, sell_order_id)
 
-    @staticmethod
-    def updateCounterpartyOrderBook(remaining_qty, status, counterparty_order_id, cursor):
+    def updateCounterpartyOrderBook(self, remaining_qty, status, counterparty_order_id, cursor):
         """Update the counterparty's order_book row by orders.id FK."""
         try:
             cursor.execute(
@@ -87,8 +97,7 @@ class portfolioPersistence:
         except Exception as ex:
             raise Exception(f"Error updating counterparty order book: {str(ex)}") from ex
 
-    @staticmethod
-    def updateIncomingOrderBook(remaining_qty, status, order_book_id, cursor):
+    def updateIncomingOrderBook(self, remaining_qty, status, order_book_id, cursor):
         """Update the incoming order's order_book row by order_book.id PK."""
         try:
             cursor.execute(
@@ -98,8 +107,7 @@ class portfolioPersistence:
         except Exception as ex:
             raise Exception(f"Error updating incoming order book: {str(ex)}") from ex
 
-    @staticmethod
-    def createUserHolding(order, userId):
+    def createUserHolding(self, order, userId):
         conn = None
         cursor = None
         try:
@@ -107,7 +115,8 @@ class portfolioPersistence:
             cursor = conn.cursor()
             cursor.execute(
                 QueryLoader.get('portfolio.yaml', 'insert_holdings_with_time'),
-                (userId, order.symbol, order.quantity, order.avg_price)
+                (userId, order.symbol, order.quantity, order.avg_price,
+                 self._infer_asset_type(order.symbol))
             )
             conn.commit()
         except Exception as ex:
@@ -120,8 +129,7 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
-    @staticmethod
-    def updateUserHoldings(order, userId, new_qty, round, new_avg):
+    def updateUserHoldings(self, order, userId, new_qty, round, new_avg):
         conn = None
         cursor = None
         try:
@@ -142,8 +150,7 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
-    @staticmethod
-    def getPortfolioServiceforLoggedInUser(userId):
+    def getPortfolioServiceforLoggedInUser(self, userId):
         conn = None
         cursor = None
         try:
@@ -159,14 +166,19 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
-    @staticmethod
-    def getPortfolioOfLoggedInUserWithProfitLoss(userId):
+    def getPortfolioOfLoggedInUserWithProfitLoss(self, userId, asset_types=None):
         conn = None
         cursor = None
         try:
             conn = PostgresConnectionFactory.create_connection()
             cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cursor.execute(QueryLoader.get('portfolio.yaml', 'select_portfolio_with_pnl'), (userId,))
+            if asset_types is None:
+                cursor.execute(QueryLoader.get('portfolio.yaml', 'select_portfolio_with_pnl'), (userId,))
+            else:
+                cursor.execute(
+                    QueryLoader.get('portfolio.yaml', 'select_portfolio_with_pnl_by_bucket'),
+                    (userId, asset_types)
+                )
             return cursor.fetchall()
         except Exception as ex:
             raise Exception("Error in fetching data for Profit and Loss") from ex
@@ -176,7 +188,23 @@ class portfolioPersistence:
             if conn is not None:
                 conn.close()
 
-    def createTradeinOrderBook(conn, cursor, order, userId, orderId):
+    def getDistinctUsersWithHoldings(self):
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(QueryLoader.get('portfolio.yaml', 'select_distinct_users_with_holdings'))
+            return cursor.fetchall()
+        except Exception as ex:
+            raise Exception("Error in fetching distinct users with holdings") from ex
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+    def createTradeinOrderBook(self, conn, cursor, order, userId, orderId):
         try:
             order_type_value = order_type_str(order.order_type)
             # STOP/STOPLIMIT orders must not be immediately matchable - they

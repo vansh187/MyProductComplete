@@ -1,0 +1,9 @@
+{
+  "_comment": "Underlying -> exchange lot size. NSE/BSE revise these periodically via circulars - keep in sync manually. Unknown underlyings fall back to null lot_size rather than guessing.",
+  "NIFTY": 75,
+  "BANKNIFTY": 35,
+  "FINNIFTY": 65,
+  "MIDCPNIFTY": 140,
+  "SENSEX": 20,
+  "BANKEX": 30
+}

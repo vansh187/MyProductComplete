@@ -39,3 +39,22 @@ class DashBoardPersistence:
                 conn.close()
             if cursor is not None:
                 cursor.close()
+
+    def getHoldingsSummaryByBucket(self, userId, asset_types):
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                QueryLoader.get('dashboard.yaml', 'select_holdings_summary_by_bucket'),
+                (userId, asset_types)
+            )
+            return cursor.fetchone()
+        except Exception as ex:
+            raise Exception(f"Exception raised while fetching bucketed holdings summary: {str(ex)}")
+        finally:
+            if conn is not None:
+                conn.close()
+            if cursor is not None:
+                cursor.close()
