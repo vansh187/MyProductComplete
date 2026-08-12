@@ -35,8 +35,14 @@ CREATE TABLE IF NOT EXISTS mf_nav_history (
     PRIMARY KEY (scheme_code, nav_date)
 );
 
-CREATE INDEX IF NOT EXISTS idx_mf_nav_history_code_date
-    ON mf_nav_history (scheme_code, nav_date DESC);
+-- No separate (scheme_code, nav_date DESC) index here on purpose - the
+-- primary key above already covers every query against this table
+-- (nav_history_get_series ORDER BY nav_date ASC; Postgres can scan a btree
+-- index backwards just as efficiently for the reverse order). An earlier
+-- version of this migration added one preemptively; it was never used by
+-- any query and cost ~430MB on a table that's already the dominant share
+-- of database size (8.5M rows across ~8.6k active schemes) - dropped after
+-- discovering it via a Supabase storage overflow warning.
 
 CREATE TABLE IF NOT EXISTS mf_scheme_returns (
     scheme_code       BIGINT PRIMARY KEY REFERENCES mf_schemes(scheme_code),
