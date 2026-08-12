@@ -34,7 +34,8 @@ from mutualfunds.curation.curated_picks_repository import MFCuratedPicksReposito
 from mutualfunds.curation.fallback_provider import RankedFallbackCurationProvider
 from mutualfunds.curation_service import MFCurationService
 from mutualfunds.daily_sync_service import MFDailyNavSyncService
-from mutualfunds.nav_history_repository import MFNavHistoryRepository
+from mutualfunds.nav_history_storage import MFNavHistoryParquetStorage
+from supabase import create_client as create_supabase_client
 from mutualfunds.providers.mfapi_provider import MfApiInProvider
 from mutualfunds.repository import MFSchemeRepository
 from mutualfunds.returns_calculator import MFReturnsCalculator
@@ -159,7 +160,15 @@ async def lifespan(app: FastAPI):
         mf_http_client = httpx.AsyncClient(timeout=30.0)
         mf_provider = MfApiInProvider(mf_http_client)
         mf_scheme_repo = MFSchemeRepository()
-        mf_nav_repo = MFNavHistoryRepository()
+        # NAV history lives in Supabase Storage as per-scheme Parquet files,
+        # not Postgres - mf_nav_history alone was ~750MB (98% of the whole
+        # database) and hit the plan's storage cap; Storage carries a
+        # separate, larger/cheaper quota and the ~8.7x Parquet compression
+        # measured against the same data shrinks the footprint further.
+        # Same interface as the old MFNavHistoryRepository (bulk_insert/
+        # append_daily/get_series), so nothing downstream changed.
+        mf_supabase_client = create_supabase_client(os.getenv("SUPABASE_URL"), os.getenv("SERVICE_ROLE_KEY"))
+        mf_nav_repo = MFNavHistoryParquetStorage(mf_supabase_client)
         mf_returns_repo = MFReturnsRepository()
         mf_picks_repo = MFCuratedPicksRepository()
         mf_cache = MFInMemoryCache()
