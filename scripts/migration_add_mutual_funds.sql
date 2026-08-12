@@ -28,6 +28,15 @@ CREATE INDEX IF NOT EXISTS idx_mf_schemes_fund_house
 CREATE INDEX IF NOT EXISTS idx_mf_schemes_pending_backfill
     ON mf_schemes (scheme_code) WHERE is_active IS NULL;
 
+-- As of mutualfunds/nav_history_storage.py, this table is NOT the live NAV
+-- history store - it's kept empty/unused going forward. Full NAV history
+-- moved to one compressed Parquet file per scheme in Supabase Storage
+-- (bucket "mutual-fund-nav-history") via MFNavHistoryParquetStorage, after
+-- this table alone reached ~750MB (98% of the database) and hit the plan's
+-- storage cap. The schema is left in place only in case a Postgres-backed
+-- fallback is ever needed again; MFNavHistoryRepository.py (the old
+-- implementation) still exists for the same reason but is no longer wired
+-- into app.py.
 CREATE TABLE IF NOT EXISTS mf_nav_history (
     scheme_code   BIGINT NOT NULL REFERENCES mf_schemes(scheme_code),
     nav_date      DATE NOT NULL,
