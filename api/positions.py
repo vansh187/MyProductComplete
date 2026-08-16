@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends
 from utils.auth_dependency import get_current_user
 from service.positionsService import PositionsService
+from database.positionCache import PositionCache
 
 router = APIRouter()
+_position_cache = PositionCache()
 
 
 @router.get("/getFnoPositionsForLoggedInUser")
@@ -45,12 +47,6 @@ def getFnoPositionsForLoggedInUser(currentUser=Depends(get_current_user)):
         return {"success": False, "message": f"Error building F&O positions: {str(e)}"}
     except Exception:
         return {"success": False, "message": "An unexpected error occurred while fetching F&O positions"}
-
-from utils.auth_dependency import get_current_user
-from database.positionCache import PositionCache
-
-router = APIRouter()
-_position_cache = PositionCache()
 
 
 @router.get("/getPositionsForLoggedInUser")
