@@ -14,8 +14,8 @@ insert_holdings: |
   VALUES (%s, %s, %s, %s)
 
 insert_holdings_with_time: |
-  INSERT INTO holdings (user_id, symbol, quantity, avg_price, updated_at)
-  VALUES (%s, %s, %s, %s, NOW())
+  INSERT INTO holdings (user_id, symbol, quantity, avg_price, asset_type, updated_at)
+  VALUES (%s, %s, %s, %s, %s, NOW())
 
 update_order_quantity: |
   UPDATE holdings
@@ -28,16 +28,26 @@ update_user_holdings: |
   WHERE user_id = %s AND symbol = %s
 
 select_user_portfolio: |
-  SELECT symbol, quantity, avg_price, updated_at
+  SELECT symbol, quantity, avg_price, asset_type, updated_at
   FROM holdings
   WHERE user_id = %s AND quantity > 0
 
 select_portfolio_with_pnl: |
-  SELECT h.symbol, h.quantity, h.avg_price,
+  SELECT h.symbol, h.quantity, h.avg_price, h.asset_type,
          COALESCE(mp.current_price, h.avg_price) AS current_price
   FROM holdings h
   LEFT JOIN market_prices mp ON h.symbol = mp.symbol
   WHERE h.user_id = %s AND h.quantity > 0
+
+select_portfolio_with_pnl_by_bucket: |
+  SELECT h.symbol, h.quantity, h.avg_price, h.asset_type,
+         COALESCE(mp.current_price, h.avg_price) AS current_price
+  FROM holdings h
+  LEFT JOIN market_prices mp ON h.symbol = mp.symbol
+  WHERE h.user_id = %s AND h.quantity > 0 AND h.asset_type = ANY(%s)
+
+select_distinct_users_with_holdings: |
+  SELECT DISTINCT user_id FROM holdings WHERE quantity > 0
 
 insert_order_book: |
   INSERT INTO order_book

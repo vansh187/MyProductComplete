@@ -15,9 +15,9 @@ from service.portfolioService import portfolioService
 from service.orderService import OrderService
 from service.tradeSettlementService import TradeSettlementService
 from service.tradeHistoryService import TradeHistoryService as tradeService
-from service.walletbalance.WalletBalanceService import WalletBalanceService
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from service.matchingEngine.matchingEngine import MatchingEngine
+from service.walletbalance.WalletBalanceService import WalletBalanceService
 from service.stopOrderTriggerService import stopOrderTriggerService
 from api.models import OrderCreate, OrderSide, is_dormant_order_type, order_type_str
 
@@ -450,7 +450,7 @@ class ExecutionEngine:
                     trigger_price=float(self.order.trigger_price) if self.order.trigger_price else None,
                     client_order_id=self.order.client_order_id
                 )
-                
+
                 # Settle both sides of the match. match_found always carries both
                 # parties, regardless of which side placed the incoming (taker)
                 # order — the counterparty's resting (maker) order must be settled

@@ -1,0 +1,138 @@
+upsert_schemes_bulk: |
+  INSERT INTO mf_schemes (scheme_code, scheme_name)
+  VALUES %s
+  ON CONFLICT (scheme_code) DO UPDATE SET
+    scheme_name = EXCLUDED.scheme_name,
+    updated_at = NOW()
+
+search_schemes: |
+  SELECT s.scheme_code, s.scheme_name, s.fund_house, s.scheme_category, s.scheme_type,
+         r.latest_nav, r.return_3y
+  FROM mf_schemes s
+  LEFT JOIN mf_scheme_returns r ON r.scheme_code = s.scheme_code
+  WHERE s.is_active = TRUE
+    AND (%(query)s IS NULL OR s.scheme_name ILIKE %(query_pattern)s)
+    AND (%(category)s IS NULL OR s.scheme_category = %(category)s)
+    AND (%(fund_house)s IS NULL OR s.fund_house = %(fund_house)s)
+  ORDER BY s.scheme_name ASC
+  LIMIT %(limit)s OFFSET %(offset)s
+
+get_scheme_by_code: |
+  SELECT scheme_code, scheme_name, fund_house, scheme_category, scheme_type,
+         isin_growth, isin_div_reinvestment, is_active
+  FROM mf_schemes
+  WHERE scheme_code = %s
+
+list_categories: |
+  SELECT DISTINCT scheme_category
+  FROM mf_schemes
+  WHERE is_active = TRUE AND scheme_category IS NOT NULL
+  ORDER BY scheme_category ASC
+
+list_fund_houses: |
+  SELECT DISTINCT fund_house
+  FROM mf_schemes
+  WHERE is_active = TRUE AND fund_house IS NOT NULL
+  ORDER BY fund_house ASC
+
+get_schemes_pending_backfill: |
+  SELECT scheme_code
+  FROM mf_schemes
+  WHERE is_active IS NULL
+  ORDER BY scheme_code ASC
+  LIMIT %s
+
+mark_inactive: |
+  UPDATE mf_schemes
+  SET is_active = FALSE, updated_at = NOW()
+  WHERE scheme_code = %s
+
+mark_active_and_backfilled: |
+  UPDATE mf_schemes
+  SET is_active = TRUE,
+      is_backfilled = TRUE,
+      fund_house = %(fund_house)s,
+      scheme_type = %(scheme_type)s,
+      scheme_category = %(scheme_category)s,
+      isin_growth = %(isin_growth)s,
+      isin_div_reinvestment = %(isin_div_reinvestment)s,
+      scheme_name = COALESCE(%(scheme_name)s, scheme_name),
+      updated_at = NOW()
+  WHERE scheme_code = %(scheme_code)s
+
+is_scheme_backfilled: |
+  SELECT is_backfilled FROM mf_schemes WHERE scheme_code = %s
+
+nav_history_bulk_insert: |
+  INSERT INTO mf_nav_history (scheme_code, nav_date, nav)
+  VALUES %s
+  ON CONFLICT (scheme_code, nav_date) DO UPDATE SET nav = EXCLUDED.nav
+
+nav_history_append_daily: |
+  INSERT INTO mf_nav_history (scheme_code, nav_date, nav)
+  VALUES (%s, %s, %s)
+  ON CONFLICT (scheme_code, nav_date) DO UPDATE SET nav = EXCLUDED.nav
+
+nav_history_get_series: |
+  SELECT nav_date, nav
+  FROM mf_nav_history
+  WHERE scheme_code = %s
+    AND (%s::date IS NULL OR nav_date >= %s::date)
+  ORDER BY nav_date ASC
+
+upsert_returns: |
+  INSERT INTO mf_scheme_returns
+    (scheme_code, return_1m, return_6m, return_1y, return_3y, return_5y,
+     day_change_pct, latest_nav, last_computed_at)
+  VALUES (%(scheme_code)s, %(return_1m)s, %(return_6m)s, %(return_1y)s,
+          %(return_3y)s, %(return_5y)s, %(day_change_pct)s, %(latest_nav)s, NOW())
+  ON CONFLICT (scheme_code) DO UPDATE SET
+    return_1m = EXCLUDED.return_1m,
+    return_6m = EXCLUDED.return_6m,
+    return_1y = EXCLUDED.return_1y,
+    return_3y = EXCLUDED.return_3y,
+    return_5y = EXCLUDED.return_5y,
+    day_change_pct = EXCLUDED.day_change_pct,
+    latest_nav = EXCLUDED.latest_nav,
+    last_computed_at = NOW()
+
+get_returns: |
+  SELECT scheme_code, return_1m, return_6m, return_1y, return_3y, return_5y,
+         day_change_pct, latest_nav, last_computed_at
+  FROM mf_scheme_returns
+  WHERE scheme_code = %s
+
+top_by_category: |
+  SELECT r.scheme_code, s.scheme_name, s.fund_house, s.scheme_category, s.scheme_type,
+         r.latest_nav, r.return_1m, r.return_6m, r.return_1y, r.return_3y, r.return_5y
+  FROM mf_scheme_returns r
+  JOIN mf_schemes s ON s.scheme_code = r.scheme_code
+  WHERE s.is_active = TRUE
+    AND (%(categories)s IS NULL OR s.scheme_category = ANY(%(categories)s))
+  ORDER BY r.{sort_by} DESC NULLS LAST
+  LIMIT %(limit)s OFFSET %(offset)s
+
+get_all_backfilled_scheme_codes: |
+  SELECT scheme_code FROM mf_schemes WHERE is_backfilled = TRUE AND is_active = TRUE
+
+delete_curated_picks_for_collection: |
+  DELETE FROM mf_curated_picks WHERE collection_key = %s
+
+insert_curated_pick: |
+  INSERT INTO mf_curated_picks (collection_key, scheme_code, rank, blurb, curated_by)
+  VALUES (%s, %s, %s, %s, %s)
+  ON CONFLICT (collection_key, scheme_code) DO UPDATE SET
+    rank = EXCLUDED.rank,
+    blurb = EXCLUDED.blurb,
+    curated_by = EXCLUDED.curated_by,
+    curated_at = NOW()
+
+get_curated_picks: |
+  SELECT p.scheme_code, p.rank, p.blurb, p.curated_by,
+         s.scheme_name, s.fund_house, s.scheme_category, s.scheme_type,
+         r.latest_nav, r.return_1m, r.return_6m, r.return_1y, r.return_3y, r.return_5y
+  FROM mf_curated_picks p
+  JOIN mf_schemes s ON s.scheme_code = p.scheme_code
+  LEFT JOIN mf_scheme_returns r ON r.scheme_code = p.scheme_code
+  WHERE p.collection_key = %s
+  ORDER BY p.rank ASC

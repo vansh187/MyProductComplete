@@ -69,6 +69,11 @@ class ExchangeType(str, Enum):
     MCXSX = "MCXSX"
 
 
+# Derivative exchanges routed to the F&O positions book (service/positionsService.py)
+# instead of equity holdings - NSE/BSE are the only cash-equity exchanges.
+DERIVATIVE_EXCHANGES = {ExchangeType.NFO, ExchangeType.NCDEX, ExchangeType.MCXSX}
+
+
 # ============================================
 # ORDER CREATE MODEL
 # ============================================

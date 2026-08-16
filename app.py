@@ -1,16 +1,19 @@
 import asyncio
 import logging
+import os
 import time
+import httpx
 from fastapi import FastAPI
 from api.signup import router as signup_router
 from api.login import router as login_router
 from api.orders import router as orders_router
 from api.trade import router as trade_history
 from api.portfolio import router as user_portfolio
+from api.positions import router as fnoPositionsRouter
 from api.positions import router as positionsRouter
 from api.VerifyFundTransaction import router as verify_transaction
 from contextlib import asynccontextmanager
-from api.Dashboard import router as dashboardRouter
+from api.Dashboard import router as dashboardRouter, start_equity_curve_capture as equity_curve_refresh
 from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter
 from api.auth_google import router as googleAuthRouter
@@ -23,7 +26,44 @@ from service.positionTickService import positionTickService
 from service.orderUpdateService import OrderUpdateService
 from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
 from appconfig.FutureMaster import schedule_daily_refresh as future_master_daily_refresh
+from api.mutualFunds import router as mutualFundsRouter
+from mutualfunds.backfill_service import MFNavBackfillService
+from mutualfunds.cache import MFInMemoryCache
+from mutualfunds.collections_config import MFCollectionsCatalog
+from mutualfunds.curation.curated_picks_repository import MFCuratedPicksRepository
+from mutualfunds.curation.fallback_provider import RankedFallbackCurationProvider
+from mutualfunds.curation_service import MFCurationService
+from mutualfunds.daily_sync_service import MFDailyNavSyncService
+from mutualfunds.nav_history_storage import MFNavHistoryParquetStorage
+from supabase import create_client as create_supabase_client
+from mutualfunds.providers.mfapi_provider import MfApiInProvider
+from mutualfunds.repository import MFSchemeRepository
+from mutualfunds.returns_calculator import MFReturnsCalculator
+from mutualfunds.returns_repository import MFReturnsRepository
+from mutualfunds.scheduler import (
+    MutualFundBackgroundJobRunner,
+    schedule_daily_refresh as mutual_fund_daily_refresh,
+    schedule_cache_eviction as mutual_fund_cache_eviction_refresh,
+)
+from mutualfunds.service import MutualFundService
+from mutualfunds.sync_service import MFSchemeMasterSyncService
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from mutualfunds.curation.gemini_provider import GeminiCurationProvider
+    _GEMINI_IMPORTABLE = True
+except Exception as _gemini_import_err:
+    GeminiCurationProvider = None
+    _GEMINI_IMPORTABLE = False
+    print(f"[WARNING] Gemini curation provider unavailable: {_gemini_import_err}")
+
+try:
+    from mutualfunds.curation.groq_provider import GroqCurationProvider
+    _GROQ_IMPORTABLE = True
+except Exception as _groq_import_err:
+    GroqCurationProvider = None
+    _GROQ_IMPORTABLE = False
+    print(f"[WARNING] Groq curation provider unavailable: {_groq_import_err}")
 try:
     from breeze_connect import BreezeConnect
     from marketengine.config import Config
@@ -105,9 +145,86 @@ async def lifespan(app: FastAPI):
     top_movers_task      = None
     option_master_task   = None
     future_master_task   = None
+    mutual_fund_task      = None
+    mutual_fund_cache_eviction_task = None
     app.state.breeze       = None
     app.state.shoonya      = None
     app.state.option_feed  = None
+    app.state.mutual_fund_service     = None
+    app.state.mutual_fund_job_runner  = None
+    app.state.mf_http_client          = None
+    app.state.mf_cache                = None
+
+    # ── Mutual Funds (mfapi.in-backed, Supabase-owned, LLM-curated) ──
+    try:
+        mf_http_client = httpx.AsyncClient(timeout=30.0)
+        mf_provider = MfApiInProvider(mf_http_client)
+        mf_scheme_repo = MFSchemeRepository()
+        # NAV history lives in Supabase Storage as per-scheme Parquet files,
+        # not Postgres - mf_nav_history alone was ~750MB (98% of the whole
+        # database) and hit the plan's storage cap; Storage carries a
+        # separate, larger/cheaper quota and the ~8.7x Parquet compression
+        # measured against the same data shrinks the footprint further.
+        # Same interface as the old MFNavHistoryRepository (bulk_insert/
+        # append_daily/get_series), so nothing downstream changed.
+        mf_supabase_client = create_supabase_client(os.getenv("SUPABASE_URL"), os.getenv("SERVICE_ROLE_KEY"))
+        mf_nav_repo = MFNavHistoryParquetStorage(mf_supabase_client)
+        mf_returns_repo = MFReturnsRepository()
+        mf_picks_repo = MFCuratedPicksRepository()
+        mf_cache = MFInMemoryCache()
+        mf_calculator = MFReturnsCalculator()
+        mf_collections = MFCollectionsCatalog()
+
+        app.state.mf_http_client = mf_http_client
+        app.state.mf_cache = mf_cache
+        app.state.mutual_fund_service = MutualFundService(
+            scheme_repository=mf_scheme_repo,
+            nav_history_repository=mf_nav_repo,
+            returns_repository=mf_returns_repo,
+            curated_picks_repository=mf_picks_repo,
+            cache=mf_cache,
+            provider=mf_provider,
+            returns_calculator=mf_calculator,
+            collections_catalog=mf_collections,
+        )
+
+        # Curation providers: Gemini primary, Groq secondary, plain-ranked
+        # fallback last - degrades to the fallback whenever a key is
+        # missing or the corresponding SDK failed to import, so the
+        # Explore page is never blocked on LLM availability.
+        fallback_provider = RankedFallbackCurationProvider()
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        groq_key = os.getenv("GROQ_API_KEY")
+        primary_provider = (
+            GeminiCurationProvider(gemini_key) if (_GEMINI_IMPORTABLE and gemini_key) else fallback_provider
+        )
+        secondary_provider = (
+            GroqCurationProvider(groq_key) if (_GROQ_IMPORTABLE and groq_key) else fallback_provider
+        )
+
+        curation_service = MFCurationService(
+            returns_repository=mf_returns_repo,
+            curated_picks_repository=mf_picks_repo,
+            collections_catalog=mf_collections,
+            primary_provider=primary_provider,
+            secondary_provider=secondary_provider,
+            fallback_provider=fallback_provider,
+        )
+        app.state.mutual_fund_job_runner = MutualFundBackgroundJobRunner(
+            master_sync=MFSchemeMasterSyncService(mf_provider, mf_scheme_repo),
+            backfill=MFNavBackfillService(mf_provider, mf_scheme_repo, mf_nav_repo, mf_returns_repo, mf_calculator),
+            daily_sync=MFDailyNavSyncService(mf_provider, mf_scheme_repo, mf_nav_repo, mf_returns_repo, mf_calculator),
+            curation=curation_service,
+        )
+        mutual_fund_task = asyncio.create_task(
+            _supervised_background_task(mutual_fund_daily_refresh, "mutual_fund_refresh", app)
+        )
+        mutual_fund_cache_eviction_task = asyncio.create_task(
+            _supervised_background_task(mutual_fund_cache_eviction_refresh, "mutual_fund_cache_eviction", app)
+        )
+        print("App starting... Mutual funds module initialized.")
+    except Exception as e:
+        print(f"[WARNING] Mutual funds module init error: {e}")
 
     # ── Shoonya (primary indices provider) ───────────────────────────
     if _SHOONYA_IMPORTABLE:
@@ -204,6 +321,9 @@ async def lifespan(app: FastAPI):
     else:
         print("App starting... Breeze unavailable.")
 
+    # ── Equity curve snapshot capture (Postgres-only, no market client) ─
+    equity_curve_task = asyncio.create_task(equity_curve_refresh())
+
     yield
 
     if refresh_task:
@@ -216,8 +336,14 @@ async def lifespan(app: FastAPI):
         option_master_task.cancel()
     if future_master_task:
         future_master_task.cancel()
+    if mutual_fund_task:
+        mutual_fund_task.cancel()
+    if mutual_fund_cache_eviction_task:
+        mutual_fund_cache_eviction_task.cancel()
     if app.state.option_feed:
         app.state.option_feed.close()
+    if app.state.mf_http_client is not None:
+        await app.state.mf_http_client.aclose()
     print("Server shutting down.")
 
 
@@ -238,6 +364,7 @@ app.include_router(sectorPerformanceRouter)
 app.include_router(topMoversRouter)
 app.include_router(candlesRouter)
 app.include_router(optionChainRouter)
+app.include_router(mutualFundsRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],
