@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 import httpx
 from fastapi import FastAPI
 from api.signup import router as signup_router
@@ -27,6 +28,13 @@ from service.orderUpdateService import OrderUpdateService
 from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
 from appconfig.FutureMaster import schedule_daily_refresh as future_master_daily_refresh
 from api.mutualFunds import router as mutualFundsRouter
+from api.stocks import router as stocksRouter
+from api.search import router as searchRouter
+from appconfig.StockSymbolMaster import StockSymbolMaster, schedule_daily_refresh as stock_symbol_master_daily_refresh
+from marketengine.ShoonyaStockFeed import ShoonyaStockFeed
+from service.stocksService.StockCollectionsCatalog import StockCollectionsCatalog
+from service.stocksService.StocksService import StocksService
+from service.topMovers.TopMoversService import StockWatchlist
 from mutualfunds.backfill_service import MFNavBackfillService
 from mutualfunds.cache import MFInMemoryCache
 from mutualfunds.collections_config import MFCollectionsCatalog
@@ -147,13 +155,41 @@ async def lifespan(app: FastAPI):
     future_master_task   = None
     mutual_fund_task      = None
     mutual_fund_cache_eviction_task = None
+    stock_symbol_master_task = None
+    stock_feed_eviction_task = None
     app.state.breeze       = None
     app.state.shoonya      = None
     app.state.option_feed  = None
+    app.state.stock_feed   = None
+    app.state.stock_symbol_master = None
+    app.state.stocks_service      = None
     app.state.mutual_fund_service     = None
     app.state.mutual_fund_job_runner  = None
     app.state.mf_http_client          = None
     app.state.mf_cache                = None
+
+    # ── Stocks (Shoonya-backed Explore/Search/Quote/Chart) ────────────
+    # Independent of Shoonya being reachable - the symbol master and search
+    # work off the bundled/downloaded scrip list alone; only /explore,
+    # /quote and /chart need a live broker session, and each of those checks
+    # for one itself (StocksService methods accept shoonya=None gracefully).
+    try:
+        stock_symbol_master = StockSymbolMaster()
+        stock_watchlist = StockWatchlist(Path(__file__).parent / "appconfig" / "nifty50_watchlist.json")
+        stock_collections = StockCollectionsCatalog(stock_watchlist.stocks())
+
+        app.state.stock_symbol_master = stock_symbol_master
+        app.state.stocks_service = StocksService(
+            symbol_master=stock_symbol_master,
+            explore_watchlist=stock_watchlist,
+            collections_catalog=stock_collections,
+        )
+        stock_symbol_master_task = asyncio.create_task(
+            _supervised_background_task(stock_symbol_master_daily_refresh, "stock_symbol_master_refresh", app)
+        )
+        print("App starting... Stocks module initialized.")
+    except Exception as e:
+        print(f"[WARNING] Stocks module init error: {e}")
 
     # ── Mutual Funds (mfapi.in-backed, Supabase-owned, LLM-curated) ──
     try:
@@ -280,6 +316,24 @@ async def lifespan(app: FastAPI):
                 app.state.order_update_service = order_update_service
                 app.state.option_feed = option_feed
                 print("App starting... Option chain WebSocket feed started.")
+
+                # Stocks tick cache rides on this SAME WebSocket via
+                # option_feed.on_raw_tick() (see marketengine/ShoonyaStockFeed.py's
+                # module docstring for why it must not open a second socket) -
+                # only constructed once option_feed.start() has actually
+                # opened the connection it registers against.
+                try:
+                    stock_feed = ShoonyaStockFeed(option_feed)
+                    app.state.stock_feed = stock_feed
+                    stock_feed_eviction_task = asyncio.create_task(
+                        _supervised_background_task(
+                            lambda _app, feed=stock_feed: feed.evict_idle_loop(),
+                            "stock_feed_idle_eviction", app,
+                        )
+                    )
+                    print("App starting... Stock tick cache attached to shared feed.")
+                except Exception as e:
+                    print(f"[WARNING] Stock tick cache init error: {e}")
             except Exception as e:
                 print(f"[WARNING] Option chain feed init error: {e}")
         option_master_task = asyncio.create_task(
@@ -328,6 +382,10 @@ async def lifespan(app: FastAPI):
 
     if refresh_task:
         refresh_task.cancel()
+    if stock_symbol_master_task:
+        stock_symbol_master_task.cancel()
+    if stock_feed_eviction_task:
+        stock_feed_eviction_task.cancel()
     if shoonya_refresh_task:
         shoonya_refresh_task.cancel()
     if top_movers_task:
@@ -365,6 +423,8 @@ app.include_router(topMoversRouter)
 app.include_router(candlesRouter)
 app.include_router(optionChainRouter)
 app.include_router(mutualFundsRouter)
+app.include_router(stocksRouter)
+app.include_router(searchRouter)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://myproductreact.onrender.com", "https://primepiptrade.com", "https://www.primepiptrade.com"],

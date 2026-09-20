@@ -25,6 +25,7 @@ RECONNECT_DELAY_SECS = 5
 
 TickHandler = Callable[[str, dict], Awaitable[None] | None]
 OrderUpdateHandler = Callable[[dict], Awaitable[None] | None]
+RawTickHandler = Callable[[dict], None]
 
 
 def _safe_float(val, default=None):
@@ -71,6 +72,7 @@ class ShoonyaOptionFeed:
         self._shoonya = shoonya_connection
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._tick_handlers: list[TickHandler] = []
+        self._raw_tick_handlers: list[RawTickHandler] = []
         self._order_update_handlers: list[OrderUpdateHandler] = []
         self._subscribed_tokens: dict[str, int] = {}  # "EXCH|TOKEN" -> ref count
         self._lock = threading.Lock()
@@ -91,6 +93,19 @@ class ShoonyaOptionFeed:
         cache and the position cache) can each register their own handler -
         every registered handler receives every tick."""
         self._tick_handlers.append(handler)
+
+    def on_raw_tick(self, handler: RawTickHandler) -> None:
+        """Registers a callback invoked as handler(raw_frame) with the
+        unmodified Shoonya WS frame, before _on_tick derives the
+        instrument_key/tick_fields pair the normal on_tick() consumers see.
+        For consumers that need fields _on_tick's own normalize_touchline_tick
+        doesn't forward (e.g. equity OHLC/full depth for the stocks feature -
+        see marketengine/ShoonyaStockFeed.py) rather than duplicating a second
+        WebSocket connection. Called synchronously on NorenApi's WS thread,
+        so handlers must be fast and must never raise (this call site catches
+        and logs, but a slow handler would still stall every other consumer's
+        ticks)."""
+        self._raw_tick_handlers.append(handler)
 
     def on_order_update(self, handler: OrderUpdateHandler) -> None:
         """Registers a callback invoked as handler(order_update) whenever the
@@ -236,6 +251,18 @@ class ShoonyaOptionFeed:
             if not exch or not token:
                 return
             instrument_key = f"{exch}|{token}"
+
+            # Raw handlers run first, synchronously, and independently of the
+            # normal tick_handlers path below - a raw handler raising or
+            # running slowly must never prevent option-chain/position-cache
+            # ticks from being dispatched, so each is isolated in its own
+            # try/except and none of them can block on the asyncio loop (they
+            # run inline on this WS thread, not scheduled onto it).
+            for raw_handler in self._raw_tick_handlers:
+                try:
+                    raw_handler(raw)
+                except Exception as exc:
+                    logger.warning(f"[OptionFeed] raw_tick handler failed: {exc}")
 
             tick = normalize_touchline_tick(raw)
             if not tick or not self._tick_handlers or self._async_loop is None:

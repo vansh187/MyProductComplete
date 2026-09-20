@@ -11,6 +11,8 @@ from dotenv import load_dotenv, set_key
 
 import requests as _requests
 
+from marketengine.touchlineFields import TouchlineFieldParser
+
 IST = ZoneInfo("Asia/Kolkata")
 
 _ENV_FILE = Path(__file__).parent.parent / ".env"
@@ -82,6 +84,7 @@ class ShoonyaConnection:
         self._account_id    = os.getenv("SHOONYA_ACCOUNT_ID", self._user_id)
         self._api: _ShoonyaApi | None = None
         self._connected = False
+        self._touchline_parser = TouchlineFieldParser()
 
     # ------------------------------------------------------------------
     # OAuth helpers
@@ -273,6 +276,62 @@ class ShoonyaConnection:
 
         except Exception as exc:
             print(f"[Shoonya] get_option_quote error {exchange}:{token}: {exc}")
+            return None
+
+    def get_stock_quote(self, exchange: str, token: str) -> dict | None:
+        """
+        REST snapshot for one equity token - used to seed the stocks feature's
+        quote endpoint on a cold cache (first request for a symbol nobody has
+        viewed yet, or the WebSocket feed being temporarily behind) and by
+        /api/stocks/explore's batched watchlist scan. Bounded by the caller
+        with asyncio.wait_for, same convention as every other Shoonya REST
+        call in this codebase - this method itself never blocks longer than
+        the underlying HTTP client's own timeout.
+
+        Returns a normalised dict or None on failure/no-data. Depth arrays
+        are always exactly 5 levels (zero-filled if the broker sent fewer).
+        Circuit limits ('uc'/'lc' vs 'ucl'/'lcl') and 52-week high/low are
+        parsed defensively - Shoonya's NorenApi field names for the former
+        have varied across API versions, and the latter genuinely is not
+        part of this endpoint's payload, so those two always come back 0.0
+        rather than raising or guessing.
+        """
+        if not self._connected or self._api is None:
+            return None
+        try:
+            ret = self._api.get_quotes(exchange=exchange, token=token)
+            if not ret or ret.get("stat") != "Ok":
+                print(f"[Shoonya] get_stock_quote failed {exchange}:{token} → {ret}")
+                return None
+
+            ltp = _safe_float(ret.get("lp"))
+            if ltp == 0:
+                return None
+
+            # Depth-array construction and circuit-limit field-name fallback
+            # are shared with the WebSocket tick path (marketengine.ShoonyaStockFeed)
+            # via TouchlineFieldParser, so the two can never drift apart on
+            # field names/defaulting rules.
+            parser = self._touchline_parser
+            circuits = parser.circuit_limits(ret)
+
+            return {
+                "ltp": ltp,
+                "open": _safe_float(ret.get("o")),
+                "high": _safe_float(ret.get("h")),
+                "low": _safe_float(ret.get("l")),
+                "close": _safe_float(ret.get("c")),
+                "volume": int(_safe_float(ret.get("v"))),
+                "avg_price": _safe_float(ret.get("ap")),
+                "upper_circuit": circuits.get("upper_circuit", 0.0),
+                "lower_circuit": circuits.get("lower_circuit", 0.0),
+                "name": ret.get("cname") or ret.get("tsym"),
+                "depth": parser.full_depth(ret),
+                "as_of": ret.get("ltt"),
+            }
+
+        except Exception as exc:
+            print(f"[Shoonya] get_stock_quote error {exchange}:{token}: {exc}")
             return None
 
     def get_time_price_series(self, exchange: str, token: str, interval: str, days: int = 1) -> list[dict] | None:
@@ -585,6 +644,12 @@ async def schedule_daily_refresh(app):
                     print("[Shoonya] Option chain WS feed restarted after reconnect")
                 except Exception as exc:
                     print(f"[Shoonya] Failed to restart option chain feed after reconnect: {exc}")
+                # marketengine.ShoonyaStockFeed rides on option_feed's single
+                # WebSocket via on_raw_tick and shares option_feed's own
+                # subscription ref-count map (see ShoonyaStockFeed.ensure_subscribed) -
+                # option_feed._on_open() above already resubscribes every
+                # token in that shared map, stock tokens included, so no
+                # separate restart/resubscribe step is needed here.
         return ok
 
     while True:
