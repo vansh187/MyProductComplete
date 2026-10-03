@@ -40,8 +40,11 @@ class _ShoonyaApi(_NorenApi):
         # rejects it with "scheme https is invalid") for anything that isn't
         # an exact lowercase "https://" prefix, e.g. a differently-cased
         # scheme or a URL with no scheme at all.
+        # The websocket path keeps a trailing slash: nginx 301-redirects
+        # wss://.../NorenWSAPI to https://.../NorenWSAPI/, and websocket-client
+        # follows that redirect and fails with "scheme https is invalid".
         host_and_path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", api_url)
-        ws_url = "wss://" + host_and_path.replace("NorenWClientAPI", "NorenWSAPI")
+        ws_url = "wss://" + host_and_path.replace("NorenWClientAPI", "NorenWSAPI") + "/"
         super().__init__(host=api_url, websocket=ws_url)
 
 

@@ -20,12 +20,12 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("api_url,expected", [
-    ("https://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI"),
-    ("HTTPS://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI"),
-    ("http://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI"),
-    ("api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI"),
-    ("wss://api.shoonya.com/NorenWSAPI/", "wss://api.shoonya.com/NorenWSAPI"),
-    ("Wss://api.shoonya.com/NorenWSAPI/", "wss://api.shoonya.com/NorenWSAPI"),
+    ("https://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI/"),
+    ("HTTPS://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI/"),
+    ("http://api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI/"),
+    ("api.shoonya.com/NorenWClientAPI/", "wss://api.shoonya.com/NorenWSAPI/"),
+    ("wss://api.shoonya.com/NorenWSAPI/", "wss://api.shoonya.com/NorenWSAPI/"),
+    ("Wss://api.shoonya.com/NorenWSAPI/", "wss://api.shoonya.com/NorenWSAPI/"),
 ])
 def test_websocket_endpoint_always_forced_to_wss(api_url, expected):
     api = _ShoonyaApi(api_url)
@@ -33,10 +33,18 @@ def test_websocket_endpoint_always_forced_to_wss(api_url, expected):
 
 
 def test_trailing_slash_is_stripped_from_host_url():
-    """Both the REST host and websocket endpoint must not carry a trailing
-    slash, regardless of whether the caller's api_url had one."""
+    """The REST host must not carry a trailing slash, regardless of whether
+    the caller's api_url had one."""
     api = _ShoonyaApi("https://api.shoonya.com/NorenWClientAPI/")
     assert api._NorenApi__service_config["host"] == "https://api.shoonya.com/NorenWClientAPI"
+
+
+def test_websocket_endpoint_keeps_trailing_slash():
+    """nginx 301-redirects the slashless NorenWSAPI path to an https:// URL,
+    which websocket-client follows and rejects ("scheme https is invalid")."""
+    for api_url in ("https://api.shoonya.com/NorenWClientAPI", "https://api.shoonya.com/NorenWClientAPI/"):
+        api = _ShoonyaApi(api_url)
+        assert api._NorenApi__service_config["websocket_endpoint"].endswith("/NorenWSAPI/")
 
 
 def test_host_config_keeps_original_https_scheme():
