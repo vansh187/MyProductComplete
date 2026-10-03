@@ -19,6 +19,8 @@ import logging
 import threading
 from typing import Awaitable, Callable
 
+from marketengine.WsSubscriptionSender import WsSubscriptionSender
+
 logger = logging.getLogger(__name__)
 
 RECONNECT_DELAY_SECS = 5
@@ -69,8 +71,12 @@ def normalize_touchline_tick(raw: dict) -> dict:
 
 class ShoonyaOptionFeed:
 
-    def __init__(self, shoonya_connection):
+    def __init__(self, shoonya_connection, subscription_sender=None):
+        """subscription_sender: anything with submit(label, send) -> bool and
+        close() (default: a WsSubscriptionSender thread). ensure_subscribed()/
+        release() hand frames to it so they never block the caller."""
         self._shoonya = shoonya_connection
+        self._sender = subscription_sender or WsSubscriptionSender(thread_name="optionfeed-ws-subscribe")
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._tick_handlers: list[TickHandler] = []
         self._raw_tick_handlers: list[RawTickHandler] = []
@@ -145,18 +151,33 @@ class ShoonyaOptionFeed:
         # one, so calling it again (on the same or a new instance) would
         # otherwise leak the old socket/thread. start() runs on the event
         # loop, so the join happens on a helper thread, never here.
-        if self._api_instance is not None:
-            self._stop_websocket_in_background(self._api_instance)
-
+        # _api_instance is switched BEFORE the previous socket is stopped, so
+        # the close callback that stopping fires is recognised as stale by
+        # _callback_for and cannot mark the new socket closed or schedule a
+        # reconnect of it.
+        previous = self._api_instance
         self._api_instance = api
+        if previous is not None:
+            self._stop_websocket_in_background(previous)
 
         api.start_websocket(
             subscribe_callback=self._on_tick,
             order_update_callback=self._on_order_update,
-            socket_open_callback=self._on_open,
-            socket_close_callback=self._on_close,
-            socket_error_callback=self._on_error,
+            socket_open_callback=self._callback_for(api, self._on_open),
+            socket_close_callback=self._callback_for(api, self._on_close),
+            socket_error_callback=self._callback_for(api, self._on_error),
         )
+
+    def _callback_for(self, api, handler):
+        """Wraps a socket lifecycle callback so events from a superseded
+        NorenApi instance (an old socket shutting down after a token refresh)
+        are ignored instead of flipping the current socket's state."""
+        def _guarded(*args):
+            if api is not self._api_instance:
+                logger.debug("[OptionFeed] Ignoring %s from a superseded socket", getattr(handler, "__name__", "callback"))
+                return
+            handler(*args)
+        return _guarded
 
     def _signal_stop_websocket(self, api) -> None:
         """Best-effort, thread-safe request to stop an instance's WS loop.
@@ -219,39 +240,81 @@ class ShoonyaOptionFeed:
             logger.warning("[OptionFeed] Old WS thread did not exit within timeout")
 
     def ensure_subscribed(self, tokens: set[str]) -> None:
-        """tokens: set of 'EXCH|TOKEN' strings. Subscribes only genuinely-new tokens."""
-        new_tokens = []
-        with self._lock:
-            for token in tokens:
-                count = self._subscribed_tokens.get(token, 0)
-                if count == 0:
-                    new_tokens.append(token)
-                self._subscribed_tokens[token] = count + 1
-
-        if new_tokens and self._shoonya._api is not None:
-            logger.info(f"[OptionFeed] Subscribing to {len(new_tokens)} new tokens")
-            self._shoonya._api.subscribe(new_tokens)
+        """tokens: set of 'EXCH|TOKEN' strings. Subscribes only genuinely-new
+        tokens. Never blocks and never raises: the ref-count is updated here
+        and the frame is queued for the sender thread. If the socket is not
+        open, nothing is sent - _on_open subscribes every ref-counted token."""
+        try:
+            new_tokens = []
+            with self._lock:
+                for token in tokens:
+                    count = self._subscribed_tokens.get(token, 0)
+                    if count == 0:
+                        new_tokens.append(token)
+                    self._subscribed_tokens[token] = count + 1
+            if new_tokens:
+                self._queue_frame("subscribe", new_tokens)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] ensure_subscribed failed: {exc}")
 
     def release(self, tokens: set[str]) -> None:
-        """Decrements ref-counts; unsubscribes tokens that drop to zero."""
-        to_unsubscribe = []
-        with self._lock:
-            for token in tokens:
-                count = self._subscribed_tokens.get(token, 0)
-                if count <= 1:
-                    self._subscribed_tokens.pop(token, None)
-                    to_unsubscribe.append(token)
-                else:
-                    self._subscribed_tokens[token] = count - 1
+        """Decrements ref-counts; unsubscribes tokens that drop to zero.
+        Never blocks and never raises (see ensure_subscribed)."""
+        try:
+            to_unsubscribe = []
+            with self._lock:
+                for token in tokens:
+                    count = self._subscribed_tokens.get(token, 0)
+                    if count <= 1:
+                        self._subscribed_tokens.pop(token, None)
+                        to_unsubscribe.append(token)
+                    else:
+                        self._subscribed_tokens[token] = count - 1
+            if to_unsubscribe:
+                self._queue_frame("unsubscribe", to_unsubscribe)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] release failed: {exc}")
 
-        if to_unsubscribe and self._shoonya._api is not None:
-            logger.info(f"[OptionFeed] Unsubscribing {len(to_unsubscribe)} idle tokens")
-            self._shoonya._api.unsubscribe(to_unsubscribe)
+    def _queue_frame(self, action: str, tokens: list[str]) -> None:
+        if not self._socket_open:
+            logger.debug("[OptionFeed] Socket not open - %s of %d tokens deferred to next connect", action, len(tokens))
+            return
+        label = f"{action} {len(tokens)} tokens"
+        if self._sender.submit(label, lambda: self._send_frame(action, tokens)):
+            logger.info(f"[OptionFeed] Queued {label}")
+        else:
+            logger.warning(f"[OptionFeed] Could not queue {label} - applied on next reconnect")
+
+    def _send_frame(self, action: str, tokens: list[str]) -> None:
+        """Runs on the sender thread. Targets the instance whose socket is
+        actually open (never self._shoonya._api, which after a token refresh is
+        a newer instance with no socket yet), and re-reads the ref-counts at
+        send time so a frame queued before a disconnect cannot resurrect a
+        token released while the socket was down."""
+        api = self._api_instance
+        if api is None or not self._socket_open:
+            return
+        with self._lock:
+            if action == "subscribe":
+                live = [t for t in tokens if self._subscribed_tokens.get(t, 0) > 0]
+            else:
+                live = [t for t in tokens if self._subscribed_tokens.get(t, 0) == 0]
+        if not live:
+            return
+        if action == "subscribe":
+            api.subscribe(live)
+        else:
+            api.unsubscribe(live)
 
     def close(self) -> None:
         """Closes the instance the socket was actually opened on, not whatever
         self._shoonya._api happens to be right now - those can differ after a
         token refresh (see the _api_instance comment in __init__)."""
+        self._socket_open = False
+        try:
+            self._sender.close()
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] Subscription sender close failed: {exc}")
         if self._api_instance is not None:
             self._force_stop_websocket(self._api_instance)
 
@@ -337,14 +400,22 @@ class ShoonyaOptionFeed:
             logger.error(f"[OptionFeed] Order-update handler task failed: {exc!r}", exc_info=exc)
 
     def _on_open(self) -> None:
-        logger.info("[OptionFeed] WebSocket connected")
-        self._reconnecting = False
-        self._socket_open = True
-        with self._lock:
-            tokens = list(self._subscribed_tokens.keys())
-        if tokens and self._shoonya._api is not None:
-            logger.info(f"[OptionFeed] Resubscribing {len(tokens)} tokens after (re)connect")
-            self._shoonya._api.subscribe(tokens)
+        """Runs on the WS thread right after the broker acks the login frame.
+        _socket_open is set BEFORE the snapshot so a concurrent
+        ensure_subscribed either lands in the snapshot or queues its own frame
+        (a duplicate subscribe is harmless; a missed one is not)."""
+        try:
+            logger.info("[OptionFeed] WebSocket connected")
+            self._reconnecting = False
+            self._socket_open = True
+            with self._lock:
+                tokens = list(self._subscribed_tokens.keys())
+            api = self._api_instance
+            if tokens and api is not None:
+                logger.info(f"[OptionFeed] Resubscribing {len(tokens)} tokens after (re)connect")
+                api.subscribe(tokens)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] Resubscribe after connect failed: {exc}")
 
     def _on_close(self, *args) -> None:
         logger.warning("[OptionFeed] WebSocket closed - scheduling reconnect")

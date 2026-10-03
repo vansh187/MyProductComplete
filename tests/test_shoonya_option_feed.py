@@ -15,10 +15,31 @@ import pytest
 from marketengine.ShoonyaOptionFeed import ShoonyaOptionFeed, normalize_touchline_tick
 
 
+class _InlineSender:
+    """Runs each queued frame immediately on the calling thread, so tests can
+    assert on api.subscribe/unsubscribe synchronously."""
+
+    def __init__(self):
+        self.closed = False
+
+    def submit(self, label, send):
+        send()
+        return True
+
+    def close(self):
+        self.closed = True
+
+
 def _make_feed():
     shoonya = MagicMock()
-    feed = ShoonyaOptionFeed(shoonya)
+    feed = ShoonyaOptionFeed(shoonya, subscription_sender=_InlineSender())
     return feed, shoonya
+
+
+def _open_socket(feed, shoonya):
+    """Puts the feed in the state it is in after start() + the broker's login ack."""
+    feed._api_instance = shoonya._api
+    feed._socket_open = True
 
 
 # ── normalize_touchline_tick ─────────────────────────────────────────────
@@ -60,6 +81,7 @@ class TestSubscription:
 
     def test_ensure_subscribed_calls_broker_for_new_tokens(self):
         feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
         feed.ensure_subscribed({"NFO|111"})
         shoonya._api.subscribe.assert_called_once()
         called_tokens = shoonya._api.subscribe.call_args[0][0]
@@ -67,6 +89,7 @@ class TestSubscription:
 
     def test_ensure_subscribed_does_not_resubscribe_already_referenced_token(self):
         feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
         feed.ensure_subscribed({"NFO|111"})
         feed.ensure_subscribed({"NFO|111"})
         assert shoonya._api.subscribe.call_count == 1
@@ -74,10 +97,12 @@ class TestSubscription:
     def test_ensure_subscribed_noop_when_api_none(self):
         feed, shoonya = _make_feed()
         shoonya._api = None
+        _open_socket(feed, shoonya)
         feed.ensure_subscribed({"NFO|111"})  # must not raise
 
     def test_release_unsubscribes_when_refcount_hits_zero(self):
         feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
         feed.ensure_subscribed({"NFO|111"})
         feed.release({"NFO|111"})
         shoonya._api.unsubscribe.assert_called_once()
@@ -87,6 +112,7 @@ class TestSubscription:
         """Two independent subscribers of the same token: releasing one must
         not unsubscribe from the broker while the other still needs it."""
         feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
         feed.ensure_subscribed({"NFO|111"})
         feed.ensure_subscribed({"NFO|111"})  # second reference
         feed.release({"NFO|111"})
@@ -95,8 +121,113 @@ class TestSubscription:
 
     def test_release_of_unknown_token_does_not_raise(self):
         feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
         feed.release({"NFO|999"})  # never subscribed
         shoonya._api.unsubscribe.assert_called_once()  # still reported as "to remove"
+
+    def test_subscribe_while_socket_down_is_deferred_to_on_open(self):
+        """Regression: with the socket down, NorenApi's subscribe busy-waits
+        forever. Nothing may be sent; the ref-count is kept and _on_open
+        subscribes it once the socket is back."""
+        feed, shoonya = _make_feed()
+        feed._api_instance = shoonya._api  # started, but not open yet
+        feed.ensure_subscribed({"NSE|2885"})
+        shoonya._api.subscribe.assert_not_called()
+        assert feed._subscribed_tokens == {"NSE|2885": 1}
+
+        feed._on_open()
+        assert shoonya._api.subscribe.call_args[0][0] == ["NSE|2885"]
+
+    def test_release_while_socket_down_is_not_resubscribed_on_reconnect(self):
+        feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
+        feed.ensure_subscribed({"NSE|2885"})
+        feed._socket_open = False
+        feed.release({"NSE|2885"})
+        shoonya._api.unsubscribe.assert_not_called()
+
+        shoonya._api.subscribe.reset_mock()
+        feed._on_open()
+        shoonya._api.subscribe.assert_not_called()
+
+    def test_queued_subscribe_for_token_released_before_send_is_dropped(self):
+        """A frame queued before a disconnect must not resurrect a token that
+        was released while the socket was down."""
+        queued = []
+
+        class _DeferredSender:
+            def submit(self, label, send):
+                queued.append(send)
+                return True
+
+            def close(self):
+                pass
+
+        shoonya = MagicMock()
+        feed = ShoonyaOptionFeed(shoonya, subscription_sender=_DeferredSender())
+        _open_socket(feed, shoonya)
+        feed.ensure_subscribed({"NSE|1"})
+        feed._socket_open = False
+        feed.release({"NSE|1"})
+        feed._socket_open = True
+        for send in queued:
+            send()
+        shoonya._api.subscribe.assert_not_called()
+
+    def test_frames_go_to_the_open_instance_not_a_newer_unstarted_one(self):
+        feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
+        opened_api = shoonya._api
+        shoonya._api = MagicMock()  # token refresh built a new instance, not started yet
+        feed.ensure_subscribed({"NSE|1"})
+        opened_api.subscribe.assert_called_once()
+        shoonya._api.subscribe.assert_not_called()
+
+    def test_ensure_subscribed_returns_immediately_while_broker_send_blocks(self):
+        """With the real sender thread, a send stuck inside the broker library
+        must not block the caller (the asyncio event loop in production)."""
+        import time as _time
+        from marketengine.WsSubscriptionSender import WsSubscriptionSender
+
+        unblock = threading.Event()
+        entered = threading.Event()
+
+        def _stuck_subscribe(tokens):
+            entered.set()
+            unblock.wait(5)
+
+        shoonya = MagicMock()
+        shoonya._api.subscribe.side_effect = _stuck_subscribe
+        sender = WsSubscriptionSender(thread_name="test-ws-subscribe")
+        feed = ShoonyaOptionFeed(shoonya, subscription_sender=sender)
+        _open_socket(feed, shoonya)
+        try:
+            feed.ensure_subscribed({"NSE|1"})
+            assert entered.wait(2)  # the sender thread is now stuck inside the broker call
+            start = _time.perf_counter()
+            feed.ensure_subscribed({"NSE|2"})
+            feed.release({"NSE|1"})
+            assert (_time.perf_counter() - start) < 0.05
+        finally:
+            unblock.set()
+            assert sender.flush(timeout=2)
+            sender.close()
+        # FIFO: subscribe NSE|1, subscribe NSE|2, then unsubscribe NSE|1.
+        assert [c.args[0] for c in shoonya._api.subscribe.call_args_list] == [["NSE|1"], ["NSE|2"]]
+        shoonya._api.unsubscribe.assert_called_once_with(["NSE|1"])
+
+    def test_ensure_subscribed_never_raises(self):
+        feed, shoonya = _make_feed()
+        _open_socket(feed, shoonya)
+        shoonya._api.subscribe.side_effect = RuntimeError("socket gone")
+        feed._sender = MagicMock(submit=MagicMock(side_effect=RuntimeError("sender broken")))
+        feed.ensure_subscribed({"NSE|1"})  # must not raise
+        feed.release({"NSE|1"})  # must not raise
+
+    def test_close_closes_sender(self):
+        feed, _ = _make_feed()
+        feed.close()
+        assert feed._sender.closed
 
 
 # ── tick exception surfacing ──────────────────────────────────────────────
@@ -330,6 +461,7 @@ class TestOnOpen:
 
     def test_on_open_resubscribes_previously_subscribed_tokens(self):
         feed, shoonya = _make_feed()
+        feed._api_instance = shoonya._api
         feed.ensure_subscribed({"NFO|111", "NFO|222"})
         shoonya._api.subscribe.reset_mock()
 
@@ -341,8 +473,62 @@ class TestOnOpen:
 
     def test_on_open_with_no_tokens_does_not_call_subscribe(self):
         feed, shoonya = _make_feed()
+        feed._api_instance = shoonya._api
         feed._on_open()
         shoonya._api.subscribe.assert_not_called()
+
+    def test_on_open_does_not_raise_when_resubscribe_fails(self):
+        feed, shoonya = _make_feed()
+        feed._api_instance = shoonya._api
+        feed.ensure_subscribed({"NFO|111"})
+        shoonya._api.subscribe.side_effect = RuntimeError("send failed")
+        feed._on_open()  # runs on NorenApi's WS thread - must never raise
+        assert feed.is_connected
+
+
+class TestSupersededSocketCallbacks:
+
+    def _callbacks(self, api):
+        return api.start_websocket.call_args.kwargs
+
+    def test_close_from_old_instance_after_token_refresh_is_ignored(self):
+        """Stopping the old socket fires its close callback; it must not mark
+        the new socket closed or schedule a reconnect of the healthy one."""
+        feed, shoonya = _make_feed()
+        old_api = shoonya._api
+
+        async def _run():
+            feed.start()
+
+        asyncio.run(_run())
+        old_callbacks = self._callbacks(old_api)
+
+        new_api = MagicMock()
+        shoonya._api = new_api
+        asyncio.run(_run())
+        self._callbacks(new_api)["socket_open_callback"]()
+        assert feed.is_connected
+
+        with patch.object(feed, "_schedule_reconnect") as schedule:
+            old_callbacks["socket_close_callback"]()
+            old_callbacks["socket_error_callback"]("old boom")
+        schedule.assert_not_called()
+        assert feed.is_connected
+
+    def test_callbacks_from_current_instance_still_apply(self):
+        feed, shoonya = _make_feed()
+
+        async def _run():
+            feed.start()
+
+        asyncio.run(_run())
+        callbacks = self._callbacks(shoonya._api)
+        callbacks["socket_open_callback"]()
+        assert feed.is_connected
+        with patch.object(feed, "_schedule_reconnect") as schedule:
+            callbacks["socket_close_callback"]()
+        schedule.assert_called_once()
+        assert not feed.is_connected
 
 
 # ── on_close / on_error schedule reconnect ─────────────────────────────────

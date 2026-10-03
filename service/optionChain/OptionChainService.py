@@ -13,13 +13,12 @@ from service.optionChain.OptionChainCache import OptionChainCache
 
 logger = logging.getLogger(__name__)
 
-# NorenApi.subscribe()/unsubscribe() send a frame over the WS connection and
-# busy-wait (plain time.sleep loop) until it's connected - if the feed is down
-# or stuck reconnecting, that wait never returns. Bounding it here keeps a
-# broker-side WS outage from freezing the whole request (and, with only a
-# handful of Uvicorn workers, the whole app) - the feed will simply catch up
-# once reconnected since ensure_subscribed()/release() are ref-count based.
-FEED_SUBSCRIBE_TIMEOUT_SECS = 3.0
+# ShoonyaOptionFeed.ensure_subscribed()/release() only update ref-counts and
+# queue the WS frame for the feed's sender thread, so they are called inline
+# here - no executor hop, no timeout needed (see marketengine/
+# WsSubscriptionSender.py).
+
+DEFAULT_RISK_FREE_RATE = 0.065
 
 UNDERLYING_SPOT_TOKENS = {
     "nifty": ("NSE", "26000"),
@@ -48,12 +47,11 @@ SEED_BATCH_SIZE = 10
 
 class OptionChainService:
 
-    RATE = 0.065
-
-    def __init__(self, feed=None):
+    def __init__(self, feed=None, rate: float = DEFAULT_RISK_FREE_RATE):
         """feed: a ShoonyaOptionFeed instance, or None if live ticks are unavailable
         (e.g. Shoonya not connected) - the service still works off REST seeds only."""
         self._feed = feed
+        self._rate = rate
         self._caches: dict[str, OptionChainCache] = {}
         self._token_to_cache_keys: dict[str, set[str]] = {}
         # Per-cache-key consumer count: incremented for every holder (a plain
@@ -72,8 +70,7 @@ class OptionChainService:
         self._feed = feed
         feed.on_tick(self._route_tick)
 
-    @staticmethod
-    def _cache_key(underlying: str, expiry: str) -> str:
+    def _cache_key(self, underlying: str, expiry: str) -> str:
         return f"{underlying.upper()}:{expiry}"
 
     async def _route_tick(self, instrument_key: str, tick_fields: dict) -> None:
@@ -82,8 +79,7 @@ class OptionChainService:
             if cache is not None:
                 await cache.apply_tick(instrument_key, tick_fields)
 
-    @staticmethod
-    def _window_around_spot(strike_chain: dict, spot: float | None) -> dict:
+    def _window_around_spot(self, strike_chain: dict, spot: float | None) -> dict:
         """Trims the full master strike ladder to STRIKES_EACH_SIDE on either
         side of the current spot price (or the middle of the chain if spot
         isn't known yet)."""
@@ -112,27 +108,25 @@ class OptionChainService:
         strike_chain = self._window_around_spot(full_chain, spot)
         exchange = OPTIONS_EXCHANGE[underlying]
 
-        cache = OptionChainCache(underlying.upper(), expiry, strike_chain, exchange=exchange, rate=self.RATE)
+        cache = OptionChainCache(underlying.upper(), expiry, strike_chain, exchange=exchange, rate=self._rate)
         self._caches[key] = cache
 
         for token in cache.tokens():
             self._token_to_cache_keys.setdefault(token, set()).add(key)
 
-        if self._feed is not None:
-            await self._ensure_subscribed_async(cache.tokens())
+        self._subscribe_feed(cache.tokens())
 
         await self._seed_from_rest(shoonya, cache, strike_chain, exchange)
 
         return cache, None
 
-    async def _ensure_subscribed_async(self, tokens: set[str]) -> None:
+    def _subscribe_feed(self, tokens: set[str]) -> None:
+        if self._feed is None:
+            return
         try:
-            await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(None, self._feed.ensure_subscribed, tokens),
-                timeout=FEED_SUBSCRIBE_TIMEOUT_SECS,
-            )
+            self._feed.ensure_subscribed(tokens)
         except Exception as e:
-            logger.warning(f"[OptionChainService] ensure_subscribed timed out/failed: {e}")
+            logger.warning(f"[OptionChainService] ensure_subscribed failed: {e}")
 
     async def _seed_from_rest(self, shoonya, cache: OptionChainCache, strike_chain: dict, exchange: str) -> None:
         loop = asyncio.get_running_loop()
@@ -186,17 +180,15 @@ class OptionChainService:
                 if not keys_for_token:
                     self._token_to_cache_keys.pop(token, None)
 
-        if self._feed is not None:
-            await self._release_feed_async(cache.tokens())
+        self._release_feed(cache.tokens())
 
-    async def _release_feed_async(self, tokens: set[str]) -> None:
+    def _release_feed(self, tokens: set[str]) -> None:
+        if self._feed is None:
+            return
         try:
-            await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(None, self._feed.release, tokens),
-                timeout=FEED_SUBSCRIBE_TIMEOUT_SECS,
-            )
+            self._feed.release(tokens)
         except Exception as e:
-            logger.warning(f"[OptionChainService] feed release timed out/failed: {e}")
+            logger.warning(f"[OptionChainService] feed release failed: {e}")
 
     async def release_chain(self, underlying: str, expiry: str) -> None:
         """Called when an SSE stream client (that previously called

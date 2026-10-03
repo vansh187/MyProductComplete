@@ -2,6 +2,7 @@ import os
 import asyncio
 import functools
 import hashlib
+import importlib
 import json
 import logging
 import re
@@ -11,8 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv, set_key
 
-import requests as _requests
-
+from marketengine.BrokerHttpClient import BrokerHttpClient
 from marketengine.touchlineFields import TouchlineFieldParser
 
 logger = logging.getLogger(__name__)
@@ -22,16 +22,28 @@ IST = ZoneInfo("Asia/Kolkata")
 _ENV_FILE = Path(__file__).parent.parent / ".env"
 
 try:
-    from NorenRestApiPy.NorenApi import NorenApi as _NorenApi
+    # import_module returns the module itself even if a package __init__
+    # ever re-exports a same-named class over the submodule attribute.
+    _noren_module = importlib.import_module("NorenRestApiPy.NorenApi")
+    _NorenApi = _noren_module.NorenApi
     _NOREN_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):
+    _noren_module = None
     _NorenApi = object
     _NOREN_AVAILABLE = False
     logger.warning("[Shoonya] NorenRestApiOAuth not installed — run: pip install NorenRestApiOAuth")
 
+# Upper bound on how long a subscribe/unsubscribe frame waits for the socket
+# to (re)connect. The stock library waits forever.
+WS_SEND_WAIT_SECS = 2.0
+_WS_POLL_SECS = 0.05
+_TOUCHLINE_FEED = 1   # NorenRestApiPy FeedType.TOUCHLINE
+_SNAPQUOTE_FEED = 2   # NorenRestApiPy FeedType.SNAPQUOTE
+
 
 class _ShoonyaApi(_NorenApi):
-    def __init__(self, api_url: str):
+    def __init__(self, api_url: str, ws_send_wait_secs: float = WS_SEND_WAIT_SECS):
+        self._ws_send_wait_secs = ws_send_wait_secs
         api_url = api_url.rstrip("/")
         # Strip whatever scheme api_url has (http/https/ws/wss, any case) and
         # always force wss:// - a plain substring .replace("https://", "wss://")
@@ -46,6 +58,54 @@ class _ShoonyaApi(_NorenApi):
         host_and_path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", api_url)
         ws_url = "wss://" + host_and_path.replace("NorenWClientAPI", "NorenWSAPI") + "/"
         super().__init__(host=api_url, websocket=ws_url)
+
+    # The library's subscribe()/unsubscribe() go through NorenApi.__ws_send,
+    # which spins `while not connected: sleep(0.05)` with no bound - one call
+    # during a feed outage hangs its thread until the socket comes back, and
+    # forever if that instance's socket was already told to stop. These
+    # overrides build the same frames but wait at most ws_send_wait_secs.
+
+    def subscribe(self, instrument, feed_type=_TOUCHLINE_FEED) -> bool:
+        frame_type = {_TOUCHLINE_FEED: "t", _SNAPQUOTE_FEED: "d"}.get(feed_type, str(feed_type))
+        return self._send_ws_frame({"t": frame_type, "k": self._join_instruments(instrument)})
+
+    def unsubscribe(self, instrument, feed_type=_TOUCHLINE_FEED) -> bool:
+        frame_type = {_TOUCHLINE_FEED: "u", _SNAPQUOTE_FEED: "ud"}.get(feed_type)
+        if frame_type is None:
+            logger.warning(f"[Shoonya] unsubscribe: unsupported feed_type {feed_type}")
+            return False
+        return self._send_ws_frame({"t": frame_type, "k": self._join_instruments(instrument)})
+
+    def is_ws_connected(self) -> bool:
+        return bool(getattr(self, "_NorenApi__websocket_connected", False))
+
+    def _join_instruments(self, instrument) -> str:
+        return "#".join(instrument) if isinstance(instrument, (list, tuple, set)) else str(instrument)
+
+    def _send_ws_frame(self, values: dict) -> bool:
+        try:
+            payload = json.dumps(values)
+            deadline = time.monotonic() + self._ws_send_wait_secs
+            while not self.is_ws_connected():
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        f"[Shoonya] WS not connected after {self._ws_send_wait_secs}s - "
+                        f"dropped '{values.get('t')}' frame for {values.get('k', '')[:80]}"
+                    )
+                    return False
+                time.sleep(_WS_POLL_SECS)
+
+            websocket = getattr(self, "_NorenApi__websocket", None)
+            mutex = getattr(self, "_NorenApi__ws_mutex", None)
+            if websocket is None or mutex is None:
+                logger.warning("[Shoonya] WS internals unavailable - frame not sent")
+                return False
+            with mutex:
+                websocket.send(payload)
+            return True
+        except Exception as exc:
+            logger.warning(f"[Shoonya] WS send failed: {exc}")
+            return False
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -106,8 +166,11 @@ class ShoonyaConnection:
         SHOONYA_API_URL  (defaults to Finvasia production endpoint)
     """
 
-    def __init__(self):
+    def __init__(self, http_client: BrokerHttpClient | None = None):
+        """http_client: pooled REST client shared by every NorenApi call made
+        through this connection (see marketengine/BrokerHttpClient.py)."""
         load_dotenv(dotenv_path=_ENV_FILE, override=True)
+        self._http = http_client or BrokerHttpClient()
         self._user_id       = os.getenv("SHOONYA_USER_ID", "")
         self._password      = os.getenv("SHOONYA_PASSWORD", "")
         self._vendor_code   = os.getenv("SHOONYA_VENDOR_CODE", "")   # e.g. FN215083_U
@@ -149,7 +212,7 @@ class ShoonyaConnection:
 
         try:
             logger.info(f"[Shoonya] Exchanging code at {url}")
-            r = _requests.post(url, data=payload, timeout=15)
+            r = self._http.post(url, data=payload, timeout=15)
             logger.debug(f"[Shoonya] {r.status_code}: {r.text[:300]}")
 
             data = r.json()
@@ -199,6 +262,9 @@ class ShoonyaConnection:
             return False
 
         try:
+            # Route every NorenApi REST call through the pooled, timed client
+            # before the first call below (idempotent across reconnects).
+            self._http.install(_noren_module)
             self._api = _ShoonyaApi(self._api_url)
 
             # Restore session (NorenRestApiOAuth requires accesstoken too)
