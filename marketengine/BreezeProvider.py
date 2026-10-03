@@ -9,6 +9,9 @@ import os
 import threading
 from dotenv import load_dotenv
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 class BreezeMarketProvider(BaseMarketProvider):
@@ -27,7 +30,7 @@ class BreezeMarketProvider(BaseMarketProvider):
         # Fetch the session token that you cached or input during the morning login flow
         session_token = Config.BREEZE_SESSION_TOKEN 
         
-        print("Initializing Secure Breeze API Connection Handler...")
+        logger.info("Initializing Secure Breeze API Connection Handler...")
         self.breeze = BreezeConnect(api_key=self.api_key)
         
         # Authenticate session keys with ICICI servers
@@ -60,7 +63,7 @@ class BreezeMarketProvider(BaseMarketProvider):
         )"""
         # Assign our internal adapter function to Breeze's raw callback trigger
         self.breeze.on_ticks = self._on_breeze_tick_received
-        print("Connected to live Breeze Rate Refresh WebSocket Server.")
+        logger.info("Connected to live Breeze Rate Refresh WebSocket Server.")
 
     def on_tick(self, callback: Callable[[Dict[str, Any]], None]):
         """
@@ -97,7 +100,7 @@ class BreezeMarketProvider(BaseMarketProvider):
             )
             
         except Exception as e:
-            print(f"Error processing raw Breeze ticker payload stream: {e}")
+            logger.warning(f"Error processing raw Breeze ticker payload stream: {e}")
 
     async def subscribe(self, symbols: List[str]):
         """
@@ -105,7 +108,7 @@ class BreezeMarketProvider(BaseMarketProvider):
         """
         self.symbols.extend(symbols)
         for symbol in symbols:
-            print(f"Sending WebSocket subscription frame for {symbol} (NSE)...")
+            logger.debug(f"Sending WebSocket subscription frame for {symbol} (NSE)...")
             
             # Subscribe to the exchange live feed via standard cash product specifications
             self.breeze.subscribe_feeds(
@@ -129,4 +132,4 @@ class BreezeMarketProvider(BaseMarketProvider):
                 get_market_depth=False
             )
         self.breeze.ws_disconnect()
-        print("Breeze streaming channels disconnected safely.")
+        logger.info("Breeze streaming channels disconnected safely.")

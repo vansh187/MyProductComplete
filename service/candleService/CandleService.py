@@ -6,6 +6,9 @@ Fetches historical candles from Shoonya for charting.
 import asyncio
 from datetime import datetime
 from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
 
 # How many calendar days of history to request from the broker. This must be
 # wide enough to reach back past weekends/holidays to the last trading day
@@ -149,7 +152,7 @@ class CandleService:
             candles = [self._format_candle(c) for c in result_candles]
 
         except Exception as e:
-            print(f"[CandleService] Error fetching candles {exchange}:{token} {timeframe}: {e}")
+            logger.warning(f"[CandleService] Error fetching candles {exchange}:{token} {timeframe}: {e}")
             errors.append({
                 "exchange": exchange,
                 "token": token,

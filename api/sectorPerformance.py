@@ -11,6 +11,9 @@ from service.sectorPerformance.SectorPerformanceService import (
     SectorIndexRegistry,
     SectorPerformanceFetcher,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/market", tags=["Sector Performance"])
 
@@ -81,7 +84,7 @@ async def stream_sector_performance(request: Request):
                 })
                 yield f"data: {payload}\n\n"
             except Exception as exc:
-                print(f"[SSE/sectors] Error: {exc}")
+                logger.warning(f"[SSE/sectors] Error: {exc}")
 
             await asyncio.sleep(5 if is_open else 60)
 

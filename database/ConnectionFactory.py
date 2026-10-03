@@ -7,6 +7,9 @@ import os
 
 import mysql.connector
 from mysql.connector import Error
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionFactory:
@@ -14,10 +17,7 @@ class ConnectionFactory:
     def create_connection(host_name, user_name, user_password, db_name, port=3306):
         connection = None
         try:
-            print("host:", host_name)
-            print("port:", port)
-            print("user:", user_name)
-            print("database:", db_name)
+            logger.debug(f"MySQL connect host={host_name} port={port} user={user_name} database={db_name}")
             connection = mysql.connector.connect(
                 host=host_name,
                 port=int(port),
@@ -27,7 +27,7 @@ class ConnectionFactory:
             )
             ##print("Connection to MySQL DB successful")
         except ValueError as e:
-            print(f"The error '{e}' occurred")
+            logger.error(f"The error '{e}' occurred")
         except Error as e:
-            print(f"The error '{e}' occurred")
+            logger.error(f"The error '{e}' occurred")
         return connection

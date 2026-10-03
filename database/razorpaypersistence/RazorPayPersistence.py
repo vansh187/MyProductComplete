@@ -32,7 +32,7 @@ class RazorPayPersistence:
                  TransactionType.WALLET_FUNDING, TransactionStatus.PENDING)
             )
             conn.commit()
-            print("Insert Success")
+            logger.debug("Insert Success")
         except Exception as ex:
             if conn:
                 conn.rollback()
@@ -66,14 +66,14 @@ class RazorPayPersistence:
             was_pending = cursor.rowcount > 0
             conn.commit()
             if was_pending:
-                print("Transaction update is success")
+                logger.debug("Transaction update is success")
             else:
-                print(f"Payment for order {razorpay_order_id}/user {userId} was already processed - skipping duplicate")
+                logger.warning(f"Payment for order {razorpay_order_id}/user {userId} was already processed - skipping duplicate")
             return was_pending
         except Exception as ex:
             if conn:
                 conn.rollback()
-            print(f"Error in updating status: {str(ex)}")
+            logger.error(f"Error in updating status: {str(ex)}")
             return False
         finally:
             if conn is not None:
@@ -113,11 +113,11 @@ class RazorPayPersistence:
             )
             walletRecord = cursor.fetchone()
             if walletRecord is None:
-                print(f"No wallet_ledger record found for order {razorpay_order_id}, skipping wallet update")
+                logger.warning(f"No wallet_ledger record found for order {razorpay_order_id}, skipping wallet update")
                 return
 
             transaction_amount = Decimal(str(walletRecord["transaction_amount"]))
-            print(f"DEBUG: userId={userId}, transaction_amount={transaction_amount}")
+            logger.debug(f"DEBUG: userId={userId}, transaction_amount={transaction_amount}")
 
             if walletRecord["wallet_id"] is None:
                 # No wallet row exists yet - serialize concurrent first-time
@@ -135,13 +135,13 @@ class RazorPayPersistence:
                         QueryLoader.get('razorpay.yaml', 'insert_wallet'),
                         (userId, transaction_amount)
                     )
-                    print(f"insert wallet record with new funds: balance={transaction_amount}")
+                    logger.info(f"insert wallet record with new funds: balance={transaction_amount}")
                 else:
                     cursor.execute(
                         QueryLoader.get('wallet.yaml', 'increment_wallet_balance'),
                         (transaction_amount, userId)
                     )
-                    print(f"Wallet was created concurrently before lock acquired; credited {transaction_amount}")
+                    logger.info(f"Wallet was created concurrently before lock acquired; credited {transaction_amount}")
             else:
                 # Wallet already exists - atomic increment, no separate
                 # read+write, so no lost-update race even without an
@@ -150,7 +150,7 @@ class RazorPayPersistence:
                     QueryLoader.get('wallet.yaml', 'increment_wallet_balance'),
                     (transaction_amount, userId)
                 )
-                print(f"Wallet credited atomically: +{transaction_amount} for user {userId}")
+                logger.info(f"Wallet credited atomically: +{transaction_amount} for user {userId}")
 
             conn.commit()
         except Exception as ex:
@@ -192,7 +192,7 @@ class RazorPayPersistence:
             row = cursor.fetchone()
             return row["user_id"] if row else None
         except Exception as ex:
-            print(f"Error fetching user_id by order_id: {str(ex)}")
+            logger.error(f"Error fetching user_id by order_id: {str(ex)}")
             return None
         finally:
             if conn is not None:

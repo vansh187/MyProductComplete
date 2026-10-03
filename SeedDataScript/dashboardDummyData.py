@@ -24,6 +24,9 @@ load_dotenv()
 import psycopg2.extras
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from utils.password_hasher import hash_password
+import logging
+
+logger = logging.getLogger(__name__)
 
 DEMO_EMAIL = "dashboard.demo@example.com"
 DEMO_PASSWORD = "Demo@12345"
@@ -61,7 +64,7 @@ def upsert_demo_user(cur):
     cur.execute("SELECT user_id FROM users WHERE email = %s", (DEMO_EMAIL,))
     row = cur.fetchone()
     if row:
-        print(f"Reusing existing demo user_id={row['user_id']}")
+        logger.info(f"Reusing existing demo user_id={row['user_id']}")
         return row["user_id"]
 
     cur.execute(
@@ -70,7 +73,7 @@ def upsert_demo_user(cur):
         ("Dashboard", "Demo", DEMO_EMAIL, hash_password(DEMO_PASSWORD), "9999999999")
     )
     user_id = cur.fetchone()["user_id"]
-    print(f"Created demo user_id={user_id}")
+    logger.info(f"Created demo user_id={user_id}")
     return user_id
 
 
@@ -166,22 +169,22 @@ def main():
         seed_equity_curve(cur, user_id)
         conn.commit()
 
-        print("\nDashboard demo data seeded successfully.")
-        print("=" * 50)
-        print(f"  Login email:    {DEMO_EMAIL}")
-        print(f"  Login password: {DEMO_PASSWORD}")
-        print(f"  user_id:        {user_id}")
-        print("=" * 50)
-        print("POST /login with the above to get a Bearer token, then call:")
-        print("  GET /getDashboardSummary")
-        print("  GET /getAssetClassSummary?bucket=ALL|STOCKS|FNO")
-        print("  GET /getPortfolioEquityCurve?bucket=ALL&range=1M")
-        print("  GET /getPortfolioForLoggedInUser")
-        print("  GET /getPortfolioOfLoggedInUserWithProfitLoss?bucket=STOCKS")
-        print("  GET /getFnoPositionsForLoggedInUser")
+        logger.info("\nDashboard demo data seeded successfully.")
+        logger.info("=" * 50)
+        logger.info(f"  Login email:    {DEMO_EMAIL}")
+        logger.info(f"  Login password: {DEMO_PASSWORD}")
+        logger.info(f"  user_id:        {user_id}")
+        logger.info("=" * 50)
+        logger.info("POST /login with the above to get a Bearer token, then call:")
+        logger.info("  GET /getDashboardSummary")
+        logger.info("  GET /getAssetClassSummary?bucket=ALL|STOCKS|FNO")
+        logger.info("  GET /getPortfolioEquityCurve?bucket=ALL&range=1M")
+        logger.info("  GET /getPortfolioForLoggedInUser")
+        logger.info("  GET /getPortfolioOfLoggedInUserWithProfitLoss?bucket=STOCKS")
+        logger.info("  GET /getFnoPositionsForLoggedInUser")
     except Exception as ex:
         conn.rollback()
-        print(f"[FATAL] Seed failed: {ex}")
+        logger.error(f"[FATAL] Seed failed: {ex}")
         raise
     finally:
         cur.close()
@@ -189,4 +192,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

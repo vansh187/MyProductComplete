@@ -1,5 +1,8 @@
 import json
 from database.redisConnection import RedisConnection
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MarketRepository:
@@ -16,7 +19,7 @@ class MarketRepository:
             await db.set(f"market:{symbol}", json.dumps(payload))
             return True
         except Exception as e:
-            print(f"Failed to save tick for {symbol}: {e}")
+            logger.error(f"Failed to save tick for {symbol}: {e}")
             return False
         
         
@@ -28,7 +31,7 @@ class MarketRepository:
             raw_data = await db.get(f"market:{symbol}")
             return json.loads(raw_data) if raw_data else None
         except Exception as e:
-            print(f"Failed to read tick for {symbol}: {e}")
+            logger.error(f"Failed to read tick for {symbol}: {e}")
             return None
         
     async def append_historical_candle(self, symbol: str, interval: str, candle_data: dict):
@@ -47,7 +50,7 @@ class MarketRepository:
             # Optimization Guardrail: Keep only the last 500 candles to save cloud RAM memory
             await db.zremrangebyrank(key, 0, -501)
         except Exception as e:
-            print(f"Failed to append candle for {symbol}: {e}")
+            logger.error(f"Failed to append candle for {symbol}: {e}")
 
     async def get_historical_candles(self, symbol: str, interval: str, count: int = 100) -> list:
         """
@@ -65,5 +68,5 @@ class MarketRepository:
             candles.reverse()
             return candles
         except Exception as e:
-            print(f"Error fetching candles: {e}")
+            logger.error(f"Error fetching candles: {e}")
             return []    

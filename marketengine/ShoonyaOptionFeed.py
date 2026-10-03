@@ -22,6 +22,7 @@ from typing import Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 RECONNECT_DELAY_SECS = 5
+WS_JOIN_TIMEOUT_SECS = 2
 
 TickHandler = Callable[[str, dict], Awaitable[None] | None]
 OrderUpdateHandler = Callable[[dict], Awaitable[None] | None]
@@ -77,6 +78,9 @@ class ShoonyaOptionFeed:
         self._subscribed_tokens: dict[str, int] = {}  # "EXCH|TOKEN" -> ref count
         self._lock = threading.Lock()
         self._reconnecting = False
+        # True only between _on_open and the next close/error/restart, so
+        # tick caches can refuse to serve prices from a dead socket.
+        self._socket_open = False
         # The specific NorenApi instance the websocket was last opened on.
         # ShoonyaConnection.connect() builds a BRAND NEW NorenApi instance on
         # every reconnect/token-refresh (self._api = _ShoonyaApi(...)), so
@@ -86,6 +90,10 @@ class ShoonyaOptionFeed:
         # instance (which never opened a socket) does nothing to the orphaned
         # old one.
         self._api_instance = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._socket_open
 
     def on_tick(self, handler: TickHandler) -> None:
         """Registers a callback invoked as handler(instrument_key, tick_fields)
@@ -129,14 +137,16 @@ class ShoonyaOptionFeed:
         # A fresh external trigger (broker reconnect) supersedes whatever our
         # own internal reconnect loop was doing for the old session.
         self._reconnecting = False
+        self._socket_open = False
 
         # Best-effort close of the specific previous instance's socket/thread
         # before opening a new one - NorenApi.start_websocket() unconditionally
         # creates a new WebSocketApp + daemon thread without closing a prior
         # one, so calling it again (on the same or a new instance) would
-        # otherwise leak the old socket/thread.
+        # otherwise leak the old socket/thread. start() runs on the event
+        # loop, so the join happens on a helper thread, never here.
         if self._api_instance is not None:
-            self._force_stop_websocket(self._api_instance)
+            self._stop_websocket_in_background(self._api_instance)
 
         self._api_instance = api
 
@@ -148,8 +158,7 @@ class ShoonyaOptionFeed:
             socket_error_callback=self._on_error,
         )
 
-    @staticmethod
-    def _signal_stop_websocket(api) -> None:
+    def _signal_stop_websocket(self, api) -> None:
         """Best-effort, thread-safe request to stop an instance's WS loop.
 
         NorenApi.close_websocket() is a no-op once __websocket_connected is
@@ -185,21 +194,29 @@ class ShoonyaOptionFeed:
             except Exception:
                 pass
 
-    @classmethod
-    def _force_stop_websocket(cls, api) -> None:
-        """Full stop of a previous NorenApi instance: signal + join.
+    def _force_stop_websocket(self, api) -> None:
+        """Full stop of a previous NorenApi instance: signal + join (blocks up
+        to WS_JOIN_TIMEOUT_SECS). Only for shutdown (close()) - never call on
+        the event loop during normal operation; start() uses
+        _stop_websocket_in_background instead."""
+        self._signal_stop_websocket(api)
+        self._join_ws_thread(api)
 
-        Only safe to call from a thread other than the target instance's own
-        WS thread (true for start()/close(), which run on the asyncio loop's
-        thread) - see _signal_stop_websocket() for why the join is split out.
-        """
-        cls._signal_stop_websocket(api)
-
+    def _stop_websocket_in_background(self, api) -> None:
+        self._signal_stop_websocket(api)
         thread = getattr(api, "_NorenApi__ws_thread", None)
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2)
-            if thread.is_alive():
-                logger.warning("[OptionFeed] Old WS thread did not exit within timeout")
+            threading.Thread(
+                target=self._join_ws_thread, args=(api,), name="ws-old-join", daemon=True
+            ).start()
+
+    def _join_ws_thread(self, api) -> None:
+        thread = getattr(api, "_NorenApi__ws_thread", None)
+        if thread is None or thread is threading.current_thread() or not thread.is_alive():
+            return
+        thread.join(timeout=WS_JOIN_TIMEOUT_SECS)
+        if thread.is_alive():
+            logger.warning("[OptionFeed] Old WS thread did not exit within timeout")
 
     def ensure_subscribed(self, tokens: set[str]) -> None:
         """tokens: set of 'EXCH|TOKEN' strings. Subscribes only genuinely-new tokens."""
@@ -282,8 +299,7 @@ class ShoonyaOptionFeed:
         except Exception as e:
             logger.warning(f"[OptionFeed] Error processing tick {raw}: {e}")
 
-    @staticmethod
-    def _log_tick_task_exception(future: "asyncio.Future") -> None:
+    def _log_tick_task_exception(self, future: "asyncio.Future") -> None:
         try:
             exc = future.exception()
         except Exception:
@@ -312,8 +328,7 @@ class ShoonyaOptionFeed:
         except Exception as e:
             logger.warning(f"[OptionFeed] Error processing order update {raw}: {e}")
 
-    @staticmethod
-    def _log_order_update_task_exception(future: "asyncio.Future") -> None:
+    def _log_order_update_task_exception(self, future: "asyncio.Future") -> None:
         try:
             exc = future.exception()
         except Exception:
@@ -324,6 +339,7 @@ class ShoonyaOptionFeed:
     def _on_open(self) -> None:
         logger.info("[OptionFeed] WebSocket connected")
         self._reconnecting = False
+        self._socket_open = True
         with self._lock:
             tokens = list(self._subscribed_tokens.keys())
         if tokens and self._shoonya._api is not None:
@@ -332,6 +348,7 @@ class ShoonyaOptionFeed:
 
     def _on_close(self, *args) -> None:
         logger.warning("[OptionFeed] WebSocket closed - scheduling reconnect")
+        self._socket_open = False
         self._signal_stop_current_instance()
         try:
             self._schedule_reconnect()
@@ -340,6 +357,7 @@ class ShoonyaOptionFeed:
 
     def _on_error(self, *args) -> None:
         logger.warning(f"[OptionFeed] WebSocket error: {args}")
+        self._socket_open = False
         self._signal_stop_current_instance()
         try:
             self._schedule_reconnect()

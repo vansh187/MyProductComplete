@@ -2,6 +2,9 @@ import asyncio
 import json
 from datetime import date, datetime
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 _FILE = Path(__file__).parent / "master_futures.json"
 
@@ -21,11 +24,9 @@ def _load(path: Path) -> dict[str, dict]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as exc:
-        print(
-            f"[FutureMaster] {path} missing or unreadable ({exc}) - futures "
+        logger.warning(f"[FutureMaster] {path} missing or unreadable ({exc}) - futures "
             f"classification will fall back to the symbol-suffix heuristic "
-            f"until `python scripts/build_future_master.py` is run to generate it."
-        )
+            f"until `python scripts/build_future_master.py` is run to generate it.")
         return {}
 
 
@@ -104,6 +105,6 @@ async def schedule_daily_refresh(app=None) -> None:
             contracts = await loop.run_in_executor(None, download_future_master)
             _FILE.write_text(json.dumps(contracts, indent=2, ensure_ascii=False), encoding="utf-8")
             reload()
-            print("[FutureMaster] Refreshed futures scrip master")
+            logger.info("[FutureMaster] Refreshed futures scrip master")
         except Exception as exc:
-            print(f"[FutureMaster] Refresh failed: {exc}")
+            logger.warning(f"[FutureMaster] Refresh failed: {exc}")

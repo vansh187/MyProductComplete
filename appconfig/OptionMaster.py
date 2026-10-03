@@ -2,6 +2,9 @@ import asyncio
 import json
 from datetime import date, datetime
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 _FILE = Path(__file__).parent / "master_options.json"
 
@@ -21,11 +24,9 @@ def _load(path: Path) -> dict[str, dict]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as exc:
-        print(
-            f"[OptionMaster] {path} missing or unreadable ({exc}) - option chain "
+        logger.warning(f"[OptionMaster] {path} missing or unreadable ({exc}) - option chain "
             f"will report no_option_data until `python scripts/build_option_master.py` "
-            f"is run to generate it."
-        )
+            f"is run to generate it.")
         return {}
 
 
@@ -206,6 +207,6 @@ async def schedule_daily_refresh(app=None) -> None:
             chains = await loop.run_in_executor(None, download_option_master)
             _FILE.write_text(json.dumps(chains, indent=2, ensure_ascii=False), encoding="utf-8")
             reload()
-            print("[OptionMaster] Refreshed NFO scrip master")
+            logger.info("[OptionMaster] Refreshed NFO scrip master")
         except Exception as exc:
-            print(f"[OptionMaster] Refresh failed: {exc}")
+            logger.warning(f"[OptionMaster] Refresh failed: {exc}")

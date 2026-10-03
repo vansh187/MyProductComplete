@@ -3,6 +3,9 @@ import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from database.ConnectionFactory import ConnectionFactory
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MarketPriceScheduler:
@@ -30,7 +33,7 @@ class MarketPriceScheduler:
             return float(history["Close"].iloc[-1])
 
         except Exception as e:
-            print(f"[MarketPriceScheduler] Failed for {symbol}: {e}")
+            logger.warning(f"[MarketPriceScheduler] Failed for {symbol}: {e}")
             return None
 
     # -----------------------------
@@ -60,7 +63,7 @@ class MarketPriceScheduler:
 
             symbols = cursor.fetchall()
             if not symbols:
-                print(" No symbols found in market_prices table")
+                logger.warning(" No symbols found in market_prices table")
                 return
             update_query = """
                 UPDATE market_prices
@@ -84,12 +87,12 @@ class MarketPriceScheduler:
 
             conn.commit()
 
-            print(f"[MarketPriceScheduler] Updated {updated_count} symbols")
+            logger.info(f"[MarketPriceScheduler] Updated {updated_count} symbols")
 
         except Exception as e:
             if conn:
                 conn.rollback()
-            print(f"[MarketPriceScheduler] DB update failed: {e}")
+            logger.warning(f"[MarketPriceScheduler] DB update failed: {e}")
 
         finally:
             if cursor:
@@ -104,7 +107,7 @@ class MarketPriceScheduler:
     def start():
 
         if MarketPriceScheduler._scheduler is not None:
-            print("[MarketPriceScheduler] Already running")
+            logger.info("[MarketPriceScheduler] Already running")
             return
 
         scheduler = BackgroundScheduler()
@@ -122,4 +125,4 @@ class MarketPriceScheduler:
 
         MarketPriceScheduler._scheduler = scheduler
 
-        print("[MarketPriceScheduler] Started successfully")
+        logger.info("[MarketPriceScheduler] Started successfully")

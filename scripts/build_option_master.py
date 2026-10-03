@@ -29,6 +29,9 @@ from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
 from zipfile import ZipFile
+import logging
+
+logger = logging.getLogger(__name__)
 
 NFO_MASTER_URL = "https://api.shoonya.com/NFO_symbols.txt.zip"
 BFO_MASTER_URL = "https://api.shoonya.com/BFO_symbols.txt.zip"
@@ -114,7 +117,7 @@ def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS, symbol_m
 
 def _download_and_parse(url: str, tracked: set[str], symbol_map: dict[str, str] | None = None) -> dict:
     """Downloads one Shoonya scrip-master zip and parses it via parse_master_csv()."""
-    print(f"Downloading Shoonya symbol master from {url}...")
+    logger.info(f"Downloading Shoonya symbol master from {url}...")
     resp = urlopen(url, timeout=30)
     zip_data = ZipFile(io.BytesIO(resp.read()))
 
@@ -124,7 +127,7 @@ def _download_and_parse(url: str, tracked: set[str], symbol_map: dict[str, str] 
         candidates = [n for n in zip_data.namelist() if n.endswith("_symbols.txt")]
         target = candidates[0] if candidates else None
     if target is None or target not in zip_data.namelist():
-        print(f"Available files: {zip_data.namelist()}")
+        logger.info(f"Available files: {zip_data.namelist()}")
         raise FileNotFoundError(f"No symbols .txt found in master ZIP from {url}")
 
     content = zip_data.read(target).decode("utf-8", errors="replace")
@@ -145,14 +148,15 @@ def main():
     for underlying in TRACKED_UNDERLYINGS:
         expiries = chains.get(underlying, {}).get("expiries", [])
         total_strikes = sum(len(chains[underlying][e]) for e in expiries)
-        print(f"  {underlying}: {len(expiries)} expiries, {total_strikes} strike entries")
+        logger.info(f"  {underlying}: {len(expiries)} expiries, {total_strikes} strike entries")
 
     OUTPUT_FILE.write_text(
         json.dumps(chains, indent=2, ensure_ascii=False),
         encoding="utf-8"
     )
-    print(f"Written to {OUTPUT_FILE}")
+    logger.info(f"Written to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

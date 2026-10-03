@@ -10,6 +10,9 @@ from service.equityCurveService import EquityCurveService
 from database.portfolioPersistence import portfolioPersistence
 from database.positionspersistence.PositionsPersistence import PositionsPersistence
 from utils.assetBuckets import ASSET_TYPE_BUCKETS
+import logging
+
+logger = logging.getLogger(__name__)
 
 router=APIRouter()
 
@@ -96,9 +99,9 @@ async def start_equity_curve_capture():
                 try:
                     equity_curve_service.captureSnapshotsForUser(user_id)
                 except Exception as exc:
-                    print(f"[EquityCurve] Snapshot failed for user {user_id}: {exc}")
+                    logger.warning(f"[EquityCurve] Snapshot failed for user {user_id}: {exc}")
         except Exception as exc:
-            print(f"[EquityCurve] Refresh error: {exc}")
+            logger.warning(f"[EquityCurve] Refresh error: {exc}")
 
         await asyncio.sleep(60 if _is_market_open() else 300)
 

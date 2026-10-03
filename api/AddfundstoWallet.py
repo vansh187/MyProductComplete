@@ -5,6 +5,9 @@ from fastapi import APIRouter
 from decimal import Decimal
 from service.razorpay.Razorypay import Razorpay
 from service.walletbalance.WalletBalanceService import WalletBalanceService
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -14,7 +17,7 @@ class WalletLedger(BaseModel):
 
 @router.post("/v1/addFundsToWallet")
 def addFundsToWallet(walletLedger: WalletLedger, background_tasks: BackgroundTasks, current_user=Depends(get_current_user)):
-    print("Adding funds")
+    logger.debug("Adding funds")
     userId = current_user["user_id"]
     razorpay = Razorpay()
     return razorpay.invokeRazorPayintegration(walletLedger, userId, background_tasks=background_tasks)

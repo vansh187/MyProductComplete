@@ -50,7 +50,7 @@ def _get_stock_feed(request: Request):
 async def get_explore(request: Request):
     service = _get_service(request)
     try:
-        page = await service.get_explore(_get_shoonya(request))
+        page = await service.get_explore(_get_shoonya(request), _get_stock_feed(request))
     except Exception as exc:
         logger.error(f"[api.stocks] /explore failed: {exc}")
         raise HTTPException(status_code=503, detail="Explore data is temporarily unavailable.")

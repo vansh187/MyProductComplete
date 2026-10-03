@@ -1,7 +1,9 @@
 import os
 import asyncio
+import functools
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import datetime, timedelta
@@ -13,6 +15,8 @@ import requests as _requests
 
 from marketengine.touchlineFields import TouchlineFieldParser
 
+logger = logging.getLogger(__name__)
+
 IST = ZoneInfo("Asia/Kolkata")
 
 _ENV_FILE = Path(__file__).parent.parent / ".env"
@@ -23,7 +27,7 @@ try:
 except ImportError:
     _NorenApi = object
     _NOREN_AVAILABLE = False
-    print("[Shoonya] NorenRestApiOAuth not installed — run: pip install NorenRestApiOAuth")
+    logger.warning("[Shoonya] NorenRestApiOAuth not installed — run: pip install NorenRestApiOAuth")
 
 
 class _ShoonyaApi(_NorenApi):
@@ -46,6 +50,34 @@ def _safe_float(val, default: float = 0.0) -> float:
         return float(val) if val not in (None, "") else default
     except (TypeError, ValueError):
         return default
+
+
+SLOW_BROKER_CALL_MS = 1000
+# Child of this module's logger, so LOG_LEVELS=marketengine.ShoonyaConnection=DEBUG
+# enables both the module's own lines and these timings.
+broker_timing_logger = logging.getLogger(f"{__name__}.timing")
+
+
+def _timed_broker_call(func):
+    """Logs each Shoonya REST round trip: DEBUG normally, WARNING when slow.
+    The line is only formatted when it will actually be emitted."""
+    name = func.__name__
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        start = time.perf_counter()
+        ok = False
+        try:
+            result = func(self, *args, **kwargs)
+            ok = result is not None
+            return result
+        finally:
+            ms = (time.perf_counter() - start) * 1000
+            if ms >= SLOW_BROKER_CALL_MS:
+                broker_timing_logger.warning("SLOW broker call %s%s %.0fms %s", name, args, ms, "ok" if ok else "empty")
+            elif broker_timing_logger.isEnabledFor(logging.DEBUG):
+                broker_timing_logger.debug("%s%s %.0fms %s", name, args, ms, "ok" if ok else "empty")
+    return wrapper
 
 
 class ShoonyaConnection:
@@ -113,13 +145,13 @@ class ShoonyaConnection:
         url     = self._api_url.rstrip("/") + "/GenAcsTok"
 
         try:
-            print(f"[Shoonya] Exchanging code at {url}")
+            logger.info(f"[Shoonya] Exchanging code at {url}")
             r = _requests.post(url, data=payload, timeout=15)
-            print(f"[Shoonya] {r.status_code}: {r.text[:300]}")
+            logger.debug(f"[Shoonya] {r.status_code}: {r.text[:300]}")
 
             data = r.json()
             if "access_token" not in data:
-                print(f"[Shoonya] Token exchange failed: {data}")
+                logger.warning(f"[Shoonya] Token exchange failed: {data}")
                 return None
 
             acc_tok      = data["access_token"]
@@ -135,11 +167,11 @@ class ShoonyaConnection:
             self._access_token  = acc_tok
             self._account_id    = account_id
 
-            print("[Shoonya] Tokens saved to .env")
+            logger.info("[Shoonya] Tokens saved to .env")
             return susertoken
 
         except Exception as exc:
-            print(f"[Shoonya] exchange_code error: {exc}")
+            logger.warning(f"[Shoonya] exchange_code error: {exc}")
             return None
 
     # ------------------------------------------------------------------
@@ -154,15 +186,13 @@ class ShoonyaConnection:
         self._connected = False
 
         if not _NOREN_AVAILABLE:
-            print("[Shoonya] NorenRestApiOAuth missing.")
+            logger.warning("[Shoonya] NorenRestApiOAuth missing.")
             return False
 
         if not self._session_token:
-            print(
-                "[Shoonya] No session token. Complete OAuth flow:\n"
+            logger.info("[Shoonya] No session token. Complete OAuth flow:\n"
                 "  1. GET  /admin/shoonya/auth-url  → open URL in browser\n"
-                "  2. POST /admin/shoonya/exchange-code  {\"code\": \"<paste>\"}"
-            )
+                "  2. POST /admin/shoonya/exchange-code  {\"code\": \"<paste>\"}")
             return False
 
         try:
@@ -188,14 +218,14 @@ class ShoonyaConnection:
             test = self._api.get_quotes(exchange="NSE", token="26000")
             if test and test.get("stat") == "Ok":
                 self._connected = True
-                print(f"[Shoonya] Connected as {self._user_id} (pid={os.getpid()})")
+                logger.info(f"[Shoonya] Connected as {self._user_id} (pid={os.getpid()})")
                 return True
 
-            print(f"[Shoonya] Token invalid or expired: {test}")
+            logger.warning(f"[Shoonya] Token invalid or expired: {test}")
             return False
 
         except Exception as exc:
-            print(f"[Shoonya] connect error: {exc}")
+            logger.warning(f"[Shoonya] connect error: {exc}")
             return False
 
     def connect_with_token(self, susertoken: str) -> bool:
@@ -207,6 +237,7 @@ class ShoonyaConnection:
     # Market data
     # ------------------------------------------------------------------
 
+    @_timed_broker_call
     def get_index_quote(self, exchange: str, token: str) -> dict | None:
         """
         Returns a normalised quote dict or None on failure.
@@ -217,7 +248,7 @@ class ShoonyaConnection:
         try:
             ret = self._api.get_quotes(exchange=exchange, token=token)
             if not ret or ret.get("stat") != "Ok":
-                print(f"[Shoonya] get_quotes failed {exchange}:{token} → {ret}")
+                logger.warning(f"[Shoonya] get_quotes failed {exchange}:{token} → {ret}")
                 return None
 
             ltp = _safe_float(ret.get("lp"))
@@ -246,9 +277,10 @@ class ShoonyaConnection:
             }
 
         except Exception as exc:
-            print(f"[Shoonya] get_index_quote error {exchange}:{token}: {exc}")
+            logger.warning(f"[Shoonya] get_index_quote error {exchange}:{token}: {exc}")
             return None
 
+    @_timed_broker_call
     def get_option_quote(self, exchange: str, token: str) -> dict | None:
         """
         REST snapshot for a single option contract - used to seed OI/LTP/bid/
@@ -263,7 +295,7 @@ class ShoonyaConnection:
         try:
             ret = self._api.get_quotes(exchange=exchange, token=token)
             if not ret or ret.get("stat") != "Ok":
-                print(f"[Shoonya] get_option_quote failed {exchange}:{token} → {ret}")
+                logger.warning(f"[Shoonya] get_option_quote failed {exchange}:{token} → {ret}")
                 return None
 
             return {
@@ -275,9 +307,10 @@ class ShoonyaConnection:
             }
 
         except Exception as exc:
-            print(f"[Shoonya] get_option_quote error {exchange}:{token}: {exc}")
+            logger.warning(f"[Shoonya] get_option_quote error {exchange}:{token}: {exc}")
             return None
 
+    @_timed_broker_call
     def get_stock_quote(self, exchange: str, token: str) -> dict | None:
         """
         REST snapshot for one equity token - used to seed the stocks feature's
@@ -301,7 +334,7 @@ class ShoonyaConnection:
         try:
             ret = self._api.get_quotes(exchange=exchange, token=token)
             if not ret or ret.get("stat") != "Ok":
-                print(f"[Shoonya] get_stock_quote failed {exchange}:{token} → {ret}")
+                logger.warning(f"[Shoonya] get_stock_quote failed {exchange}:{token} → {ret}")
                 return None
 
             ltp = _safe_float(ret.get("lp"))
@@ -331,9 +364,10 @@ class ShoonyaConnection:
             }
 
         except Exception as exc:
-            print(f"[Shoonya] get_stock_quote error {exchange}:{token}: {exc}")
+            logger.warning(f"[Shoonya] get_stock_quote error {exchange}:{token}: {exc}")
             return None
 
+    @_timed_broker_call
     def get_time_price_series(self, exchange: str, token: str, interval: str, days: int = 1) -> list[dict] | None:
         """
         Fetch OHLC candle data from Shoonya for a given timeframe.
@@ -369,7 +403,7 @@ class ShoonyaConnection:
             # NorenApi returns a plain list of candle dicts on success, or a
             # dict (e.g. {"stat": "Not_Ok", "emsg": ...}) on failure.
             if not ret or not isinstance(ret, list):
-                print(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
+                logger.warning(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
                 return None
 
             # Parse Shoonya's TPSeries field names and normalize. TPSeries
@@ -390,7 +424,7 @@ class ShoonyaConnection:
                         "volume":    int(_safe_float(candle.get("intv"))),
                     }))
                 except Exception as e:
-                    print(f"[Shoonya] Error parsing candle {candle}: {e}")
+                    logger.debug(f"[Shoonya] Error parsing candle {candle}: {e}")
                     continue
 
             parsed.sort(key=lambda item: item[0])
@@ -399,7 +433,7 @@ class ShoonyaConnection:
             return result if result else None
 
         except Exception as exc:
-            print(f"[Shoonya] get_time_price_series error {exchange}:{token} interval={interval}: {exc}")
+            logger.warning(f"[Shoonya] get_time_price_series error {exchange}:{token} interval={interval}: {exc}")
             return None
 
     # ------------------------------------------------------------------
@@ -428,16 +462,16 @@ class ShoonyaConnection:
             from webdriver_manager.core.driver_cache import DriverCacheManager
             from selenium.webdriver.chrome.service import Service
         except ImportError as e:
-            print(f"[Shoonya] auto_login dependency missing: {e}")
+            logger.warning(f"[Shoonya] auto_login dependency missing: {e}")
             return False
 
         load_dotenv(dotenv_path=_ENV_FILE, override=True)
         totp_secret = os.getenv("SHOONYA_TOTP_SECRET", "")
         if not totp_secret:
-            print("[Shoonya] SHOONYA_TOTP_SECRET not set — cannot auto_login")
+            logger.warning("[Shoonya] SHOONYA_TOTP_SECRET not set — cannot auto_login")
             return False
 
-        print(f"[Shoonya] auto_login starting (pid={os.getpid()})")
+        logger.info(f"[Shoonya] auto_login starting (pid={os.getpid()})")
 
         login_url = (
             f"https://api.shoonya.com/OAuthlogin/investor-entry-level/login"
@@ -461,14 +495,14 @@ class ShoonyaConnection:
         os.makedirs(wdm_root, exist_ok=True)
         _cache = DriverCacheManager(root_dir=wdm_root)
 
-        print("[Shoonya] Starting headless Chrome for auto-login...")
+        logger.info("[Shoonya] Starting headless Chrome for auto-login...")
         try:
             driver = webdriver.Chrome(
                 service=Service(ChromeDriverManager(cache_manager=_cache).install()),
                 options=options,
             )
         except Exception as exc:
-            print(f"[Shoonya] auto_login: could not start Chrome — {exc}")
+            logger.warning(f"[Shoonya] auto_login: could not start Chrome — {exc}")
             return False
 
         wait = WebDriverWait(driver, 30)
@@ -500,7 +534,7 @@ class ShoonyaConnection:
             # Submit via Enter key (avoids fragile button DOM iteration)
             visible_inputs[2].send_keys(Keys.RETURN)
 
-            print("[Shoonya] Credentials submitted, waiting for auth code...")
+            logger.info("[Shoonya] Credentials submitted, waiting for auth code...")
             deadline = time.time() + 60
 
             while time.time() < deadline:
@@ -549,27 +583,27 @@ class ShoonyaConnection:
                 time.sleep(0.5)
 
         except Exception as exc:
-            print(f"[Shoonya] auto_login browser error: {exc}")
+            logger.warning(f"[Shoonya] auto_login browser error: {exc}")
         finally:
             if not auth_code:
                 try:
-                    print(f"[Shoonya] auto_login failure diagnostics — last URL: {last_url}")
-                    print(f"[Shoonya] auto_login failure diagnostics — page title: {driver.title!r}")
+                    logger.warning(f"[Shoonya] auto_login failure diagnostics — last URL: {last_url}")
+                    logger.warning(f"[Shoonya] auto_login failure diagnostics — page title: {driver.title!r}")
                     screenshot_path = str(_ENV_FILE.parent / "shoonya_login_failure.png")
                     driver.save_screenshot(screenshot_path)
-                    print(f"[Shoonya] auto_login failure diagnostics — screenshot saved to {screenshot_path}")
+                    logger.warning(f"[Shoonya] auto_login failure diagnostics — screenshot saved to {screenshot_path}")
                 except Exception as diag_exc:
-                    print(f"[Shoonya] auto_login: failed to capture failure diagnostics: {diag_exc}")
+                    logger.warning(f"[Shoonya] auto_login: failed to capture failure diagnostics: {diag_exc}")
             try:
                 driver.quit()
             except Exception:
                 pass
 
         if not auth_code:
-            print("[Shoonya] auto_login: could not capture auth code")
+            logger.warning("[Shoonya] auto_login: could not capture auth code")
             return False
 
-        print(f"[Shoonya] Auth code captured, exchanging for token...")
+        logger.info(f"[Shoonya] Auth code captured, exchanging for token...")
         token = self.exchange_code(auth_code)
         if not token:
             return False
@@ -601,6 +635,42 @@ def _next_refresh_delay() -> float:
     return (candidate - now).total_seconds()
 
 
+AUTO_LOGIN_RETRY_DELAY_SECS = 300
+
+
+def get_or_create_connection(app) -> "ShoonyaConnection":
+    """The single ShoonyaConnection the whole process uses. Startup, the
+    refresh loop and the admin OAuth endpoint all resolve it here, so a login
+    done by one is seen by the others instead of two sessions fighting over
+    the same account. app.state.shoonya stays "connected instance or None"
+    for request handlers; app.state.shoonya_connection always holds the
+    instance."""
+    shoonya = getattr(app.state, "shoonya", None) or getattr(app.state, "shoonya_connection", None)
+    if shoonya is None:
+        shoonya = ShoonyaConnection()
+    app.state.shoonya_connection = shoonya
+    return shoonya
+
+
+def activate_market_feeds(app) -> None:
+    """After any successful login: connect() builds a brand new NorenApi
+    instance, so an existing WebSocket feed must reopen on it (its
+    _on_open resubscribes every ref-counted token, stock-feed tokens
+    included); if the feeds were never created (startup login failed),
+    create them via the factory app.py registers. Never raises."""
+    option_feed = getattr(app.state, "option_feed", None)
+    try:
+        if option_feed is not None:
+            option_feed.start()
+            logger.info("[Shoonya] Market feed restarted on the new session")
+            return
+        create_market_feeds = getattr(app.state, "create_market_feeds", None)
+        if callable(create_market_feeds) and create_market_feeds():
+            logger.info("[Shoonya] Market feeds started after late login")
+    except Exception as exc:
+        logger.warning(f"[Shoonya] Market feed activation after login failed: {exc}")
+
+
 async def schedule_daily_refresh(app):
     """
     Background task that keeps the Shoonya session alive.
@@ -615,8 +685,6 @@ async def schedule_daily_refresh(app):
       invalidates the previous session around market pre-open), marks the
       session disconnected, and forces a fresh auto_login().
     """
-    RETRY_DELAY = 300  # 5 minutes
-
     async def _auto_login(shoonya) -> bool:
         loop = asyncio.get_running_loop()
         try:
@@ -625,54 +693,36 @@ async def schedule_daily_refresh(app):
             # Never let an unexpected auto_login exception kill this
             # background task — that would silently stop all future
             # reconnect attempts until the process is restarted.
-            print(f"[Shoonya] auto_login raised unexpectedly: {exc}")
+            logger.error(f"[Shoonya] auto_login raised unexpectedly: {exc}")
             ok = False
         if ok:
             app.state.shoonya = shoonya
-
-            # connect() (called inside auto_login) builds a BRAND NEW NorenApi
-            # instance every time, so any option-chain WebSocket opened on the
-            # previous instance is now orphaned — without this, option-chain
-            # ticks would go permanently dead after every reconnect (daily
-            # 8:30 AM refresh, or a retry after an outage) even though REST
-            # endpoints keep working fine since they resolve self._api fresh
-            # on every call.
-            option_feed = getattr(app.state, "option_feed", None)
-            if option_feed is not None:
-                try:
-                    option_feed.start()
-                    print("[Shoonya] Option chain WS feed restarted after reconnect")
-                except Exception as exc:
-                    print(f"[Shoonya] Failed to restart option chain feed after reconnect: {exc}")
-                # marketengine.ShoonyaStockFeed rides on option_feed's single
-                # WebSocket via on_raw_tick and shares option_feed's own
-                # subscription ref-count map (see ShoonyaStockFeed.ensure_subscribed) -
-                # option_feed._on_open() above already resubscribes every
-                # token in that shared map, stock tokens included, so no
-                # separate restart/resubscribe step is needed here.
+            activate_market_feeds(app)
         return ok
 
     while True:
-        shoonya = getattr(app.state, "shoonya", None)
-        if shoonya is None:
-            from marketengine.ShoonyaConnection import ShoonyaConnection
-            shoonya = ShoonyaConnection()
+        shoonya = get_or_create_connection(app)
 
         while not shoonya.is_connected:
-            print(f"[Shoonya] Disconnected — attempting auto-login... (pid={os.getpid()})")
+            logger.warning(f"[Shoonya] Disconnected — attempting auto-login... (pid={os.getpid()})")
             if await _auto_login(shoonya):
-                print(f"[Shoonya] Reconnected at {datetime.now(IST).strftime('%H:%M IST')}")
+                logger.info(f"[Shoonya] Reconnected at {datetime.now(IST).strftime('%H:%M IST')}")
                 break
-            print(f"[Shoonya] Auto-login failed — retrying in {RETRY_DELAY // 60} min")
-            await asyncio.sleep(RETRY_DELAY)
+            logger.warning(f"[Shoonya] Auto-login failed — retrying in {AUTO_LOGIN_RETRY_DELAY_SECS // 60} min")
+            await asyncio.sleep(AUTO_LOGIN_RETRY_DELAY_SECS)
+            # Re-resolve after every wait: an admin OAuth login may have
+            # connected the shared instance meanwhile - adopt it instead of
+            # starting a competing Selenium login on the same account.
+            shoonya = get_or_create_connection(app)
+
+        if getattr(app.state, "shoonya", None) is not shoonya:
+            app.state.shoonya = shoonya
 
         delay   = _next_refresh_delay()
         next_at = datetime.now(IST) + timedelta(seconds=delay)
-        print(
-            f"[Shoonya] Next scheduled refresh at "
+        logger.info(f"[Shoonya] Next scheduled refresh at "
             f"{next_at.strftime('%Y-%m-%d %H:%M IST')} "
-            f"({delay / 3600:.1f}h from now)"
-        )
+            f"({delay / 3600:.1f}h from now)")
         await asyncio.sleep(delay)
 
         # Shoonya invalidates sessions around this time — mark disconnected
@@ -681,6 +731,6 @@ async def schedule_daily_refresh(app):
         # above picks it back up.
         shoonya.invalidate()
         if await _auto_login(shoonya):
-            print(f"[Shoonya] Scheduled auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
+            logger.info(f"[Shoonya] Scheduled auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
         else:
-            print("[Shoonya] Scheduled auto-refresh failed — entering retry mode")
+            logger.warning("[Shoonya] Scheduled auto-refresh failed — entering retry mode")

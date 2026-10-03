@@ -3,9 +3,13 @@ import asyncio
 import random
 import time
 from repository.MarketRepository import MarketRepository as mk
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 async def simulate_market():
-    print("Starting local market simulator (Alpha Vantage bypass)...")
+    logger.info("Starting local market simulator (Alpha Vantage bypass)...")
     symbols = ["NIFTY50", "SENSEX", "RELIANCE.BSE", "INFY.NSE"]
     prices = {"NIFTY50": 23500.0, "SENSEX": 77000.0, "RELIANCE.BSE": 2450.0, "INFY.NSE": 1500.0}
     

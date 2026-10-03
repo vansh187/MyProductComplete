@@ -29,6 +29,9 @@ import json
 from pathlib import Path
 from urllib.request import urlopen
 from zipfile import ZipFile
+import logging
+
+logger = logging.getLogger(__name__)
 
 _OUTPUT_FILE = Path(__file__).parent.parent / "appconfig" / "stock_symbol_master.json"
 _SECTOR_MAP_FILE = Path(__file__).parent.parent / "appconfig" / "nifty50_watchlist.json"
@@ -63,7 +66,7 @@ class StockSymbolMasterBuilder:
             try:
                 rows = self._download_and_parse(exchange, url)
             except Exception as exc:
-                print(f"[build_stock_symbol_master] {exchange} download/parse failed, skipping: {exc}")
+                logger.warning(f"[build_stock_symbol_master] {exchange} download/parse failed, skipping: {exc}")
                 continue
 
             for row in rows:
@@ -71,19 +74,19 @@ class StockSymbolMasterBuilder:
                 row["sector"] = sector_map.get(row["symbol"])
                 records[key] = row
 
-            print(f"[build_stock_symbol_master] {exchange}: {len(rows)} equity symbols parsed")
+            logger.info(f"[build_stock_symbol_master] {exchange}: {len(rows)} equity symbols parsed")
 
         return list(records.values())
 
     def write(self, records: list[dict]) -> None:
         self._output_file.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[build_stock_symbol_master] Wrote {len(records)} symbols to {self._output_file}")
+        logger.info(f"[build_stock_symbol_master] Wrote {len(records)} symbols to {self._output_file}")
 
     def _load_sector_map(self) -> dict[str, str]:
         try:
             entries = json.loads(self._sector_map_file.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-            print(f"[build_stock_symbol_master] Could not read sector map {self._sector_map_file}: {exc}")
+            logger.warning(f"[build_stock_symbol_master] Could not read sector map {self._sector_map_file}: {exc}")
             return {}
 
         sector_map = {}
@@ -152,10 +155,11 @@ def main() -> None:
     builder = StockSymbolMasterBuilder()
     records = builder.build()
     if not records:
-        print("[build_stock_symbol_master] No records produced - leaving existing output file untouched")
+        logger.warning("[build_stock_symbol_master] No records produced - leaving existing output file untouched")
         return
     builder.write(records)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

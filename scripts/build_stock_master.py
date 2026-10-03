@@ -14,6 +14,9 @@ import io
 from pathlib import Path
 from urllib.request import urlopen
 from zipfile import ZipFile
+import logging
+
+logger = logging.getLogger(__name__)
 
 SECURITY_MASTER_URL = "https://directlink.icicidirect.com/MotherAppMaster/SecurityMaster.zip"
 OUTPUT_FILE = Path(__file__).parent.parent / "appconfig" / "master_stocks.json"
@@ -24,14 +27,14 @@ def download_security_master() -> dict[str, str]:
     Downloads and parses Breeze's SecurityMaster.zip.
     Returns { "Company Name": "BREEZE_STOCK_CODE" } for all NSE cash equities.
     """
-    print("Downloading Breeze Security Master...")
+    logger.info("Downloading Breeze Security Master...")
     resp = urlopen(SECURITY_MASTER_URL, timeout=30)
     zip_data = ZipFile(io.BytesIO(resp.read()))
 
     # The ZIP contains multiple .txt files — we want NSEScripMaster.txt
     target = "NSEScripMaster.txt"
     if target not in zip_data.namelist():
-        print(f"Available files: {zip_data.namelist()}")
+        logger.info(f"Available files: {zip_data.namelist()}")
         raise FileNotFoundError(f"{target} not found in security master ZIP")
 
     content = zip_data.read(target).decode("utf-8", errors="replace")
@@ -58,19 +61,20 @@ def download_security_master() -> dict[str, str]:
 
 def main():
     stocks = download_security_master()
-    print(f"Found {len(stocks)} NSE equity entries.")
+    logger.info(f"Found {len(stocks)} NSE equity entries.")
 
     OUTPUT_FILE.write_text(
         json.dumps(stocks, indent=2, ensure_ascii=False),
         encoding="utf-8"
     )
-    print(f"Written to {OUTPUT_FILE}")
+    logger.info(f"Written to {OUTPUT_FILE}")
 
     # Quick sanity check
     for name in ("Infosys", "Tata Consultancy", "Reliance"):
         matches = {k: v for k, v in stocks.items() if name.lower() in k.lower()}
-        print(f"  {name}: {matches}")
+        logger.info(f"  {name}: {matches}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

@@ -5,8 +5,14 @@ from typing import List
 import asyncio
 import json
 import math
+import time
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+
+from utils.market_hours import is_market_open
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/market", tags=["Market Quotes"])
 
@@ -21,11 +27,7 @@ _LAST_PRICE_CACHE = {}
 
 
 def _is_market_open() -> bool:
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
-    now_mins = now.hour * 60 + now.minute
-    return (9 * 60 + 15) <= now_mins <= (15 * 60 + 30)
+    return is_market_open()
 
 
 def _last_trading_day() -> str:
@@ -89,13 +91,13 @@ async def _fetch_quotes(breeze, symbols: List[str]) -> tuple[list[dict], list[di
 
             if not response or response.get("Status") != 200:
                 reason = (response or {}).get("Error") or f"Status {(response or {}).get('Status')}"
-                print(f"[Breeze] Non-200 for {symbol}: {response}")
+                logger.warning(f"[Breeze] Non-200 for {symbol}: {response}")
                 errors.append({"symbol": symbol, "reason": reason, "trading_day": trading_day})
                 continue
 
             data = response.get("Success") or []
             if not data:
-                print(f"[Breeze] Empty data for {symbol} on {trading_day}")
+                logger.warning(f"[Breeze] Empty data for {symbol} on {trading_day}")
                 errors.append({"symbol": symbol, "reason": "no_data", "trading_day": trading_day})
                 continue
 
@@ -117,7 +119,7 @@ async def _fetch_quotes(breeze, symbols: List[str]) -> tuple[list[dict], list[di
             })
 
         except Exception as e:
-            print(f"[Breeze] Exception for {symbol}: {e}")
+            logger.warning(f"[Breeze] Exception for {symbol}: {e}")
             errors.append({"symbol": symbol, "reason": str(e), "trading_day": trading_day})
 
     return results, errors
@@ -264,16 +266,16 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
                 ),
                 timeout=10.0
             )
-            print(f"[Shoonya] {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {quote}")
+            logger.debug(f"[Shoonya] {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {quote}")
             if quote:
                 source = "shoonya"
                 # Cache successful live price
                 _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                 return quote, source
         except asyncio.TimeoutError:
-            print(f"[Shoonya] Timeout for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']})")
+            logger.warning(f"[Shoonya] Timeout for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']})")
         except Exception as e:
-            print(f"[Shoonya] Exception for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {e}")
+            logger.warning(f"[Shoonya] Exception for {stock_code} ({idx['shoonya_exchange']}:{idx['shoonya_token']}): {e}")
 
     # ── Fallback 1: Breeze get_quotes with 2s timeout ──────────────────
     if breeze is not None:
@@ -296,9 +298,9 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
                     _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                     return quote, source
         except asyncio.TimeoutError:
-            print(f"[Breeze] get_quotes timeout for {stock_code}")
+            logger.warning(f"[Breeze] get_quotes timeout for {stock_code}")
         except Exception as e:
-            print(f"[Breeze] get_quotes failed for {stock_code}: {e}")
+            logger.warning(f"[Breeze] get_quotes failed for {stock_code}: {e}")
 
     # ── Fallback 2: Breeze historical (NSE only) with 2s timeout ──────────
     if breeze is not None and exchange_code == "NSE":
@@ -325,9 +327,9 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
                 _LAST_PRICE_CACHE[stock_code] = {"quote": quote, "source": source}
                 return quote, source
         except asyncio.TimeoutError:
-            print(f"[Breeze] Historical timeout for {stock_code}")
+            logger.warning(f"[Breeze] Historical timeout for {stock_code}")
         except Exception as e:
-            print(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
+            logger.warning(f"[Breeze] Historical fallback failed for {stock_code}: {e}")
 
     # ── Last Resort: Return cached last price ONLY when market is closed ──
     if stock_code in _LAST_PRICE_CACHE and not _is_market_open():
@@ -337,22 +339,62 @@ async def _fetch_index_quote(idx: dict, shoonya, breeze, trading_day: str, loop)
     return None, None
 
 
-async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
-    """Fetch ALL indices in parallel with per-call timeouts.
+def index_instrument_keys() -> list[str]:
+    return [f"{idx['shoonya_exchange']}|{idx['shoonya_token']}" for idx in _ALL_INDICES]
 
-    Timeout strategy:
-    - Shoonya (primary): 10s per index
-    - Breeze (fallback): 2s per call
-    All 6 indices fetched in parallel, so wall-clock time ~10s max.
-    """
+
+def _index_quote_from_tick(stock_feed, idx: dict) -> dict | None:
+    """Builds the same shape as ShoonyaConnection.get_index_quote from the
+    pinned WebSocket tick - touchline 'c' is the previous close."""
+    if stock_feed is None:
+        return None
+    try:
+        tick = stock_feed.get_tick(f"{idx['shoonya_exchange']}|{idx['shoonya_token']}")
+    except Exception as exc:
+        logger.warning(f"[Indices] get_tick failed for {idx['stock_code']}: {exc}")
+        return None
+    if not tick:
+        return None
+    ltp        = _safe_float(tick.get("ltp"))
+    prev_close = _safe_float(tick.get("close"))
+    if ltp <= 0 or prev_close <= 0:
+        return None
+    change = round(ltp - prev_close, 2)
+    return {
+        "ltp":        ltp,
+        "open":       _safe_float(tick.get("open")),
+        "high":       _safe_float(tick.get("high")),
+        "low":        _safe_float(tick.get("low")),
+        "prev_close": prev_close,
+        "change":     change,
+        "change_pct": round(change / prev_close * 100, 2),
+        "as_of":      tick.get("last_trade_time"),
+    }
+
+
+async def _resolve_index_quote(idx: dict, shoonya, breeze, stock_feed, trading_day: str, loop):
+    # Ticks only count as live Shoonya data while the session is connected
+    # (get_tick itself also refuses dead-socket / stale ticks); otherwise the
+    # original Breeze -> closed-market-cache fallback chain applies unchanged.
+    if shoonya is not None and shoonya.is_connected:
+        quote = _index_quote_from_tick(stock_feed, idx)
+        if quote is not None:
+            _LAST_PRICE_CACHE[idx["stock_code"]] = {"quote": quote, "source": "shoonya"}
+            return quote, "shoonya"
+    return await _fetch_index_quote(idx, shoonya, breeze, trading_day, loop)
+
+
+async def _fetch_indices(shoonya, breeze, stock_feed=None) -> tuple[list[dict], list[dict]]:
+    """Fetch ALL indices: WebSocket tick cache first, then in parallel REST
+    with per-call timeouts (Shoonya 10s, Breeze 2s) for any index without a
+    usable tick."""
     trading_day = _last_trading_day()
     loop        = asyncio.get_running_loop()
     results     = []
     errors      = []
 
-    # Fetch all indices in parallel (not sequentially)
     tasks = [
-        _fetch_index_quote(idx, shoonya, breeze, trading_day, loop)
+        _resolve_index_quote(idx, shoonya, breeze, stock_feed, trading_day, loop)
         for idx in _ALL_INDICES
     ]
 
@@ -363,13 +405,13 @@ async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
         exchange_code = idx["exchange_code"]
 
         if isinstance(response, Exception):
-            print(f"[Exception] {stock_code}: {response}")
+            logger.error(f"[Exception] {stock_code}: {response}")
             errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": str(response)})
             continue
 
         quote, source = response
         if quote is None:
-            print(f"No data for {stock_code} from any provider")
+            logger.warning(f"No data for {stock_code} from any provider")
             errors.append({"index": idx["display_name"], "stock_code": stock_code, "reason": "no_data"})
             continue
 
@@ -388,6 +430,28 @@ async def _fetch_indices(shoonya, breeze) -> tuple[list[dict], list[dict]]:
         })
 
     return results, errors
+
+
+# Single-flight snapshot shared by /indices, /indices/stream (every connected
+# client) and /marquee - without it each SSE client polled the broker itself,
+# so N open tabs meant N x 6 REST calls every 5 seconds on the shared pool.
+_INDICES_SNAPSHOT_TTL_SECS = 1.0
+_indices_snapshot: dict = {"at": 0.0, "data": None}
+_indices_snapshot_lock = asyncio.Lock()
+
+
+async def _get_indices_snapshot(shoonya, breeze, stock_feed) -> tuple[list[dict], list[dict]]:
+    cached = _indices_snapshot["data"]
+    if cached is not None and (time.monotonic() - _indices_snapshot["at"]) < _INDICES_SNAPSHOT_TTL_SECS:
+        return cached
+    async with _indices_snapshot_lock:
+        cached = _indices_snapshot["data"]
+        if cached is not None and (time.monotonic() - _indices_snapshot["at"]) < _INDICES_SNAPSHOT_TTL_SECS:
+            return cached
+        data = await _fetch_indices(shoonya, breeze, stock_feed)
+        _indices_snapshot["data"] = data
+        _indices_snapshot["at"] = time.monotonic()
+        return data
 
 
 def _normalize_index(item: dict) -> dict:
@@ -418,12 +482,9 @@ async def get_market_indices(request: Request):
     Shoonya is the primary provider; Breeze is the fallback.
     """
     shoonya, breeze = _get_market_clients(request)
-    indices, errors = await _fetch_indices(shoonya, breeze)
-
-    # Log for debugging data fluctuation
-    print(f"[API] /indices response: {len(indices)} indices, {len(errors)} errors")
-    for idx in indices:
-        print(f"  - {idx.get('name')}: {idx.get('value')} ({idx.get('source')})")
+    indices, errors = await _get_indices_snapshot(shoonya, breeze, getattr(request.app.state, "stock_feed", None))
+    if errors:
+        logger.warning(f"[API] /indices: {len(indices)} indices, {len(errors)} errors: {errors}")
 
     return {
         "market_status": "open" if _is_market_open() else "closed",
@@ -462,7 +523,9 @@ async def stream_market_indices(request: Request):
                 continue
 
             try:
-                indices, errors = await _fetch_indices(shoonya, breeze)
+                indices, errors = await _get_indices_snapshot(
+                    shoonya, breeze, getattr(request.app.state, "stock_feed", None)
+                )
                 payload = json.dumps({
                     "market_status": "open" if is_open else "closed",
                     "indices":       indices,
@@ -471,7 +534,7 @@ async def stream_market_indices(request: Request):
                 })
                 yield f"data: {payload}\n\n"
             except Exception as exc:
-                print(f"[SSE/indices] Error: {exc}")
+                logger.warning(f"[SSE/indices] Error: {exc}")
 
             await asyncio.sleep(5 if is_open else 60)
 
@@ -504,7 +567,7 @@ async def get_marquee(
     async def _no_stocks():
         return [], []
 
-    index_task = _fetch_indices(shoonya, breeze)
+    index_task = _get_indices_snapshot(shoonya, breeze, getattr(request.app.state, "stock_feed", None))
     stock_task = _fetch_quotes(breeze, symbols) if (symbols and breeze) else _no_stocks()
 
     results = await asyncio.gather(index_task, stock_task, return_exceptions=True)
@@ -562,7 +625,7 @@ async def stream_market_quotes(
         while True:
             # Stop the loop as soon as the client closes the browser tab
             if await request.is_disconnected():
-                print("[SSE] Client disconnected. Stopping stream.")
+                logger.debug("[SSE] Client disconnected. Stopping stream.")
                 break
 
             try:
@@ -570,7 +633,7 @@ async def stream_market_quotes(
                 payload = json.dumps(_build_response(stocks, errors))
                 yield f"data: {payload}\n\n"
             except Exception as e:
-                print(f"[SSE] Error generating event: {e}")
+                logger.warning(f"[SSE] Error generating event: {e}")
 
             await asyncio.sleep(12 if _is_market_open() else 60)
 

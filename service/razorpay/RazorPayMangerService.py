@@ -3,6 +3,9 @@ import os
 from dotenv import load_dotenv
 from database.razorpaypersistence.RazorPayPersistence import RazorPayPersistence
 from fastapi import BackgroundTasks 
+import logging
+
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 class RazorPayManagerService:
@@ -19,7 +22,7 @@ class RazorPayManagerService:
         self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
         if self.key_id is not None and self.key_secret is not None:
             self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
-            print("client success")
+            logger.debug("client success")
             order_payload = {
             "amount": int(walletLedger.amount * 100),
             "currency": walletLedger.currency,
@@ -102,7 +105,7 @@ class RazorPayManagerService:
                 # updatePaymentStatus()'s PENDING->SUCCESS idempotency check.
                 return True
         except Exception as ex:
-            print(f"Error in verification of payment: {ex}")
+            logger.error(f"Error in verification of payment: {ex}")
             return False
 
 
@@ -121,32 +124,30 @@ class RazorPayManagerService:
             # with the value now stored in RAZORPAY_WEBHOOK_SECRET.
             webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
             if not webhook_secret:
-                print("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
+                logger.error("RAZORPAY_WEBHOOK_SECRET is not set in the environment variables.")
                 return False
             
             # Using Razorpay's utility helper to verify the signature
-            print("inside verify_webhook_signature inside RazorPayManagerService")
-            print("webhook signatue"+webhook_signature)
-            print(raw_body)
+            logger.debug("inside verify_webhook_signature inside RazorPayManagerService")
             self.key_id=os.getenv("RAZORPAY_API_KEY")
             self.key_secret=os.getenv("RAZORPAY_SECRET_KEY")
             self.client=razorpay.Client(auth=(self.key_id,self.key_secret))
-            print("Client initiation done")
+            logger.debug("Client initiation done")
             self.client.utility.verify_webhook_signature(
                 raw_body.decode('utf-8'), 
                 webhook_signature, 
                 webhook_secret
             )
-            print("inside verify_webhook_signature after utility inside RazorPayManagerService")
+            logger.debug("inside verify_webhook_signature after utility inside RazorPayManagerService")
             return True
         except Exception as e:
-            print(f" Webhook signature verification failed: {e}")
+            logger.warning(f" Webhook signature verification failed: {e}")
             return False   
     
     
     
     def invokeCallToDatabase(self,razorpay_order_id,razorpay_payment_id,userId):
-        print("calling to database")
+        logger.debug("calling to database")
         razorPayPersistence=RazorPayPersistence()
         was_newly_processed = razorPayPersistence.updatePaymentStatus(
                        razorpay_order_id ,
@@ -160,5 +161,5 @@ class RazorPayManagerService:
         if was_newly_processed:
             razorPayPersistence.insertUpdateWallet(userId,razorpay_order_id)
         else:
-            print(f"Skipping wallet credit for order {razorpay_order_id}: payment already processed")
-        print("database update completed")
+            logger.warning(f"Skipping wallet credit for order {razorpay_order_id}: payment already processed")
+        logger.debug("database update completed")

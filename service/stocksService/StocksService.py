@@ -19,13 +19,10 @@ session every other market-data module does):
     back into this service - no lock is ever held while awaiting anything
     here, so there is no path to a deadlock between this service, the stock
     feed, and the shared option-chain WebSocket feed it rides on.
-  - get_explore() is guarded by an asyncio.Lock + short TTL cache: without
-    it, every hit to the public, no-auth /api/stocks/explore endpoint would
-    fan out a fresh REST quote call per watchlist stock to the shared
-    broker session - fine for one visitor, not for concurrent ones. Holding
-    the lock across the whole cache-miss fetch also collapses a thundering
-    herd of concurrent requests during that window into a single broker
-    round trip instead of one each.
+  - get_explore() is a short TTL cache with stale-while-revalidate, built
+    from the pinned watchlist ticks; REST is only a bounded fallback for
+    stocks with no tick yet. Only the very first cold call waits on the
+    asyncio.Lock; afterwards every caller gets the cached page instantly.
 """
 
 import asyncio
@@ -52,6 +49,9 @@ _EXPLORE_LIST_SIZE = 10
 # never visibly stale, long enough that a burst of concurrent visitors
 # within the same window shares one broker round trip.
 _EXPLORE_CACHE_TTL_SECS = 5.0
+_EXPLORE_REST_CONCURRENCY = 8
+# Hard ceiling on how old a served explore page may be.
+_EXPLORE_MAX_STALE_SECS = 30.0
 
 # period -> (Shoonya minute interval, calendar days of history to request, aggregation bucket)
 # Shoonya's TPSeries endpoint is minute-granularity only (no native daily/
@@ -81,6 +81,7 @@ class StocksService:
         self._explore_cache_data: dict | None = None
         self._explore_cache_at: float = 0.0
         self._explore_lock = asyncio.Lock()
+        self._explore_refresh_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Facets / Search
@@ -136,24 +137,59 @@ class StocksService:
     # Explore
     # ------------------------------------------------------------------
 
-    async def get_explore(self, shoonya) -> dict:
-        """TTL-cached wrapper around _build_explore_page - see the class
-        docstring's note on why this exists. The lock is held for the whole
-        cache-miss fetch (not just the cache check), so concurrent callers
-        during a miss all converge on one broker round trip."""
+    def watchlist_instrument_keys(self) -> list[str]:
+        return [
+            f"{s['exchange']}|{s['token']}"
+            for s in self._explore_watchlist.stocks()
+            if s.get("exchange") and s.get("token")
+        ]
+
+    async def get_explore(self, shoonya, stock_feed=None) -> dict:
+        """TTL cache with bounded stale-while-revalidate:
+          age < TTL            -> cached page
+          TTL <= age < MAX     -> cached page now, one background rebuild
+          age >= MAX (or none) -> rebuild and wait (e.g. first visitor after
+                                  an idle night never sees yesterday's page)"""
+        cached = self._explore_cache_data
+        age = time.monotonic() - self._explore_cache_at
+        if cached is not None and age < _EXPLORE_MAX_STALE_SECS:
+            if age >= _EXPLORE_CACHE_TTL_SECS:
+                self._schedule_explore_refresh(shoonya, stock_feed)
+            return cached
+
         async with self._explore_lock:
-            now = time.monotonic()
-            if self._explore_cache_data is not None and (now - self._explore_cache_at) < _EXPLORE_CACHE_TTL_SECS:
+            if (self._explore_cache_data is not None
+                    and time.monotonic() - self._explore_cache_at < _EXPLORE_CACHE_TTL_SECS):
                 return self._explore_cache_data
+            return await self._refresh_explore(shoonya, stock_feed)
 
-            page = await self._build_explore_page(shoonya)
+    def _schedule_explore_refresh(self, shoonya, stock_feed) -> None:
+        if self._explore_refresh_task is not None and not self._explore_refresh_task.done():
+            return
+        self._explore_refresh_task = asyncio.create_task(self._background_explore_refresh(shoonya, stock_feed))
+
+    async def _background_explore_refresh(self, shoonya, stock_feed) -> None:
+        try:
+            async with self._explore_lock:
+                await self._refresh_explore(shoonya, stock_feed)
+        except Exception as exc:
+            logger.warning(f"[StocksService] background explore refresh failed: {exc}")
+
+    async def _refresh_explore(self, shoonya, stock_feed) -> dict:
+        page = await self._build_explore_page(shoonya, stock_feed)
+        # An all-empty page (broker briefly down) must not overwrite a good one.
+        previous = self._explore_cache_data
+        previous_fresh_enough = (time.monotonic() - self._explore_cache_at) < _EXPLORE_MAX_STALE_SECS
+        # A transient all-empty build (broker blip) keeps the last good page,
+        # but only while that page is still within the max-stale bound.
+        if page["trending"] or previous is None or not previous.get("trending") or not previous_fresh_enough:
             self._explore_cache_data = page
-            self._explore_cache_at = time.monotonic()
-            return page
+        self._explore_cache_at = time.monotonic()
+        return self._explore_cache_data
 
-    async def _build_explore_page(self, shoonya) -> dict:
+    async def _build_explore_page(self, shoonya, stock_feed=None) -> dict:
         watchlist_stocks = self._explore_watchlist.stocks()
-        summaries = await self._fetch_watchlist_summaries(shoonya, watchlist_stocks)
+        summaries = await self._fetch_watchlist_summaries(shoonya, watchlist_stocks, stock_feed)
 
         by_volume = sorted(summaries, key=lambda s: s["volume"], reverse=True)
         by_gain = sorted(summaries, key=lambda s: s["change_pct"], reverse=True)
@@ -171,49 +207,68 @@ class StocksService:
             "collections": self._collections_catalog.all(),
         }
 
-    async def _fetch_watchlist_summaries(self, shoonya, watchlist_stocks: list[dict]) -> list[dict]:
+    def _watchlist_summary(self, stock: dict, quote: dict) -> dict:
+        ltp = self._as_float(quote.get("ltp"))
+        prev_close = self._as_float(quote.get("close"))
+        change = round(ltp - prev_close, 2) if prev_close else 0.0
+        change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
+        return {
+            "symbol": stock["symbol"],
+            "exchange": stock["exchange"],
+            "name": stock["name"],
+            "ltp": round(ltp, 2),
+            "change": change,
+            "change_pct": change_pct,
+            "volume": self._as_int(quote.get("volume")),
+            "sector": stock.get("sector"),
+        }
+
+    async def _fetch_watchlist_summaries(self, shoonya, watchlist_stocks: list[dict], stock_feed=None) -> list[dict]:
+        """Tick cache first (pinned watchlist tokens, O(1) in-memory); REST
+        only for stocks with no usable tick yet, capped at
+        _EXPLORE_REST_CONCURRENCY in flight so a cold start can't flood the
+        shared broker-I/O thread pool other endpoints depend on."""
+        # Disconnected broker session -> empty lists, never frozen cached prices.
         if shoonya is None or not shoonya.is_connected:
             logger.warning("[StocksService] Shoonya not connected - explore lists will be empty")
             return []
 
+        summaries: list[dict] = []
+        missing: list[dict] = []
+        for stock in watchlist_stocks:
+            tick = self._safe_get_tick(stock_feed, stock["exchange"], stock["token"])
+            if tick and self._as_float(tick.get("ltp")) > 0 and self._as_float(tick.get("close")) > 0:
+                summaries.append(self._watchlist_summary(stock, tick))
+            else:
+                missing.append(stock)
+
+        if not missing:
+            return summaries
+
         loop = asyncio.get_running_loop()
+        semaphore = asyncio.Semaphore(_EXPLORE_REST_CONCURRENCY)
 
         async def _fetch_one(stock: dict) -> dict | None:
-            try:
-                quote = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        lambda ex=stock["exchange"], tk=stock["token"]: shoonya.get_stock_quote(ex, tk)
-                    ),
-                    timeout=_EXPLORE_QUOTE_TIMEOUT_SECS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"[StocksService] explore quote timeout for {stock.get('symbol')}")
-                return None
-            except Exception as exc:
-                logger.warning(f"[StocksService] explore quote failed for {stock.get('symbol')}: {exc}")
-                return None
-
+            async with semaphore:
+                try:
+                    quote = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda ex=stock["exchange"], tk=stock["token"]: shoonya.get_stock_quote(ex, tk)
+                        ),
+                        timeout=_EXPLORE_QUOTE_TIMEOUT_SECS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[StocksService] explore quote timeout for {stock.get('symbol')}")
+                    return None
+                except Exception as exc:
+                    logger.warning(f"[StocksService] explore quote failed for {stock.get('symbol')}: {exc}")
+                    return None
             if quote is None:
                 return None
+            return self._watchlist_summary(stock, quote)
 
-            ltp = self._as_float(quote.get("ltp"))
-            prev_close = self._as_float(quote.get("close"))
-            change = round(ltp - prev_close, 2) if prev_close else 0.0
-            change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
-            return {
-                "symbol": stock["symbol"],
-                "exchange": stock["exchange"],
-                "name": stock["name"],
-                "ltp": round(ltp, 2),
-                "change": change,
-                "change_pct": change_pct,
-                "volume": self._as_int(quote.get("volume")),
-                "sector": stock.get("sector"),
-            }
-
-        results = await asyncio.gather(*[_fetch_one(s) for s in watchlist_stocks], return_exceptions=True)
-        summaries = []
+        results = await asyncio.gather(*[_fetch_one(s) for s in missing], return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(f"[StocksService] explore fetch raised: {result}")

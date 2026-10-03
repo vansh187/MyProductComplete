@@ -31,6 +31,9 @@ sys.path.insert(0, str(repo_root))
 
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from database.razorpaypersistence.RazorPayPersistence import RazorPayPersistence
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def get_wallet_balance(user_id):
@@ -70,12 +73,12 @@ def deposit(user_id, order_id, amount):
 
 
 def scenario_concurrent_deposits(user_id, num_threads=20, amount_each=Decimal("100.00")):
-    print(f"\n=== Concurrent-deposit test against real user_id={user_id} ===")
+    logger.info(f"\n=== Concurrent-deposit test against real user_id={user_id} ===")
     balance_before = get_wallet_balance(user_id)
     rows_before = count_wallet_rows(user_id)
-    print(f"  balance BEFORE: {balance_before} (wallet rows: {rows_before})")
+    logger.info(f"  balance BEFORE: {balance_before} (wallet rows: {rows_before})")
     if balance_before is None:
-        print("  No existing wallet row for this user - this run will also exercise "
+        logger.info("  No existing wallet row for this user - this run will also exercise "
               "the brand-new-wallet advisory-lock INSERT path.")
 
     errors = []
@@ -99,30 +102,31 @@ def scenario_concurrent_deposits(user_id, num_threads=20, amount_each=Decimal("1
     expected_increase = amount_each * num_threads
     expected_balance = (balance_before or Decimal("0")) + expected_increase
 
-    print(f"  balance AFTER:  {balance_after} (wallet rows: {rows_after})")
-    print(f"  expected:       {expected_balance} (increase of {expected_increase} from {num_threads} x {amount_each})")
-    print(f"  errors: {errors}")
+    logger.info(f"  balance AFTER:  {balance_after} (wallet rows: {rows_after})")
+    logger.info(f"  expected:       {expected_balance} (increase of {expected_increase} from {num_threads} x {amount_each})")
+    logger.info(f"  errors: {errors}")
 
     ok = True
     if errors:
-        print("  FAIL: one or more concurrent deposits raised an error or hung")
+        logger.error("  FAIL: one or more concurrent deposits raised an error or hung")
         ok = False
     if rows_after != 1:
-        print(f"  FAIL: expected exactly 1 wallet row after the run, found {rows_after} (duplicate-row race)")
+        logger.error(f"  FAIL: expected exactly 1 wallet row after the run, found {rows_after} (duplicate-row race)")
         ok = False
     if balance_after != expected_balance:
-        print(f"  FAIL: balance mismatch - expected {expected_balance}, got {balance_after} (lost update)")
+        logger.error(f"  FAIL: balance mismatch - expected {expected_balance}, got {balance_after} (lost update)")
         ok = False
 
-    print("  PASS - no lost updates, no duplicate wallet rows, all 20 concurrent credits landed" if ok else "  ONE OR MORE CHECKS FAILED - see above")
+    logger.info("  PASS - no lost updates, no duplicate wallet rows, all 20 concurrent credits landed" if ok else "  ONE OR MORE CHECKS FAILED - see above")
     return ok
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     if len(sys.argv) != 2:
-        print("Usage: python scripts/verify_wallet_credit_fix.py <existing_user_id>")
+        logger.info("Usage: python scripts/verify_wallet_credit_fix.py <existing_user_id>")
         sys.exit(1)
     user_id = int(sys.argv[1])
-    print(f"Verifying against DATABASE_URL from .env, real user_id={user_id}.")
+    logger.info(f"Verifying against DATABASE_URL from .env, real user_id={user_id}.")
     success = scenario_concurrent_deposits(user_id)
     sys.exit(0 if success else 1)

@@ -1,4 +1,7 @@
 from events.events import Event
+import logging
+
+logger = logging.getLogger(__name__)
 
 class EventBus:
 
@@ -11,7 +14,7 @@ class EventBus:
         self.subscribers[event_type].append(handler)
 
     def publish(self, event: Event):
-        print(f"EVENT TRIGGERED: {event.type}")
+        logger.debug(f"EVENT TRIGGERED: {event.type}")
 
         handlers = self.subscribers.get(event.type, [])
 

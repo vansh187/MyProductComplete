@@ -11,6 +11,9 @@ from service.topMovers.TopMoversService import (
     TopMoversFetcher,
     TopMoversCache,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/market", tags=["Top Movers"])
 
@@ -103,13 +106,11 @@ async def start_background_refresh(app):
             if shoonya and shoonya.is_connected:
                 data = await _fetcher.fetch_top_movers(shoonya, is_open)
                 await _cache.update(data)
-                print(
-                    f"[TopMovers] Refreshed — "
+                logger.info(f"[TopMovers] Refreshed — "
                     f"{len(data.get('gainers', []))} gainers, "
                     f"{len(data.get('losers', []))} losers, "
-                    f"{data.get('total_tracked', 0)} stocks tracked"
-                )
+                    f"{data.get('total_tracked', 0)} stocks tracked")
         except Exception as exc:
-            print(f"[TopMovers] Refresh error: {exc}")
+            logger.warning(f"[TopMovers] Refresh error: {exc}")
 
         await asyncio.sleep(300 if is_open else 600)

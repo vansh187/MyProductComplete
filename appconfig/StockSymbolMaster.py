@@ -20,6 +20,9 @@ globals, no static/class methods - so tests can point it at fixture files.
 import asyncio
 import json
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class StockSymbolMaster:
@@ -52,17 +55,17 @@ class StockSymbolMaster:
 
         self._records = list(by_key.values())
         self._by_key = by_key
-        print(f"[StockSymbolMaster] Loaded {len(self._records)} symbols from {source}")
+        logger.info(f"[StockSymbolMaster] Loaded {len(self._records)} symbols from {source}")
 
     def _load_file(self, path: Path) -> list[dict]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-            print(f"[StockSymbolMaster] Could not read {path}: {exc}")
+            logger.warning(f"[StockSymbolMaster] Could not read {path}: {exc}")
             return []
 
         if not isinstance(raw, list):
-            print(f"[StockSymbolMaster] {path} did not contain a JSON array - ignoring")
+            logger.warning(f"[StockSymbolMaster] {path} did not contain a JSON array - ignoring")
             return []
 
         cleaned = []
@@ -76,7 +79,7 @@ class StockSymbolMaster:
         try:
             raw = json.loads(self._fallback_file.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-            print(f"[StockSymbolMaster] Could not read fallback {self._fallback_file}: {exc}")
+            logger.warning(f"[StockSymbolMaster] Could not read fallback {self._fallback_file}: {exc}")
             return []
 
         cleaned = []
@@ -190,12 +193,12 @@ async def schedule_daily_refresh(app) -> None:
             loop = asyncio.get_running_loop()
             records = await loop.run_in_executor(None, builder.build)
             if not records:
-                print("[StockSymbolMaster] Daily refresh produced no records - keeping existing master")
+                logger.warning("[StockSymbolMaster] Daily refresh produced no records - keeping existing master")
                 continue
             await loop.run_in_executor(None, builder.write, records)
             master = getattr(app.state, "stock_symbol_master", None)
             if master is not None:
                 master.reload()
-            print(f"[StockSymbolMaster] Daily refresh complete - {len(records)} symbols")
+            logger.info(f"[StockSymbolMaster] Daily refresh complete - {len(records)} symbols")
         except Exception as exc:
-            print(f"[StockSymbolMaster] Daily refresh failed: {exc}")
+            logger.warning(f"[StockSymbolMaster] Daily refresh failed: {exc}")

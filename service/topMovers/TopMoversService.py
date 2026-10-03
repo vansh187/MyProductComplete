@@ -2,6 +2,9 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class StockWatchlist:
@@ -39,7 +42,7 @@ class TopMoversFetcher:
                     timeout=8.0
                 )
                 if quote is None:
-                    print(f"[TopMovers] No data for {stock['symbol']} ({stock['token']})")
+                    logger.warning(f"[TopMovers] No data for {stock['symbol']} ({stock['token']})")
                     return None
                 return {
                     "symbol":     stock["symbol"],
@@ -50,10 +53,10 @@ class TopMoversFetcher:
                     "change":     quote["change"],
                 }
             except asyncio.TimeoutError:
-                print(f"[TopMovers] Timeout for {stock['symbol']} ({stock['token']})")
+                logger.warning(f"[TopMovers] Timeout for {stock['symbol']} ({stock['token']})")
                 return None
             except Exception as e:
-                print(f"[TopMovers] Error for {stock['symbol']} ({stock['token']}): {e}")
+                logger.warning(f"[TopMovers] Error for {stock['symbol']} ({stock['token']}): {e}")
                 return None
 
         # Fetch in batches of 10 to reduce total time while managing load
@@ -75,7 +78,7 @@ class TopMoversFetcher:
 
         # Retry failed stocks with sequential calls (less aggressive)
         if failed:
-            print(f"[TopMovers] Retrying {len(failed)} failed stocks...")
+            logger.info(f"[TopMovers] Retrying {len(failed)} failed stocks...")
             for stock in failed[:5]:  # Retry up to 5 failed stocks
                 try:
                     result = await _fetch_one(stock)

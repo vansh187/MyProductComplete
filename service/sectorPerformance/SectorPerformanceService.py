@@ -1,6 +1,9 @@
 import asyncio
 import json
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SectorIndexRegistry:
@@ -34,7 +37,7 @@ class SectorPerformanceFetcher:
                     timeout=8.0
                 )
                 if quote is None:
-                    print(f"[SectorPerf] No data for {sector['sector']} ({sector['token']})")
+                    logger.warning(f"[SectorPerf] No data for {sector['sector']} ({sector['token']})")
                     return None, {"sector": sector["sector"], "reason": "no_data"}
                 return {
                     "sector":     sector["sector"],
@@ -43,10 +46,10 @@ class SectorPerformanceFetcher:
                     "ltp":        quote["ltp"],
                 }, None
             except asyncio.TimeoutError:
-                print(f"[SectorPerf] Timeout for {sector['sector']} ({sector['token']})")
+                logger.warning(f"[SectorPerf] Timeout for {sector['sector']} ({sector['token']})")
                 return None, {"sector": sector["sector"], "reason": "timeout"}
             except Exception as exc:
-                print(f"[SectorPerf] Error for {sector['sector']} ({sector['token']}): {exc}")
+                logger.warning(f"[SectorPerf] Error for {sector['sector']} ({sector['token']}): {exc}")
                 return None, {"sector": sector["sector"], "reason": str(exc)}
 
         # Fetch in batches of 2 to avoid overwhelming Shoonya with 8 concurrent requests

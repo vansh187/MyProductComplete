@@ -40,25 +40,54 @@ import threading
 import time
 
 from marketengine.touchlineFields import TouchlineFieldParser
+from utils.market_hours import is_market_open
 
 logger = logging.getLogger(__name__)
 
 IDLE_TTL_SECS = 90.0
+# Touchline frames only arrive when a field changes, but liquid index/Nifty 50
+# tokens change every second or two during the session - two minutes of
+# silence while the market is open means the socket died without a close.
+STALE_TICK_SECS = 120.0
 EVICTION_SWEEP_INTERVAL_SECS = 30.0
 
 
 class ShoonyaStockFeed:
 
-    def __init__(self, shared_feed, field_parser: TouchlineFieldParser | None = None):
+    def __init__(self, shared_feed, field_parser: TouchlineFieldParser | None = None,
+                 clock=time.monotonic, market_open_fn=is_market_open):
         """shared_feed: an object exposing on_raw_tick(handler), ensure_subscribed(tokens),
-        release(tokens) - i.e. a marketengine.ShoonyaOptionFeed.ShoonyaOptionFeed instance."""
+        release(tokens), is_connected - i.e. a marketengine.ShoonyaOptionFeed.ShoonyaOptionFeed instance."""
         self._shared_feed = shared_feed
         self._field_parser = field_parser or TouchlineFieldParser()
+        self._clock = clock
+        self._is_market_open = market_open_fn
         self._ticks: dict[str, dict] = {}
+        self._received_at: dict[str, float] = {}
         self._active_tokens: set[str] = set()
+        self._pinned_tokens: set[str] = set()
         self._last_access: dict[str, float] = {}
         self._lock = threading.Lock()
         self._shared_feed.on_raw_tick(self.ingest_raw_tick)
+
+    def pin(self, instrument_keys) -> None:
+        """Permanently subscribes 'EXCH|TOKEN' keys that are read on every
+        request (explore watchlist, index tiles), exempting them from idle
+        eviction so those reads are always served from ticks, never REST."""
+        new_keys = set()
+        with self._lock:
+            for key in instrument_keys:
+                if not key or key in self._pinned_tokens:
+                    continue
+                self._pinned_tokens.add(key)
+                if key not in self._active_tokens:
+                    self._active_tokens.add(key)
+                    new_keys.add(key)
+        if new_keys:
+            try:
+                self._shared_feed.ensure_subscribed(new_keys)
+            except Exception as exc:
+                logger.warning(f"[StockFeed] pin subscribe failed for {len(new_keys)} tokens: {exc}")
 
     def touch(self, instrument_key: str) -> None:
         """Marks 'EXCH|TOKEN' as actively viewed right now. Subscribes it on
@@ -82,10 +111,26 @@ class ShoonyaStockFeed:
 
     def get_tick(self, instrument_key: str) -> dict | None:
         """Returns the last-known merged tick fields for 'EXCH|TOKEN', or None
-        if nothing has arrived yet for that token. Never raises."""
+        if nothing usable is cached: no tick yet, the shared WebSocket is not
+        connected (cached prices would be frozen), or the market is open and
+        the last tick is older than STALE_TICK_SECS (socket silently dead).
+        Callers fall back to REST on None. Never raises."""
+        if not self._shared_feed_connected():
+            return None
         with self._lock:
             tick = self._ticks.get(instrument_key)
-            return dict(tick) if tick else None
+            received_at = self._received_at.get(instrument_key, 0.0)
+        if not tick:
+            return None
+        if self._is_market_open() and (self._clock() - received_at) > STALE_TICK_SECS:
+            return None
+        return dict(tick)
+
+    def _shared_feed_connected(self) -> bool:
+        try:
+            return bool(getattr(self._shared_feed, "is_connected", True))
+        except Exception:
+            return False
 
     async def evict_idle_loop(self) -> None:
         """Background task (started from app.py lifespan): periodically
@@ -105,12 +150,15 @@ class ShoonyaStockFeed:
         stale = []
         with self._lock:
             for token, last_seen in list(self._last_access.items()):
+                if token in self._pinned_tokens:
+                    continue
                 if now - last_seen > IDLE_TTL_SECS:
                     stale.append(token)
             for token in stale:
                 self._active_tokens.discard(token)
                 self._last_access.pop(token, None)
                 self._ticks.pop(token, None)
+                self._received_at.pop(token, None)
 
         if stale:
             logger.info(f"[StockFeed] Releasing {len(stale)} idle tokens")
@@ -189,5 +237,6 @@ class ShoonyaStockFeed:
                     depth = merged.get("depth") or self._field_parser.empty_depth()
                     merged["depth"] = self._field_parser.apply_depth_delta(depth, depth_delta)
                 self._ticks[instrument_key] = merged
+                self._received_at[instrument_key] = self._clock()
         except Exception as exc:
             logger.warning(f"[StockFeed] Error processing tick {raw}: {exc}")

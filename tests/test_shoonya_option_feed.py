@@ -386,7 +386,8 @@ class TestReconnectSignaling:
         thread = MagicMock(spec=threading.Thread)
         api._NorenApi__ws_thread = thread
 
-        ShoonyaOptionFeed._signal_stop_websocket(api)
+        feed, _ = _make_feed()
+        feed._signal_stop_websocket(api)
 
         thread.join.assert_not_called()
 

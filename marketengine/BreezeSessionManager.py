@@ -5,6 +5,9 @@ from zoneinfo import ZoneInfo
 from breeze_connect import BreezeConnect
 from dotenv import load_dotenv, set_key
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 _ENV_FILE = Path(__file__).parent.parent / ".env"
@@ -42,35 +45,33 @@ def refresh_session(app_state, *, session_token: str | None = None) -> bool:
             session_token = os.getenv("BREEZE_SESSION_TOKEN")
 
         if not session_token:
-            print("[SessionManager] BREEZE_SESSION_TOKEN is empty — cannot refresh.")
+            logger.warning("[SessionManager] BREEZE_SESSION_TOKEN is empty — cannot refresh.")
             return False
 
         api_key    = os.getenv("BREEZE_API_KEY")
         api_secret = os.getenv("BREEZE_SECRET_KEY")
 
         if not api_key or not api_secret:
-            print("[SessionManager] BREEZE_API_KEY / BREEZE_SECRET_KEY missing from env.")
+            logger.warning("[SessionManager] BREEZE_API_KEY / BREEZE_SECRET_KEY missing from env.")
             return False
 
         breeze = BreezeConnect(api_key=api_key)
         breeze.generate_session(api_secret=api_secret, session_token=session_token)
         app_state.breeze = breeze
 
-        print(
-            f"[SessionManager] Breeze session refreshed at "
-            f"{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}"
-        )
+        logger.info(f"[SessionManager] Breeze session refreshed at "
+            f"{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}")
         return True
 
     except Exception as e:
-        print(f"[SessionManager] Session refresh failed: {e}")
+        logger.warning(f"[SessionManager] Session refresh failed: {e}")
         return False
 
 
 def update_env_token(session_token: str) -> None:
     """Writes a new BREEZE_SESSION_TOKEN into the .env file."""
     set_key(str(_ENV_FILE), "BREEZE_SESSION_TOKEN", session_token)
-    print(f"[SessionManager] .env updated with new session token.")
+    logger.info(f"[SessionManager] .env updated with new session token.")
 
 
 async def schedule_daily_refresh(app):
@@ -86,10 +87,8 @@ async def schedule_daily_refresh(app):
     while True:
         delay = _next_refresh_delay()
         next_at = datetime.now(IST) + timedelta(seconds=delay)
-        print(
-            f"[SessionManager] Next auto-refresh at "
+        logger.info(f"[SessionManager] Next auto-refresh at "
             f"{next_at.strftime('%Y-%m-%d %H:%M IST')} "
-            f"({delay / 3600:.1f}h from now)"
-        )
+            f"({delay / 3600:.1f}h from now)")
         await asyncio.sleep(delay)
         refresh_session(app.state)

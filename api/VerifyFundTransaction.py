@@ -4,6 +4,9 @@ from service.razorpay.Razorypay import Razorpay
 from pydantic import BaseModel
 import json
 from utils.auth_dependency import get_current_user
+import logging
+
+logger = logging.getLogger(__name__)
 router=APIRouter()
 
 class VeriFyTransaction(BaseModel):
@@ -42,16 +45,16 @@ async def verifyRazorPayWebhook(request: Request, background_tasks: BackgroundTa
 
         razorPay = Razorpay()
         isValid = razorPay.verifyWebhookSignature(payload_bytes, x_razorpay_signature)
-        print("after verify webhook in verifyfund transaction: " + str(isValid))
+        logger.debug("after verify webhook in verifyfund transaction: " + str(isValid))
         if not isValid:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid webhook signature"
             )
 
-        print("before process webhook data in background")
+        logger.debug("before process webhook data in background")
         background_tasks.add_task(process_webhook_data_in_background, payload_dict)
-        print("after process webhook data in background")
+        logger.debug("after process webhook data in background")
         return {"status": "accepted", "message": "Webhook authenticated and queued"}
 
 
@@ -62,13 +65,13 @@ def process_webhook_data_in_background(event_data: dict):
                 payment_entity = event_data["payload"]["payment"]["entity"]
                 notes = payment_entity.get("notes") or {}
                 user_id = notes.get("user_id")
-                print("webhook user_id from notes: " + str(user_id))
+                logger.debug("webhook user_id from notes: " + str(user_id))
                 if not user_id:
-                    print("Webhook: user_id missing from payment notes, skipping wallet update")
+                    logger.warning("Webhook: user_id missing from payment notes, skipping wallet update")
                     return
                 razorPay = Razorpay()
                 razorPay.verifyPaymentSignatureWebHook(payment_entity, user_id)
 
         except Exception as ex:
-            print(f"Exception occurred while processing webhook: {ex}")
+            logger.error(f"Exception occurred while processing webhook: {ex}")
             raise Exception("Exception Occured while verifying webhooks")

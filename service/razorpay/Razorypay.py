@@ -5,6 +5,9 @@ import os
 from dotenv import load_dotenv
 import hmac
 import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
 load_dotenv()
 class Razorpay:
     def __init__(self):
@@ -45,22 +48,22 @@ class Razorpay:
     
     def verifyWebhookSignature(self,raw_body,webhook_signature):
         razorPayManger=RazorPayManagerService()
-        print("inside verifyWebhookSignature inside RazorPay")
+        logger.debug("inside verifyWebhookSignature inside RazorPay")
         return  razorPayManger.verify_webhook_signature(raw_body,webhook_signature)
     
     
     def verifyPaymentSignatureWebHook(self, payload, userId):
         razorPayManagerService = RazorPayManagerService()
-        print("inside verifyPaymentSignatureWebHook after backgroundprocess")
+        logger.debug("inside verifyPaymentSignatureWebHook after backgroundprocess")
         razorpay_order_id = payload.get("order_id")
         razorpay_payment_id = payload.get("id")
         if not razorpay_order_id:
-            print(f"Webhook: order_id is null for payment {razorpay_payment_id}, skipping DB update")
+            logger.warning(f"Webhook: order_id is null for payment {razorpay_payment_id}, skipping DB update")
             return None
         is_authentic = razorPayManagerService.invokeCallToDatabase(
             razorpay_order_id=razorpay_order_id,
             razorpay_payment_id=razorpay_payment_id,
             userId=userId,
         )
-        print("All authentication is in process")
+        logger.debug("All authentication is in process")
         return is_authentic

@@ -3,6 +3,9 @@ import os
 
 from database.ConnectionFactory import ConnectionFactory
 from dotenv import load_dotenv
+import logging
+
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 # -----------------------------
@@ -38,7 +41,7 @@ def get_price(symbol: str):
         return float(history["Close"].iloc[-1])
 
     except Exception as e:
-        print(f"[ERROR] Failed for {symbol}: {e}")
+        logger.error(f"Failed for {symbol}: {e}")
         return None
 
 
@@ -61,14 +64,14 @@ def seed_market_prices():
 
         cursor = conn.cursor()
 
-        print("Starting market price seed...\n")
+        logger.info("Starting market price seed...\n")
 
         for symbol in SYMBOLS:
 
             price = get_price(symbol)
 
             if price is None:
-                print(f"Skipping {symbol} (no price)")
+                logger.warning(f"Skipping {symbol} (no price)")
                 continue
 
             query = """
@@ -81,16 +84,16 @@ def seed_market_prices():
 
             cursor.execute(query, (symbol, price))
 
-            print(f"{symbol} -> {price}")
+            logger.info(f"{symbol} -> {price}")
 
         conn.commit()
 
-        print("\nSeed completed successfully!")
+        logger.info("\nSeed completed successfully!")
 
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"[FATAL ERROR] {e}")
+        logger.error(f"[FATAL ERROR] {e}")
 
     finally:
         if cursor:
@@ -103,4 +106,5 @@ def seed_market_prices():
 # RUN
 # -----------------------------
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     seed_market_prices()

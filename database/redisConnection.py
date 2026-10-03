@@ -2,6 +2,9 @@ import redis
 import os
 from dotenv import load_dotenv
 import redis.asyncio as aioredis
+import logging
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 class RedisConnection:
@@ -20,7 +23,7 @@ class RedisConnection:
         Redis client instance that manages its own warm internal connection pool.
         """
         if cls._redis_client is None:
-            print(f"Establishing secure connection to cloud Redis: {os.getenv('REDIS_HOST_URL')}")
+            logger.info(f"Establishing secure connection to cloud Redis: {os.getenv('REDIS_HOST_URL')}")
             
             # Safe parsing of host and port variables from your centralized config properties
             try:
@@ -55,7 +58,7 @@ class RedisConnection:
         Gracefully drains and closes the socket pool during hot-reloads or server shutdown.
         """
         if cls._redis_client is not None:
-            print("Closing production Redis client connection pool pools cleanly.")
+            logger.info("Closing production Redis client connection pool pools cleanly.")
             await cls._redis_client.aclose()
             cls._redis_client = None
 
@@ -87,7 +90,7 @@ class RedisConnection:
     def close_sync_connection(cls):
         """Closes the blocking client's pool during hot-reloads or shutdown."""
         if cls._sync_redis_client is not None:
-            print("Closing production sync Redis client connection pool cleanly.")
+            logger.info("Closing production sync Redis client connection pool cleanly.")
             cls._sync_redis_client.close()
             cls._sync_redis_client = None
 

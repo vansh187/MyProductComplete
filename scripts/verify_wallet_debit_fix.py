@@ -23,6 +23,9 @@ sys.path.insert(0, str(repo_root))
 
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from database.walletbalancepersistence.WalletBalancePersistence import WalletBalancePersistence
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def get_wallet_balance(user_id):
@@ -38,19 +41,19 @@ def get_wallet_balance(user_id):
 
 
 def scenario_concurrent_debits(user_id, num_threads=50, amount_each=Decimal("100.00")):
-    print(f"\n=== Concurrent-debit test against real user_id={user_id} ===")
+    logger.info(f"\n=== Concurrent-debit test against real user_id={user_id} ===")
     balance_before = get_wallet_balance(user_id)
     if balance_before is None:
-        print("  No wallet row for this user - aborting.")
+        logger.info("  No wallet row for this user - aborting.")
         return False
 
     total_requested = amount_each * num_threads
     expected_successes = int(balance_before // amount_each)
     expected_balance = balance_before - (expected_successes * amount_each)
 
-    print(f"  balance BEFORE: {balance_before}")
-    print(f"  requesting {num_threads} x {amount_each} = {total_requested} total (deliberately more than the balance)")
-    print(f"  expected: exactly {expected_successes} debits succeed, final balance = {expected_balance}")
+    logger.info(f"  balance BEFORE: {balance_before}")
+    logger.info(f"  requesting {num_threads} x {amount_each} = {total_requested} total (deliberately more than the balance)")
+    logger.info(f"  expected: exactly {expected_successes} debits succeed, final balance = {expected_balance}")
 
     results = []
     results_lock = threading.Lock()
@@ -77,32 +80,33 @@ def scenario_concurrent_debits(user_id, num_threads=50, amount_each=Decimal("100
     successful = sum(1 for r in results if r)
     failed = sum(1 for r in results if not r)
 
-    print(f"  balance AFTER:  {balance_after}")
-    print(f"  successful debits: {successful}, failed (insufficient funds): {failed}, errors: {errors}")
+    logger.info(f"  balance AFTER:  {balance_after}")
+    logger.info(f"  successful debits: {successful}, failed (insufficient funds): {failed}, errors: {errors}")
 
     ok = True
     if errors:
-        print("  FAIL: unexpected errors/hangs during concurrent debits")
+        logger.error("  FAIL: unexpected errors/hangs during concurrent debits")
         ok = False
     if balance_after < 0:
-        print(f"  FAIL: balance went negative ({balance_after}) - over-debit race")
+        logger.error(f"  FAIL: balance went negative ({balance_after}) - over-debit race")
         ok = False
     if balance_after != expected_balance:
-        print(f"  FAIL: balance mismatch - expected {expected_balance}, got {balance_after}")
+        logger.error(f"  FAIL: balance mismatch - expected {expected_balance}, got {balance_after}")
         ok = False
     if successful != expected_successes:
-        print(f"  FAIL: expected exactly {expected_successes} successful debits, got {successful}")
+        logger.error(f"  FAIL: expected exactly {expected_successes} successful debits, got {successful}")
         ok = False
 
-    print("  PASS - no over-debit, no lost/duplicated debits, balance never negative" if ok else "  ONE OR MORE CHECKS FAILED")
+    logger.info("  PASS - no over-debit, no lost/duplicated debits, balance never negative" if ok else "  ONE OR MORE CHECKS FAILED")
     return ok
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     if len(sys.argv) != 2:
-        print("Usage: python scripts/verify_wallet_debit_fix.py <existing_user_id>")
+        logger.info("Usage: python scripts/verify_wallet_debit_fix.py <existing_user_id>")
         sys.exit(1)
     user_id = int(sys.argv[1])
-    print(f"Verifying against DATABASE_URL from .env, real user_id={user_id}.")
+    logger.info(f"Verifying against DATABASE_URL from .env, real user_id={user_id}.")
     success = scenario_concurrent_debits(user_id)
     sys.exit(0 if success else 1)
