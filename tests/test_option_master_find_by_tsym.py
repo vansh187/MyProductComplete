@@ -35,6 +35,8 @@ def _find_any_real_contract():
     whatever environment runs this - see OptionMaster._load()'s
     missing-file fallback."""
     for underlying, chains in OptionMaster._raw.items():
+        if underlying.startswith("_"):
+            continue  # the "_meta" refresh stamp, not an underlying
         for expiry, strikes in chains.items():
             if expiry == "expiries":
                 continue

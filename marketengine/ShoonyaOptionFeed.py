@@ -20,6 +20,7 @@ import threading
 from typing import Awaitable, Callable
 
 from marketengine.WsSubscriptionSender import WsSubscriptionSender
+from utils.safe_numbers import safe_float, safe_int
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +30,6 @@ WS_JOIN_TIMEOUT_SECS = 2
 TickHandler = Callable[[str, dict], Awaitable[None] | None]
 OrderUpdateHandler = Callable[[dict], Awaitable[None] | None]
 RawTickHandler = Callable[[dict], None]
-
-
-def _safe_float(val, default=None):
-    try:
-        return float(val) if val not in (None, "") else default
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_int(val, default=None):
-    try:
-        return int(float(val)) if val not in (None, "") else default
-    except (TypeError, ValueError):
-        return default
 
 
 def normalize_touchline_tick(raw: dict) -> dict:
@@ -55,17 +42,17 @@ def normalize_touchline_tick(raw: dict) -> dict:
     """
     result = {}
     if "lp" in raw:
-        result["ltp"] = _safe_float(raw.get("lp"))
+        result["ltp"] = safe_float(raw.get("lp"))
     if "bp1" in raw:
-        result["bid"] = _safe_float(raw.get("bp1"))
+        result["bid"] = safe_float(raw.get("bp1"))
     if "sp1" in raw:
-        result["ask"] = _safe_float(raw.get("sp1"))
+        result["ask"] = safe_float(raw.get("sp1"))
     if "v" in raw:
-        result["volume"] = _safe_int(raw.get("v"))
+        result["volume"] = safe_int(raw.get("v"))
     if "oi" in raw:
-        result["oi"] = _safe_int(raw.get("oi"))
+        result["oi"] = safe_int(raw.get("oi"))
     if "poi" in raw:
-        result["poi"] = _safe_int(raw.get("poi"))
+        result["poi"] = safe_int(raw.get("poi"))
     return result
 
 

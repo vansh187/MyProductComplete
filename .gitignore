@@ -7,3 +7,6 @@ __pycache__/
 node_modules/
 logs/
 *.log
+
+# Scrip-master refresh temp files (appconfig/ScripMasterRefresher.py)
+appconfig/*.tmp

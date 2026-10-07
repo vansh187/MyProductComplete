@@ -6,10 +6,12 @@ returns the (data, errors) tuple convention used across this codebase
 """
 
 import asyncio
+import bisect
 import logging
 
 from appconfig import OptionMaster
 from service.optionChain.OptionChainCache import OptionChainCache
+from utils.safe_numbers import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,9 @@ class OptionChainService:
         # second concurrent viewer of the same chain silently loses live
         # updates the moment the first viewer disconnects.
         self._refcounts: dict[str, int] = {}
+        # Anything with get_tick('EXCH|TOKEN') -> {"ltp": ...} | None (the
+        # ShoonyaStockFeed tick cache, where index tokens are pinned).
+        self._spot_source = None
         if feed is not None:
             feed.on_tick(self._route_tick)
 
@@ -70,30 +75,53 @@ class OptionChainService:
         self._feed = feed
         feed.on_tick(self._route_tick)
 
+    def set_spot_source(self, spot_source) -> None:
+        """Attaches the index tick cache used to resolve spot without REST."""
+        self._spot_source = spot_source
+
     def _cache_key(self, underlying: str, expiry: str) -> str:
         return f"{underlying.upper()}:{expiry}"
 
     async def _route_tick(self, instrument_key: str, tick_fields: dict) -> None:
-        for key in self._token_to_cache_keys.get(instrument_key, ()):
+        # tuple() snapshot: a concurrent _release may mutate the set while
+        # apply_tick awaits its condition lock.
+        for key in tuple(self._token_to_cache_keys.get(instrument_key, ())):
             cache = self._caches.get(key)
             if cache is not None:
-                await cache.apply_tick(instrument_key, tick_fields)
+                try:
+                    await cache.apply_tick(instrument_key, tick_fields)
+                except Exception as e:
+                    logger.warning(f"[OptionChainService] tick for {instrument_key} not applied: {e}")
+
+    def list_expiries(self, underlying: str) -> list[str]:
+        """Still-tradable expiries (YYYY-MM-DD, ascending) from the scrip master."""
+        return OptionMaster.upcoming_expiries(underlying)
+
+    def _resolve_expiry(self, underlying: str, expiry: str | None) -> str | None:
+        """The requested expiry, or the nearest still-tradable listed expiry
+        when none was given (after 15:30 on an expiry day, the next one)."""
+        return expiry or OptionMaster.nearest_expiry(underlying)
 
     def _window_around_spot(self, strike_chain: dict, spot: float | None) -> dict:
         """Trims the full master strike ladder to STRIKES_EACH_SIDE on either
         side of the current spot price (or the middle of the chain if spot
-        isn't known yet)."""
-        if not strike_chain:
+        isn't known yet). Non-numeric strike keys are skipped."""
+        numeric = sorted(
+            (strike_value, strike)
+            for strike, strike_value in ((strike, safe_float(strike)) for strike in strike_chain)
+            if strike_value is not None
+        )
+        if not numeric:
             return {}
-        sorted_strikes = sorted(strike_chain.keys(), key=float)
         if spot is None:
-            mid = len(sorted_strikes) // 2
+            mid = len(numeric) // 2
         else:
-            mid = min(range(len(sorted_strikes)), key=lambda i: abs(float(sorted_strikes[i]) - spot))
+            mid = bisect.bisect_left(numeric, (spot, ""))
+            if mid >= len(numeric) or (mid > 0 and spot - numeric[mid - 1][0] <= numeric[mid][0] - spot):
+                mid -= 1
         lo = max(0, mid - STRIKES_EACH_SIDE)
-        hi = min(len(sorted_strikes), mid + STRIKES_EACH_SIDE + 1)
-        window = sorted_strikes[lo:hi]
-        return {strike: strike_chain[strike] for strike in window}
+        hi = min(len(numeric), mid + STRIKES_EACH_SIDE + 1)
+        return {strike: strike_chain[strike] for _, strike in numeric[lo:hi]}
 
     async def _get_or_create_cache(self, shoonya, underlying: str, expiry: str, spot: float | None) -> tuple[OptionChainCache | None, dict | None]:
         key = self._cache_key(underlying, expiry)
@@ -106,6 +134,8 @@ class OptionChainService:
             return None, {"reason": "no_option_data"}
 
         strike_chain = self._window_around_spot(full_chain, spot)
+        if not strike_chain:
+            return None, {"reason": "no_option_data"}
         exchange = OPTIONS_EXCHANGE[underlying]
 
         cache = OptionChainCache(underlying.upper(), expiry, strike_chain, exchange=exchange, rate=self._rate)
@@ -137,20 +167,28 @@ class OptionChainService:
             if info.get(token_field)
         ]
 
+        # Sliding window rather than lock-step batches: the same cap on
+        # in-flight broker calls, but one slow quote no longer holds back the
+        # next SEED_BATCH_SIZE legs.
+        in_flight = asyncio.Semaphore(SEED_BATCH_SIZE)
+
         async def _fetch_one(strike: str, leg: str, token: str) -> None:
             try:
-                quote = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: shoonya.get_option_quote(exchange, token)),
-                    timeout=8.0,
-                )
+                async with in_flight:
+                    quote = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: shoonya.get_option_quote(exchange, token)),
+                        timeout=8.0,
+                    )
                 if quote:
                     cache.seed_leg(strike, leg, quote)
-            except Exception:
-                pass  # leg simply stays unseeded until its first WS tick arrives
+            except Exception as exc:
+                # The leg stays unseeded until its first WS tick arrives.
+                logger.debug(f"[OptionChainService] REST seed for {exchange}|{token} failed: {exc!r}")
 
-        for i in range(0, len(legs), SEED_BATCH_SIZE):
-            batch = legs[i:i + SEED_BATCH_SIZE]
-            await asyncio.gather(*[_fetch_one(*leg) for leg in batch])
+        try:
+            await asyncio.gather(*[_fetch_one(*leg) for leg in legs])
+        except Exception as e:
+            logger.warning(f"[OptionChainService] REST seed failed: {e}")
 
     def _acquire(self, underlying: str, expiry: str) -> None:
         key = self._cache_key(underlying, expiry)
@@ -193,7 +231,10 @@ class OptionChainService:
     async def release_chain(self, underlying: str, expiry: str) -> None:
         """Called when an SSE stream client (that previously called
         get_cache_for_stream) disconnects."""
-        await self._release(underlying, expiry)
+        try:
+            await self._release(underlying, expiry)
+        except Exception as e:
+            logger.warning(f"[OptionChainService] release_chain {underlying} {expiry} failed: {e}")
 
     async def _resolve_spot(self, shoonya, underlying: str) -> float | None:
         """shoonya.get_index_quote() is a blocking REST call (plain `requests`
@@ -203,18 +244,45 @@ class OptionChainService:
         other SSE stream already open) until it returns. Offload it to a
         worker thread, same as _seed_from_rest() already does for option-leg
         quotes."""
-        exch, spot_token = UNDERLYING_SPOT_TOKENS[underlying]
-        loop = asyncio.get_running_loop()
         try:
+            exch, spot_token = UNDERLYING_SPOT_TOKENS[underlying]
+        except KeyError:
+            return None
+
+        # Live index tick from the shared WebSocket first: an in-memory read
+        # instead of a ~100ms REST round trip on every chain request.
+        spot = self._spot_from_tick(f"{exch}|{spot_token}")
+        if spot is not None:
+            return spot
+
+        try:
+            loop = asyncio.get_running_loop()
             spot_quote = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: shoonya.get_index_quote(exch, spot_token)),
                 timeout=8.0,
             )
+            return spot_quote["ltp"] if spot_quote else None
         except Exception:
             return None
-        return spot_quote["ltp"] if spot_quote else None
+
+    def _spot_from_tick(self, instrument_key: str) -> float | None:
+        if self._spot_source is None:
+            return None
+        try:
+            tick = self._spot_source.get_tick(instrument_key)
+            ltp = float(tick.get("ltp") or 0) if tick else 0.0
+            return ltp if ltp > 0 else None
+        except Exception:
+            return None
 
     async def get_chain(self, shoonya, underlying: str, expiry: str | None) -> tuple[dict | None, list[dict]]:
+        try:
+            return await self._get_chain(shoonya, underlying, expiry)
+        except Exception as e:
+            logger.error(f"[OptionChainService] get_chain {underlying} {expiry} failed: {e}", exc_info=True)
+            return None, [{"reason": "option_chain_failed"}]
+
+    async def _get_chain(self, shoonya, underlying: str, expiry: str | None) -> tuple[dict | None, list[dict]]:
         underlying = underlying.lower()
         if underlying not in UNDERLYING_SPOT_TOKENS:
             return None, [{"reason": "invalid_underlying"}]
@@ -222,7 +290,7 @@ class OptionChainService:
         if not OptionMaster.is_valid_underlying(underlying):
             return None, [{"reason": "no_option_data"}]
 
-        resolved_expiry = expiry or OptionMaster.nearest_expiry(underlying)
+        resolved_expiry = self._resolve_expiry(underlying, expiry)
         if not resolved_expiry:
             return None, [{"reason": "no_expiry_available"}]
 
@@ -262,8 +330,15 @@ class OptionChainService:
         yesterday's/last-known data instead of a bare 503. Returns
         (None, None) if no cache exists yet for this key (e.g. right after a
         process restart, before any live session has ever seeded it)."""
+        try:
+            return self._peek_cached_chain(underlying, expiry)
+        except Exception as e:
+            logger.warning(f"[OptionChainService] peek_cached_chain {underlying} {expiry} failed: {e}")
+            return None, None
+
+    def _peek_cached_chain(self, underlying: str, expiry: str | None) -> tuple[dict | None, str | None]:
         underlying = underlying.lower()
-        resolved_expiry = expiry or OptionMaster.nearest_expiry(underlying)
+        resolved_expiry = self._resolve_expiry(underlying, expiry)
         if not resolved_expiry:
             return None, None
 
@@ -286,11 +361,18 @@ class OptionChainService:
     async def get_cache_for_stream(self, shoonya, underlying: str, expiry: str | None) -> tuple[OptionChainCache | None, str | None, list[dict]]:
         """Resolution/subscription-trigger only (no synchronous fetch) - the SSE
         endpoint waits on the returned cache's wait_for_next() directly."""
+        try:
+            return await self._get_cache_for_stream(shoonya, underlying, expiry)
+        except Exception as e:
+            logger.error(f"[OptionChainService] get_cache_for_stream {underlying} {expiry} failed: {e}", exc_info=True)
+            return None, None, [{"reason": "option_chain_failed"}]
+
+    async def _get_cache_for_stream(self, shoonya, underlying: str, expiry: str | None) -> tuple[OptionChainCache | None, str | None, list[dict]]:
         underlying = underlying.lower()
         if underlying not in UNDERLYING_SPOT_TOKENS:
             return None, None, [{"reason": "invalid_underlying"}]
 
-        resolved_expiry = expiry or OptionMaster.nearest_expiry(underlying)
+        resolved_expiry = self._resolve_expiry(underlying, expiry)
         if not resolved_expiry:
             return None, None, [{"reason": "no_expiry_available"}]
 

@@ -97,12 +97,57 @@ class TestRemarksFallbackForRacingFills:
     def test_no_remarks_match_stays_ignored(self):
         service = self._service()
         service.order_persistence.get_order_by_broker_order_id.return_value = None
+        service.order_persistence.get_unlinked_broker_orders_by_client_order_id.return_value = []
 
         _run(service.handle_order_update({
             "norenordno": "unknown", "reporttype": "Fill", "remarks": "not_our_tag",
+            "flqty": "75", "flprc": "101.15",
         }))
 
         service.order_persistence.get_order_by_id_only.assert_not_called()
+        service.order_persistence.get_unlinked_broker_orders_by_client_order_id.assert_called_once_with("not_our_tag")
+        service.trade_settlement_service.settle_fill.assert_not_called()
+
+    @patch("service.orderUpdateService.PostgresConnectionFactory")
+    def test_client_order_id_remarks_resolve_and_backfill(self, mock_conn_factory):
+        """Live orders now carry their client_order_id in remarks."""
+        service = self._service()
+        service.order_persistence.get_order_by_broker_order_id.return_value = None
+        service.order_persistence.get_unlinked_broker_orders_by_client_order_id.return_value = [
+            _order_row(id=202, user_id=7, broker_order_id=None, client_order_id="algo-42", side="SELL"),
+            _order_row(broker_order_id=None, client_order_id="algo-42"),
+        ]
+        mock_conn_factory.create_connection.return_value = MagicMock()
+
+        _run(service.handle_order_update({
+            "norenordno": "20052000000017", "reporttype": "Fill",
+            "flqty": "75", "flprc": "101.15", "remarks": "algo-42",
+            "tsym": "NIFTY14JUL2623950CE", "trantype": "B", "qty": "75",
+        }))
+
+        # Another user's same-id order (SELL) is ruled out by side.
+        service.order_persistence.get_order_by_id_only.assert_not_called()
+        service.order_persistence.set_broker_order_id.assert_called_once_with(101, "20052000000017")
+        service.trade_settlement_service.settle_fill.assert_called_once()
+
+    def test_ambiguous_client_order_id_match_is_never_guessed(self):
+        """Review finding: two users' identical unlinked orders with the same
+        client_order_id - linking either could settle a real fill into the
+        wrong account, so neither is touched."""
+        service = self._service()
+        service.order_persistence.get_order_by_broker_order_id.return_value = None
+        service.order_persistence.get_unlinked_broker_orders_by_client_order_id.return_value = [
+            _order_row(id=202, user_id=7, broker_order_id=None, client_order_id="algo-42"),
+            _order_row(broker_order_id=None, client_order_id="algo-42"),
+        ]
+
+        _run(service.handle_order_update({
+            "norenordno": "20052000000017", "reporttype": "Fill",
+            "flqty": "75", "flprc": "101.15", "remarks": "algo-42",
+            "tsym": "NIFTY14JUL2623950CE", "trantype": "B", "qty": "75",
+        }))
+
+        service.order_persistence.set_broker_order_id.assert_not_called()
         service.trade_settlement_service.settle_fill.assert_not_called()
 
     def test_remarks_order_not_found_stays_ignored(self):

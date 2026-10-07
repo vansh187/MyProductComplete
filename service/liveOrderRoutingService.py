@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Dict, Optional
 
 from database.orderPersistence import OrderPersistence
-from service.shoonyaOrderService import ShoonyaOrderService
+from service.shoonyaOrderService import ShoonyaOrderMappingError, ShoonyaOrderService
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,15 @@ def live_orders_enabled() -> bool:
     return os.getenv("SHOONYA_LIVE_ORDERS_ENABLED", "false").strip().lower() == "true"
 
 
+def sebi_algo_id() -> Optional[str]:
+    """Optional exchange-approved algo ID (SEBI retail-algo framework) to tag
+    live orders with. Server config only (SHOONYA_ALGO_ID) - a client can
+    never choose or override it. None when not configured, in which case
+    orders are placed without one (the broker library's default)."""
+    value = os.getenv("SHOONYA_ALGO_ID", "").strip()
+    return value or None
+
+
 class LiveOrderRoutingService:
 
     def __init__(self, shoonya_api):
@@ -114,12 +123,11 @@ class LiveOrderRoutingService:
         self._executor = _LIVE_ORDER_PLACEMENT_EXECUTOR
         self.logger = logger
 
-    @staticmethod
-    def validate_lot_size(quantity: int, lot_size: Optional[int]) -> None:
+    def validate_lot_size(self, quantity: int, lot_size: Optional[int]) -> None:
         if lot_size and quantity % lot_size != 0:
             raise LotSizeMismatchError(quantity, lot_size)
 
-    def place_live_order(self, order, order_id: int, instrument: Dict[str, Any]) -> Dict[str, Any]:
+    def place_live_order(self, order, order_id: int, instrument: Dict[str, Any], algo_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Places a real order on the Shoonya master account for an F&O order
         whose internal `orders`/`order_book` rows (and any wallet debit /
@@ -134,6 +142,11 @@ class LiveOrderRoutingService:
                 to persist broker_order_id onto)
             instrument: dict from MarginEngine.resolve_contract_type() -
                 must contain at least `lot_size`
+            algo_id: SEBI algo ID to tag the order with (see sebi_algo_id)
+
+        The broker `remarks` field carries order.client_order_id, so the
+        order can be found in the broker's own order book by that id even
+        when placement status is uncertain (GET /orders/by-client-id/{id}).
 
         Returns:
             {"broker_order_id": str, "status": "PENDING", "raw_response": dict}
@@ -163,7 +176,8 @@ class LiveOrderRoutingService:
             order_type=order_type_value,
             price=order.price,
             trigger_price=order.trigger_price,
-            remarks=f"primepip_{order_id}",
+            remarks=getattr(order, "client_order_id", None) or f"primepip_{order_id}",
+            algo_id=algo_id,
         )
 
         try:
@@ -179,10 +193,16 @@ class LiveOrderRoutingService:
             raise LiveOrderStatusUncertainError(
                 f"No broker confirmation within {ORDER_PLACEMENT_TIMEOUT_SECS}s for order {order_id}"
             ) from timeout_ex
+        except ShoonyaOrderMappingError as mapping_ex:
+            # Raised by ShoonyaOrderService before the broker is ever
+            # called - nothing exists at the exchange, so this is a clean,
+            # safe-to-cancel rejection rather than an uncertain outcome.
+            self.logger.error(f"Live order {order_id} not sent - could not be mapped for the broker: {mapping_ex}")
+            raise LiveOrderRejectedError(f"order could not be sent: {mapping_ex}") from mapping_ex
         except Exception as ex:
-            # Any other failure (network error, auth expired, mapping bug,
-            # etc.) is ALSO status-uncertain, not a clean reject - never
-            # auto-cancel on an ambiguous failure, same reasoning as timeout.
+            # Any other failure (network error, auth expired, etc.) is ALSO
+            # status-uncertain, not a clean reject - never auto-cancel on an
+            # ambiguous failure, same reasoning as timeout.
             self.logger.error(
                 f"Live order placement raised an unexpected error for order_id={order_id}: {str(ex)}",
                 exc_info=True,
@@ -190,6 +210,16 @@ class LiveOrderRoutingService:
             raise LiveOrderStatusUncertainError(
                 f"Broker call failed unexpectedly for order {order_id}: {str(ex)}"
             ) from ex
+
+        if response is None:
+            # NorenApi.place_order returns None exactly when the broker
+            # answered with parsed JSON whose stat != "Ok" (transport and
+            # decode failures raise instead, and land in the uncertain path
+            # above) - a definite rejection, with the reason text dropped by
+            # the library. Previously this fell through to "uncertain" and
+            # left a rejected order PENDING with its funds still blocked.
+            self.logger.warning(f"Broker rejected order_id={order_id}, symbol={tradingsymbol} (no reason returned)")
+            raise LiveOrderRejectedError("rejected by broker (no reason returned)")
 
         stat = response.get("stat") if isinstance(response, dict) else None
 

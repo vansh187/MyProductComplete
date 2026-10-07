@@ -188,6 +188,7 @@ class TestAppStartup:
              patch.object(app_module, "shoonya_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "top_movers_refresh", _noop_daily_refresh), \
              patch.object(app_module, "option_master_daily_refresh", _noop_daily_refresh), \
+             patch.object(app_module, "future_master_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "ShoonyaOptionFeed", _FakeOptionFeed):
 
             with TestClient(app_module.app) as client:
@@ -216,6 +217,7 @@ class TestAppStartup:
              patch.object(app_module, "shoonya_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "top_movers_refresh", _noop_daily_refresh), \
              patch.object(app_module, "option_master_daily_refresh", _noop_daily_refresh), \
+             patch.object(app_module, "future_master_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "ShoonyaOptionFeed", _FakeOptionFeed):
 
             with TestClient(app_module.app) as client:
@@ -247,6 +249,7 @@ class TestAppStartup:
              patch.object(app_module, "shoonya_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "top_movers_refresh", _noop_daily_refresh), \
              patch.object(app_module, "option_master_daily_refresh", _noop_daily_refresh), \
+             patch.object(app_module, "future_master_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "ShoonyaOptionFeed", _FakeOptionFeed):
 
             with TestClient(app_module.app) as client:
@@ -269,7 +272,8 @@ class TestAppStartup:
         with patch.object(app_module, "ShoonyaConnection", ExplodingShoonya), \
              patch.object(app_module, "shoonya_daily_refresh", _noop_daily_refresh), \
              patch.object(app_module, "top_movers_refresh", _noop_daily_refresh), \
-             patch.object(app_module, "option_master_daily_refresh", _noop_daily_refresh):
+             patch.object(app_module, "option_master_daily_refresh", _noop_daily_refresh), \
+             patch.object(app_module, "future_master_daily_refresh", _noop_daily_refresh):
 
             with TestClient(app_module.app) as client:
                 resp = client.get("/")
@@ -280,10 +284,11 @@ class TestAppStartup:
 
 
 async def _noop_daily_refresh(app):
-    """Stand-in for the real *_daily_refresh background tasks — they all
-    `await asyncio.sleep(...)` before doing anything network-bound, so
-    replacing them avoids scheduling real long-lived work during a test
-    while still exercising create_task()/task-cancellation at shutdown."""
+    """Stand-in for the real *_daily_refresh background tasks. The scrip-master
+    refreshes download from the broker and rewrite tracked JSON files right
+    at startup when the master is stale, so they must always be replaced;
+    the others would schedule real long-lived work. Still exercises
+    create_task()/task-cancellation at shutdown."""
     import asyncio
     try:
         await asyncio.sleep(3600)

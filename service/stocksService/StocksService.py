@@ -460,7 +460,11 @@ class StocksService:
         for candle in raw_candles:
             timestamp = candle.get("timestamp")
             try:
-                dt = datetime.strptime(timestamp, "%d-%m-%Y %H:%M:%S").replace(tzinfo=IST)
+                # ShoonyaConnection.get_time_price_series emits ISO 8601 with
+                # +05:30 already attached.
+                dt = datetime.fromisoformat(timestamp)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=IST)
             except (TypeError, ValueError):
                 continue
             parsed.append({

@@ -1,11 +1,17 @@
 import asyncio
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
-from utils.auth_dependency import get_current_user
+from utils.market_hours import IST_OFFSET
+from utils.auth_dependency import get_current_user, require_admin
 
-router = APIRouter(prefix="/admin/shoonya", tags=["Shoonya Admin"])
+# Every route here controls or exposes the master broker account (OAuth
+# login, the whole platform's real position book). Open to any logged-in
+# user while ADMIN_USER_IDS is empty; set it to restrict to those ids - see
+# require_admin.
+router = APIRouter(prefix="/admin/shoonya", tags=["Shoonya Admin"], dependencies=[Depends(require_admin)])
 logger = logging.getLogger("admin_shoonya")
 
 
@@ -56,6 +62,46 @@ async def exchange_code(body: CodeExchangeRequest, request: Request, current_use
     activate_market_feeds(request.app)
     logger.info("[admin_shoonya] Shoonya connected via admin OAuth flow")
     return {"status": "connected", "message": "Shoonya connected and token saved to .env."}
+
+
+POSITION_BOOK_TIMEOUT_SECS = 5.0
+
+
+@router.get("/positions")
+async def get_master_positions(request: Request, current_user=Depends(get_current_user)):
+    """
+    Shoonya's actual position book for the master account (PositionBook),
+    rows passed through exactly as the broker returns them (tsym, netqty,
+    netavgprc, rpnl, urmtom, lp, ...) - for reconciling the internal
+    per-user positions against what the broker really holds.
+
+    Response: {"success": true, "count": 2, "positions": [...], "as_of": "2026-10-06T10:15:30.123+05:30"}
+    """
+    shoonya = getattr(request.app.state, "shoonya", None)
+    if shoonya is None or not shoonya.is_connected:
+        raise HTTPException(status_code=503, detail="Shoonya session is not connected")
+
+    try:
+        loop = asyncio.get_running_loop()
+        positions = await asyncio.wait_for(
+            loop.run_in_executor(None, shoonya.get_position_book),
+            timeout=POSITION_BOOK_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Broker did not respond in time")
+    except Exception as exc:
+        logger.error(f"[admin_shoonya] position book fetch failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch the broker position book")
+
+    if positions is None:
+        raise HTTPException(status_code=502, detail="Broker position book request failed")
+
+    return {
+        "success": True,
+        "count": len(positions),
+        "positions": positions,
+        "as_of": datetime.now(IST_OFFSET).isoformat(timespec="milliseconds"),
+    }
 
 
 @router.get("/status")

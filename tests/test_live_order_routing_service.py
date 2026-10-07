@@ -19,6 +19,7 @@ from service.liveOrderRoutingService import (
     LiveOrderStatusUncertainError,
     LotSizeMismatchError,
     live_orders_enabled,
+    sebi_algo_id,
 )
 
 
@@ -32,9 +33,15 @@ def _order(**overrides):
     order.quantity = 75
     order.price = 101.15
     order.trigger_price = None
+    order.client_order_id = None
     for key, value in overrides.items():
         setattr(order, key, value)
     return order
+
+
+def _routing_service():
+    with patch("service.liveOrderRoutingService.OrderPersistence"),          patch("service.liveOrderRoutingService.ShoonyaOrderService"):
+        return LiveOrderRoutingService(shoonya_api=MagicMock())
 
 
 def _instrument(lot_size=75):
@@ -61,17 +68,17 @@ class TestLiveOrdersEnabledFlag:
 class TestLotSizeValidation:
 
     def test_multiple_of_lot_size_passes(self):
-        LiveOrderRoutingService.validate_lot_size(150, 75)  # must not raise
+        _routing_service().validate_lot_size(150, 75)  # must not raise
 
     def test_non_multiple_raises_before_any_broker_call(self):
         with pytest.raises(LotSizeMismatchError):
-            LiveOrderRoutingService.validate_lot_size(80, 75)
+            _routing_service().validate_lot_size(80, 75)
 
     def test_missing_lot_size_is_not_validated(self):
         """If lot_size is unknown (None/0), don't block placement on a guess -
         the broker's own validation is the backstop in that case."""
-        LiveOrderRoutingService.validate_lot_size(80, None)
-        LiveOrderRoutingService.validate_lot_size(80, 0)
+        _routing_service().validate_lot_size(80, None)
+        _routing_service().validate_lot_size(80, 0)
 
 
 class TestPlaceLiveOrder:
@@ -172,3 +179,48 @@ class TestPlaceLiveOrder:
 
         assert result["broker_order_id"] == "999"
         assert mock_persistence.set_broker_order_id.call_count == 2
+
+
+class TestAlgoIdAndRemarks:
+
+    def _service_with_mocked_broker(self):
+        with patch("service.liveOrderRoutingService.OrderPersistence") as MockPersistence,              patch("service.liveOrderRoutingService.ShoonyaOrderService") as MockShoonyaOrderService:
+            service = LiveOrderRoutingService(shoonya_api=MagicMock())
+            return service, MockPersistence.return_value, MockShoonyaOrderService.return_value
+
+    def test_sebi_algo_id_reads_server_config(self, monkeypatch):
+        monkeypatch.setenv("SHOONYA_ALGO_ID", "  ALGO-7  ")
+        assert sebi_algo_id() == "ALGO-7"
+        monkeypatch.setenv("SHOONYA_ALGO_ID", "")
+        assert sebi_algo_id() is None
+        monkeypatch.delenv("SHOONYA_ALGO_ID")
+        assert sebi_algo_id() is None
+
+    def test_client_order_id_goes_to_remarks_and_algo_id_is_forwarded(self):
+        service, _, mock_shoonya_order_service = self._service_with_mocked_broker()
+        mock_shoonya_order_service.place_order.return_value = {"stat": "Ok", "norenordno": "1"}
+
+        service.place_live_order(_order(client_order_id="algo-42"), 101, _instrument(), algo_id="ALGO-7")
+
+        _, kwargs = mock_shoonya_order_service.place_order.call_args
+        assert kwargs["remarks"] == "algo-42"
+        assert kwargs["algo_id"] == "ALGO-7"
+
+    def test_remarks_fall_back_to_internal_order_id(self):
+        service, _, mock_shoonya_order_service = self._service_with_mocked_broker()
+        mock_shoonya_order_service.place_order.return_value = {"stat": "Ok", "norenordno": "1"}
+
+        service.place_live_order(_order(), 101, _instrument())
+
+        _, kwargs = mock_shoonya_order_service.place_order.call_args
+        assert kwargs["remarks"] == "primepip_101"
+
+    def test_none_response_is_a_definite_rejection(self):
+        """NorenApi.place_order returns None exactly when the broker replied
+        stat != Ok - that is a reject (safe to cancel/refund), not uncertain."""
+        service, mock_persistence, mock_shoonya_order_service = self._service_with_mocked_broker()
+        mock_shoonya_order_service.place_order.return_value = None
+
+        with pytest.raises(LiveOrderRejectedError):
+            service.place_live_order(_order(), 101, _instrument())
+        mock_persistence.set_broker_order_id.assert_not_called()

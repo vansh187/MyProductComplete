@@ -11,7 +11,7 @@ import psycopg2.extras
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from database.portfolioPersistence import portfolioPersistence
 from utils.query_loader import QueryLoader
-from api.models import is_dormant_order_type, order_type_str
+from api.models import BROKER_ROUTED_SOURCE, is_dormant_order_type, order_type_str
 
 logger = logging.getLogger(__name__)
 
@@ -603,6 +603,67 @@ class OrderPersistence:
                 cursor.close()
             if conn is not None:
                 conn.close()
+
+    def _fetch_rows(self, query_name: str, params: tuple) -> List[Dict[str, Any]]:
+        """Runs one read-only orders.yaml query and returns its rows as dicts."""
+        conn = None
+        cursor = None
+        try:
+            conn = PostgresConnectionFactory.create_connection()
+            if conn is None:
+                raise Exception("Failed to establish database connection")
+
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = QueryLoader.get('orders.yaml', query_name)
+            if query is None:
+                raise Exception(f"Query '{query_name}' not found in orders.yaml")
+
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+        except psycopg2.Error as db_error:
+            logger.error(f"Database error running {query_name}: {str(db_error)}")
+            raise Exception(f"Database error: {str(db_error)}") from db_error
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+    def get_order_by_client_order_id(self, user_id: int, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """The user's most recent order carrying this client_order_id, or None.
+
+        Raises:
+            ValueError: If parameters are invalid
+            Exception: If the database operation fails
+        """
+        if user_id is None or user_id <= 0:
+            raise ValueError("User ID must be a positive integer")
+        if not client_order_id or not str(client_order_id).strip():
+            raise ValueError("client_order_id cannot be empty")
+        rows = self._fetch_rows('get_order_by_client_order_id', (user_id, client_order_id))
+        return rows[0] if rows else None
+
+    def get_unlinked_broker_orders_by_client_order_id(self, client_order_id: str) -> List[Dict[str, Any]]:
+        """
+        Candidates for a broker update/order-book row tagged with this
+        client_order_id that we haven't linked yet: orders actually sent to
+        the broker (source = BROKER_ROUTED_SOURCE), still PENDING/
+        PENDING_TRIGGER, with no broker_order_id. The orders table keeps
+        client_order_id unique across all users (orders_client_order_id_key),
+        so this returns at most one row today; callers still check it against
+        the broker row (symbol/side/quantity) and never guess, so a relaxed
+        constraint could never mislink an order.
+
+        Raises:
+            Exception: If the database operation fails
+        """
+        if not client_order_id or not str(client_order_id).strip():
+            return []
+        return self._fetch_rows(
+            'get_unlinked_broker_orders_by_client_order_id', (client_order_id, BROKER_ROUTED_SOURCE)
+        )
 
 
 # Legacy function names for backward compatibility

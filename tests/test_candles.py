@@ -27,29 +27,29 @@ def _make_app():
 class TestCandleServiceNormalizeInterval:
 
     def test_normalize_interval_1m(self):
-        assert CandleService._normalize_interval("1m") == "1"
+        assert CandleService()._normalize_interval("1m") == "1"
 
     def test_normalize_interval_3m(self):
-        assert CandleService._normalize_interval("3m") == "3"
+        assert CandleService()._normalize_interval("3m") == "3"
 
     def test_normalize_interval_5m(self):
-        assert CandleService._normalize_interval("5m") == "5"
+        assert CandleService()._normalize_interval("5m") == "5"
 
     def test_normalize_interval_15m(self):
-        assert CandleService._normalize_interval("15m") == "15"
+        assert CandleService()._normalize_interval("15m") == "15"
 
     def test_normalize_interval_1h(self):
-        assert CandleService._normalize_interval("1h") == "60"
+        assert CandleService()._normalize_interval("1h") == "60"
 
     def test_normalize_interval_1d_unsupported(self):
         """1d is not available via TPSeries (minute-granularity only)."""
-        assert CandleService._normalize_interval("1d") is None
+        assert CandleService()._normalize_interval("1d") is None
 
     def test_normalize_interval_invalid_returns_none(self):
-        assert CandleService._normalize_interval("30m") is None
+        assert CandleService()._normalize_interval("30m") is None
 
     def test_supported_timeframes_matches_interval_keys(self):
-        assert set(CandleService.SUPPORTED_TIMEFRAMES) == {"1m", "3m", "5m", "15m", "1h"}
+        assert set(CandleService().supported_timeframes) == {"1m", "3m", "5m", "15m", "1h"}
 
 
 class TestFormatCandle:
@@ -63,7 +63,7 @@ class TestFormatCandle:
             "close": 24870.506789,
             "volume": 50000,
         }
-        result = CandleService._format_candle(raw)
+        result = CandleService()._format_candle(raw)
         assert result["timestamp"] == "2026-07-01T09:15:00+05:30"
         assert result["open"] == 24865.76
         assert result["high"] == 24880.2
@@ -73,7 +73,7 @@ class TestFormatCandle:
 
     def test_format_candle_missing_fields_defaults_to_zero(self):
         raw = {"timestamp": "2026-07-01T09:15:00+05:30"}
-        result = CandleService._format_candle(raw)
+        result = CandleService()._format_candle(raw)
         assert result["open"] == 0.0
         assert result["high"] == 0.0
         assert result["low"] == 0.0
@@ -87,31 +87,31 @@ class TestFilterToLastTradingDay:
         """When the lookback window spans a weekend, only the most recent
         day's candles (e.g. Friday) should survive, not a blend with Thursday."""
         raw = [
-            {"timestamp": "02-07-2026 15:29:00", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},  # Thursday
-            {"timestamp": "03-07-2026 09:15:00", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},  # Friday
-            {"timestamp": "03-07-2026 09:16:00", "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3},  # Friday
+            {"timestamp": "2026-07-02T15:29:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},  # Thursday
+            {"timestamp": "2026-07-03T09:15:00+05:30", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},  # Friday
+            {"timestamp": "2026-07-03T09:16:00+05:30", "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3},  # Friday
         ]
-        result = CandleService._filter_to_last_trading_day(raw)
+        result = CandleService()._filter_to_last_trading_day(raw)
         assert len(result) == 2
-        assert all(c["timestamp"].startswith("03-07-2026") for c in result)
+        assert all(c["timestamp"].startswith("2026-07-03") for c in result)
 
     def test_filter_to_last_trading_day_single_day_unaffected(self):
         raw = [
-            {"timestamp": "03-07-2026 09:15:00", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
-            {"timestamp": "03-07-2026 09:16:00", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+            {"timestamp": "2026-07-03T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"timestamp": "2026-07-03T09:16:00+05:30", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
         ]
-        result = CandleService._filter_to_last_trading_day(raw)
+        result = CandleService()._filter_to_last_trading_day(raw)
         assert result == raw
 
     def test_filter_to_last_trading_day_empty_input(self):
-        assert CandleService._filter_to_last_trading_day([]) == []
+        assert CandleService()._filter_to_last_trading_day([]) == []
 
     def test_filter_to_last_trading_day_skips_unparseable_timestamps(self):
         raw = [
             {"timestamp": "garbage", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
-            {"timestamp": "03-07-2026 09:15:00", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+            {"timestamp": "2026-07-03T09:15:00+05:30", "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
         ]
-        result = CandleService._filter_to_last_trading_day(raw)
+        result = CandleService()._filter_to_last_trading_day(raw)
         assert result == [raw[1]]
 
 
@@ -122,8 +122,8 @@ class TestGetIndexCandles:
         returns Friday's candles even though 'today' has no data, and the
         service must surface them instead of reporting no_candle_data."""
         friday_candles = [
-            {"timestamp": "03-07-2026 09:15:00", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1000},
-            {"timestamp": "03-07-2026 09:16:00", "open": 100.5, "high": 102, "low": 100, "close": 101.5, "volume": 1200},
+            {"timestamp": "2026-07-03T09:15:00+05:30", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1000},
+            {"timestamp": "2026-07-03T09:16:00+05:30", "open": 100.5, "high": 102, "low": 100, "close": 101.5, "volume": 1200},
         ]
 
         fake_shoonya = MagicMock()
@@ -196,7 +196,7 @@ class TestGetIndexCandles:
 
     def test_get_index_candles_trims_to_limit_keeping_most_recent(self):
         raw = [
-            {"timestamp": f"03-07-2026 09:{i:02d}:00", "open": i, "high": i, "low": i, "close": i, "volume": i}
+            {"timestamp": f"2026-07-03T09:{i:02d}:00+05:30", "open": i, "high": i, "low": i, "close": i, "volume": i}
             for i in range(10, 20)
         ]
         fake_shoonya = MagicMock()
@@ -211,8 +211,8 @@ class TestGetIndexCandles:
         assert errors == []
         assert len(candles) == 3
         # Most recent 3 of the 10 candles (09:17, 09:18, 09:19)
-        assert candles[0]["timestamp"] == "03-07-2026 09:17:00"
-        assert candles[-1]["timestamp"] == "03-07-2026 09:19:00"
+        assert candles[0]["timestamp"] == "2026-07-03T09:17:00+05:30"
+        assert candles[-1]["timestamp"] == "2026-07-03T09:19:00+05:30"
 
     def test_get_index_candles_broker_exception_is_captured_as_error(self):
         fake_shoonya = MagicMock()

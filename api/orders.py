@@ -1,26 +1,124 @@
+import asyncio
 import logging
+import re
+import uuid
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from appconfig import OptionMaster
+from appconfig.ScripMasterRefresher import upcoming_expiry_dates
 from utils.auth_dependency import get_current_user
+from utils.safe_numbers import safe_float, safe_int
+from database.orderPersistence import OrderPersistence
 from service.orderService import OrderService
 from service.executionEngine import ExecutionEngine
 from service.walletbalance.WalletBalanceService import WalletBalanceService
 from service.marginengine.margin_engine import MarginEngine
 from service.marginengine.exceptions import InsufficientMarginError, MarginEngineError, ReferencePriceUnresolvedError
+from service.brokerOrderStatusService import BrokerOrderStatusService
 from service.liveOrderRoutingService import (
     LiveOrderRoutingService,
     LiveOrderRejectedError,
     LiveOrderStatusUncertainError,
     LotSizeMismatchError,
     live_orders_enabled,
+    sebi_algo_id,
 )
 
-from api.models import OrderCreate, OrderModify, OrderSide, OrderType
+from api.models import BROKER_ROUTED_SOURCE, OrderCreate, OrderModify, OrderSide, OrderType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_broker_order_status_service = BrokerOrderStatusService()
+
+# client_order_id travels to the broker in the order's `remarks` field, so it
+# is kept to a conservative, broker-safe shape.
+_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+# OrderUpdateService reads "primepip_<order_id>" remarks as an internal order
+# id - a client id in that shape could route another order's fill.
+_RESERVED_CLIENT_ORDER_ID_PREFIX = "primepip_"
+
+
+# Internal statuses of an order that is finished with zero fills - for a
+# broker-routed order, nothing is (or will be) live at the exchange.
+_CLOSED_UNFILLED_STATUSES = frozenset({"CANCELLED", "REJECTED", "FAILED"})
+
+
+# Broker (Shoonya) order statuses after which the order can never fill.
+_BROKER_CLOSED_STATUSES = frozenset({"REJECTED", "CANCELED", "CANCELLED"})
+
+
+def _unseen_placement_status(internal_status: Optional[str]) -> Tuple[str, bool]:
+    """(placement_status, retry_with_new_client_order_id) for a broker-routed
+    order the broker does not show. Absence alone proves nothing: right
+    after a timed-out placement the broker may not list it yet (and the
+    order book can be up to a second old), so only our own record decides."""
+    if internal_status in ("EXECUTED", "PARTIALLY_EXECUTED"):
+        return "CONFIRMED", False
+    if internal_status in _CLOSED_UNFILLED_STATUSES:
+        # Closed by a definite broker reject (or a broker cancel/reject push)
+        # with funds released - nothing can be live.
+        return "CLOSED", True
+    return "UNCONFIRMED", False
+
+
+def _off_tick(value: Optional[float], tick_size: Decimal) -> bool:
+    return value is not None and Decimal(str(value)) % tick_size != 0
+
+
+def _live_order_market_rule_error(order: OrderCreate, instrument: Dict[str, Any]) -> Optional[str]:
+    """Exchange rules a live F&O order is certain to be rejected for, checked
+    before any DB write or wallet debit (a broker reject would otherwise cost
+    a debit, a reject round trip and a refund):
+      - the contract has expired (on expiry day, after the 15:30 close);
+      - LIMIT/STOPLIMIT price or trigger price off the contract's tick size;
+      - STOPLIMIT trigger on the wrong side of the limit price (a BUY
+        stop-limit triggers at or below its limit, a SELL at or above).
+    Returns the reason, or None when the order passes."""
+    expiry = instrument.get("expiry")
+    if expiry and not upcoming_expiry_dates([expiry]):
+        return f"Contract {order.symbol} expired on {expiry} and can no longer be traded"
+
+    order_type = _enum_value(order.order_type)
+    if instrument.get("contract_type") == "OPTION":
+        contract = OptionMaster.find_by_tsym(order.symbol)
+        tick_size = Decimal(str(contract.get("tick_size") or OptionMaster.DEFAULT_TICK_SIZE)) if contract else None
+        if tick_size:
+            if order_type in ("LIMIT", "STOPLIMIT") and _off_tick(order.price, tick_size):
+                return f"Price must be a multiple of the tick size ({tick_size})"
+            if order_type in ("STOP", "STOPLIMIT") and _off_tick(order.trigger_price, tick_size):
+                return f"Trigger price must be a multiple of the tick size ({tick_size})"
+
+    if order_type == "STOPLIMIT" and order.price is not None and order.trigger_price is not None:
+        side = _enum_value(order.side)
+        if side == "BUY" and order.trigger_price > order.price:
+            return "For a BUY stop-limit order the trigger price must be at or below the limit price"
+        if side == "SELL" and order.trigger_price < order.price:
+            return "For a SELL stop-limit order the trigger price must be at or above the limit price"
+    return None
+
+
+def _is_broker_routed(order_row: Dict[str, Any]) -> bool:
+    """Sent to the real broker - including a timed-out placement that has no
+    broker_order_id yet but may still be live at the exchange. Such orders
+    must never be cancelled/amended through the internal-only endpoints."""
+    return bool(order_row.get("broker_order_id")) or order_row.get("source") == BROKER_ROUTED_SOURCE
+
+
+def _enum_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def _client_order_id_error(client_order_id: str) -> Optional[str]:
+    if not _CLIENT_ORDER_ID_PATTERN.match(client_order_id):
+        return "client_order_id must be 1-40 characters of letters, digits, '_' or '-'"
+    if client_order_id.lower().startswith(_RESERVED_CLIENT_ORDER_ID_PREFIX):
+        return f"client_order_id must not start with '{_RESERVED_CLIENT_ORDER_ID_PREFIX}'"
+    return None
 
 
 def _cancel_after_margin_failure(order_service: OrderService, user_id: int, order_id: int) -> None:
@@ -33,6 +131,53 @@ def _cancel_after_margin_failure(order_service: OrderService, user_id: int, orde
         order_service.cancel_order_by_id(user_id, order_id)
     except Exception as ex:
         logger.error(f"Failed to auto-cancel order {order_id} after margin failure: {str(ex)}")
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """True if a Postgres unique-constraint violation (SQLSTATE 23505) is
+    anywhere in the exception's cause chain - the persistence layer re-wraps
+    psycopg2 errors in plain Exceptions."""
+    seen = 0
+    current: Optional[BaseException] = exc
+    while current is not None and seen < 10:
+        if getattr(current, "pgcode", None) == "23505":
+            return True
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return False
+
+
+def _release_after_broker_reject(order_service: OrderService, user_id: int, order_id: int,
+                                 client_order_id: Optional[str]) -> None:
+    """Cancels an order the broker refused (nothing exists at the exchange),
+    which refunds the wallet debit and releases the margin block. Unlike the
+    best-effort margin-failure cancel, nothing here is swallowed: if the
+    cancel or any part of the release fails - or the order is somehow still
+    open afterwards - the client gets a 500 needing manual reconciliation
+    instead of being told the order was cleanly rejected."""
+    try:
+        if not order_service.cancel_rejected_order(user_id, order_id):
+            # Not pending any more: fine only if something else (the broker's
+            # own reject/cancel push - OrderUpdateService) already closed it.
+            current = order_service.get_order_by_id(user_id, order_id)
+            current_status = _enum_value(current.get("status")) if current else None
+            if current_status not in _CLOSED_UNFILLED_STATUSES:
+                raise RuntimeError(f"order is {current_status}, not closed, after the broker rejected it")
+    except Exception as ex:
+        logger.error(
+            f"Broker rejected order {order_id} for user {user_id}, but cancelling it to release "
+            f"its wallet debit/margin failed - manual reconciliation needed: {ex}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "The broker rejected the order, but releasing its blocked funds failed - "
+                           "it needs manual reconciliation",
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+            },
+        )
 
 
 def _refund_wallet_after_order_creation_failure(wallet_service: WalletBalanceService, user_id: int, amount: Decimal) -> None:
@@ -96,7 +241,7 @@ def get_orders(current_user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="Failed to retrieve orders")
 
 
-def _create_order_row_with_checks(order: OrderCreate, user_id: int) -> Tuple[int, Optional[str], Dict[str, Any], MarginEngine, OrderService]:
+def _create_order_row_with_checks(order: OrderCreate, user_id: int, broker_routed: bool = False) -> Tuple[int, Optional[str], Dict[str, Any], MarginEngine, OrderService]:
     """
     Shared by both POST /orders (simulated, peer-matched) and POST
     /createLiveOrder (real Shoonya order) - this is every DB-writing step
@@ -105,6 +250,9 @@ def _create_order_row_with_checks(order: OrderCreate, user_id: int) -> Tuple[int
     itself, and F&O margin check+block. Factored out (rather than
     copy-pasted into the new live-order endpoint) so a future fix to any of
     this logic can't be applied to one endpoint and missed on the other.
+
+    broker_routed: True only from POST /createLiveOrder (see
+    OrderService.create_order) - never derived from the request body.
 
     Raises HTTPException directly on any failure (funds/margin/creation),
     exactly as create_order always has - callers should let it propagate
@@ -187,7 +335,26 @@ def _create_order_row_with_checks(order: OrderCreate, user_id: int) -> Tuple[int
 
     # Create order in database
     order_service = OrderService()
-    order_id = order_service.create_order(order, user_id)
+    try:
+        order_id = order_service.create_order(order, user_id, broker_routed=broker_routed)
+    except Exception as create_ex:
+        # The wallet was debited above, before the insert - a raised insert
+        # must refund it just like a failed (None) one does.
+        if wallet_debited:
+            _refund_wallet_after_order_creation_failure(wallet_service, user_id, required_balance)
+        if _is_unique_violation(create_ex):
+            # orders_client_order_id_key (client_order_id is unique across
+            # ALL users): either a concurrent retry won the race between our
+            # per-user duplicate pre-check and this insert, or another user's
+            # order already uses this id.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "This client_order_id is already in use",
+                    "client_order_id": order.client_order_id,
+                },
+            )
+        raise
 
     if order_id is None or order_id <= 0:
         if wallet_debited:
@@ -344,6 +511,40 @@ def create_live_order(request: Request, order: OrderCreate, current_user=Depends
             logger.error("create_live_order() called with no live Shoonya session")
             raise HTTPException(status_code=503, detail="Shoonya session is not connected - cannot place a live order")
 
+        # Optional, server-side only (never client-supplied): attached when
+        # SHOONYA_ALGO_ID is configured, otherwise the order is sent without
+        # one, exactly as the broker library does by default.
+        algo_id = sebi_algo_id()
+
+        # Every live order gets a client_order_id (generated when the caller
+        # sent none) - it is the order's tag in the broker's own order book.
+        if order.client_order_id:
+            order.client_order_id = order.client_order_id.strip()
+            client_id_error = _client_order_id_error(order.client_order_id)
+            if client_id_error:
+                raise HTTPException(status_code=400, detail=client_id_error)
+            existing_order = OrderPersistence().get_order_by_client_order_id(user_id, order.client_order_id)
+            if existing_order is not None:
+                # Idempotency: one client_order_id identifies exactly one
+                # order attempt, final once used - a retry must never place a
+                # second real order. A rejected attempt is closed for good
+                # (the orders table also keeps the id unique), so retrying
+                # after a reject needs a new id - the detail says which case
+                # this is.
+                existing_status = _enum_value(existing_order.get("status"))
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "An order with this client_order_id already exists",
+                        "order_id": existing_order.get("id"),
+                        "client_order_id": order.client_order_id,
+                        "status": existing_status,
+                        "retry_with_new_client_order_id": existing_status in _CLOSED_UNFILLED_STATUSES,
+                    },
+                )
+        else:
+            order.client_order_id = f"pp{uuid.uuid4().hex[:20]}"
+
         # Pre-check contract type and lot size BEFORE any DB writes/wallet
         # debit, so a request for an equity symbol or a bad quantity fails
         # cleanly with zero side effects - no order row, no wallet touch,
@@ -366,25 +567,49 @@ def create_live_order(request: Request, order: OrderCreate, current_user=Depends
                 detail=f"Quantity must be a multiple of the lot size ({lot_size})"
             )
 
-        order_id, contract_type, instrument, margin_engine, order_service = _create_order_row_with_checks(order, user_id)
+        market_rule_error = _live_order_market_rule_error(order, instrument_probe)
+        if market_rule_error:
+            raise HTTPException(status_code=400, detail=market_rule_error)
+
+        order_id, contract_type, instrument, margin_engine, order_service = _create_order_row_with_checks(
+            order, user_id, broker_routed=True
+        )
 
         live_order_routing_service = LiveOrderRoutingService(shoonya_api)
         try:
-            live_result = live_order_routing_service.place_live_order(order, order_id, instrument)
+            live_result = live_order_routing_service.place_live_order(order, order_id, instrument, algo_id=algo_id)
         except LotSizeMismatchError as lot_ex:
             # Re-checked here since instrument (from _create_order_row_with_checks,
             # which re-resolves the contract independently of instrument_probe
             # above) is the authoritative source used for the actual placement -
             # the pre-check above is a fast-fail convenience, not the only guard.
-            order_service.cancel_order_by_id(user_id, order_id)
-            raise HTTPException(status_code=400, detail=str(lot_ex))
+            _release_after_broker_reject(order_service, user_id, order_id, order.client_order_id)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": str(lot_ex),
+                    "order_id": order_id,
+                    "client_order_id": order.client_order_id,
+                    "retry_with_new_client_order_id": True,
+                },
+            )
         except LiveOrderRejectedError as reject_ex:
             # Broker explicitly said no - safe to cancel, which reuses the
             # existing cancel path's wallet refund + margin release +
             # order_book cancellation (OrderService.cancel_order_by_id) so
             # nothing is left inconsistent.
-            order_service.cancel_order_by_id(user_id, order_id)
-            raise HTTPException(status_code=400, detail=f"Broker rejected the order: {reject_ex.reason}")
+            _release_after_broker_reject(order_service, user_id, order_id, order.client_order_id)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"Broker rejected the order: {reject_ex.reason}",
+                    "order_id": order_id,
+                    "client_order_id": order.client_order_id,
+                    # Nothing exists at the broker and the funds are back -
+                    # a retry is safe, under a new client_order_id.
+                    "retry_with_new_client_order_id": True,
+                },
+            )
         except LiveOrderStatusUncertainError as uncertain_ex:
             # Deliberately NOT cancelled - the order may have actually gone
             # through at the broker even though we didn't get clean
@@ -395,17 +620,25 @@ def create_live_order(request: Request, order: OrderCreate, current_user=Depends
             )
             raise HTTPException(
                 status_code=202,
-                detail="Order was submitted but broker confirmation timed out - check order status before retrying"
+                detail={
+                    "message": "Order was submitted but broker confirmation timed out - it may be live "
+                               "at the exchange. Poll GET /orders/by-client-id/{client_order_id}; do NOT "
+                               "retry under a new client_order_id until placement_status says it is safe.",
+                    "order_id": order_id,
+                    "client_order_id": order.client_order_id,
+                    "retry_with_new_client_order_id": False,
+                },
             )
 
         logger.info(
             f"Live order created: order_id={order_id}, broker_order_id={live_result['broker_order_id']}, "
-            f"user={user_id}, symbol={order.symbol}"
+            f"client_order_id={order.client_order_id}, user={user_id}, symbol={order.symbol}"
         )
 
         return {
             "success": True,
             "order_id": order_id,
+            "client_order_id": order.client_order_id,
             "broker_order_id": live_result["broker_order_id"],
             "status": live_result["status"],
         }
@@ -420,6 +653,104 @@ def create_live_order(request: Request, order: OrderCreate, current_user=Depends
     except Exception as ex:
         logger.error(f"Error creating live order: {str(ex)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to create live order: {str(ex)}")
+
+
+@router.get("/orders/by-client-id/{client_order_id}")
+async def get_order_by_client_order_id(client_order_id: str, request: Request, current_user=Depends(get_current_user)):
+    """
+    The broker's own status for one of the caller's live orders, looked up by
+    the client_order_id it was placed with (POST /createLiveOrder).
+
+    Response:
+    {
+      "success": true, "order_id": 812, "client_order_id": "algo-42",
+      "broker_order_id": "26100600012345", "internal_status": "EXECUTED",
+      "placement_status": "CONFIRMED", "retry_with_new_client_order_id": false,
+      "status": "COMPLETE", "filled_qty": 75, "avg_fill_price": 101.15,
+      "rejreason": null, "broker_time": "10:15:30 06-10-2026"
+    }
+    status is the broker's (OPEN, COMPLETE, REJECTED, CANCELED,
+    TRIGGER_PENDING, ...), null when the broker shows no such order.
+    filled_qty/avg_fill_price come from the broker when it has the order,
+    otherwise from our own order record.
+
+    placement_status - what a caller may safely conclude:
+      CONFIRMED    the order reached the exchange (broker has it, or it filled)
+      CLOSED       finished with zero fills; nothing is live
+      UNCONFIRMED  sent, but not visible at the broker (yet): it MAY still be
+                   live - keep polling, never re-place under a new id
+      NOT_ROUTED   a POST /orders order; never sent to the broker
+    retry_with_new_client_order_id is true only when a new attempt cannot
+    double up a live order.
+
+    Raises:
+        HTTPException: 400 bad id, 404 no such order for this user, 409 more
+            than one broker order fits, 503/504 broker unreachable,
+            500 unexpected failure
+    """
+    if current_user is None or "user_id" not in current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    user_id = current_user["user_id"]
+
+    client_order_id = (client_order_id or "").strip()
+    if not _CLIENT_ORDER_ID_PATTERN.match(client_order_id):
+        raise HTTPException(status_code=400, detail="Invalid client_order_id")
+
+    try:
+        loop = asyncio.get_running_loop()
+        order_row = await loop.run_in_executor(
+            None, OrderPersistence().get_order_by_client_order_id, user_id, client_order_id
+        )
+    except Exception as ex:
+        logger.error(f"Order lookup by client_order_id={client_order_id} failed: {ex}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to look up order")
+
+    if order_row is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    internal_status = _enum_value(order_row.get("status"))
+    response = {
+        "success": True,
+        "order_id": order_row.get("id"),
+        "client_order_id": client_order_id,
+        "broker_order_id": order_row.get("broker_order_id"),
+        "internal_status": internal_status,
+        "routed_to_broker": True,
+        "broker_found": False,
+        "placement_status": None,
+        "retry_with_new_client_order_id": False,
+        "status": None,
+        "filled_qty": safe_int(order_row.get("filled_qty"), 0),
+        "avg_fill_price": safe_float(order_row.get("avg_fill_price")),
+        "rejreason": None,
+        "broker_time": None,
+    }
+
+    shoonya = getattr(request.app.state, "shoonya", None)
+    broker_status, reason = await _broker_order_status_service.get_status(shoonya, order_row)
+    if broker_status is not None:
+        response.update(broker_status)
+        response["broker_order_id"] = broker_status.get("broker_order_id") or response["broker_order_id"]
+        response["broker_found"] = True
+        closed_at_broker = broker_status.get("status") in _BROKER_CLOSED_STATUSES and not broker_status.get("filled_qty")
+        response["placement_status"] = "CLOSED" if closed_at_broker else "CONFIRMED"
+        response["retry_with_new_client_order_id"] = closed_at_broker
+        return response
+    if reason == "not_routed_to_broker":
+        response["routed_to_broker"] = False
+        response["placement_status"] = "NOT_ROUTED"
+        response["retry_with_new_client_order_id"] = internal_status in _CLOSED_UNFILLED_STATUSES
+        return response
+    if reason == "not_found_at_broker":
+        response["placement_status"], response["retry_with_new_client_order_id"] = _unseen_placement_status(internal_status)
+        return response
+    if reason == "ambiguous_at_broker":
+        raise HTTPException(status_code=409, detail="More than one broker order matches this order - needs manual reconciliation")
+    if reason == "broker_timeout":
+        raise HTTPException(status_code=504, detail="Broker did not respond in time")
+    if reason in ("shoonya_disconnected", "broker_unavailable"):
+        raise HTTPException(status_code=503, detail="Broker order status is unavailable right now")
+    raise HTTPException(status_code=500, detail="Failed to fetch broker order status")
 
 
 @router.get("/orders/{order_id}")
@@ -501,7 +832,7 @@ def cancel_order(order_id: int, current_user=Depends(get_current_user)):
 
         order_service = OrderService()
         existing_order = order_service.get_order_by_id(user_id, order_id)
-        if existing_order is not None and existing_order.get("broker_order_id"):
+        if existing_order is not None and _is_broker_routed(existing_order):
             # A real, live Shoonya order - this endpoint only ever touches
             # internal state (wallet refund/margin release/order_book), it
             # never calls the broker's own cancel_order. Cancelling "cleanly"
@@ -583,7 +914,7 @@ def modify_order(order_id: int, modify: OrderModify, current_user=Depends(get_cu
         if existing_order is None:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if existing_order.get("broker_order_id"):
+        if _is_broker_routed(existing_order):
             # Same reasoning as cancel_order() above - modifying only the
             # internal row would desync from the real resting order at the
             # broker (wrong price/qty tracked internally while the real

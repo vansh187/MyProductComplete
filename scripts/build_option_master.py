@@ -13,7 +13,7 @@ Output: appconfig/master_options.json
   "NIFTY": {
     "expiries": ["2026-07-07", "2026-07-14", ...],
     "2026-07-07": {
-      "24300": {"ce_token": "...", "ce_tsym": "...", "pe_token": "...", "pe_tsym": "...", "lot_size": 65}
+      "24300": {"ce_token": "...", "ce_tsym": "...", "pe_token": "...", "pe_tsym": "...", "lot_size": 65, "tick_size": 0.05}
     }
   },
   "BANKNIFTY": {...},
@@ -53,6 +53,9 @@ TRACKED_UNDERLYINGS = NFO_UNDERLYINGS | BFO_UNDERLYINGS
 BFO_SYMBOL_TO_UNDERLYING = {
     "BSXOPT": "SENSEX",
 }
+
+# Used only when a row's TickSize column is blank/unparseable.
+DEFAULT_TICK_SIZE = 0.05
 
 
 def _parse_expiry(raw: str) -> str:
@@ -97,8 +100,13 @@ def parse_master_csv(content: str, tracked: set[str] = NFO_UNDERLYINGS, symbol_m
         except (KeyError, ValueError):
             continue
 
+        try:
+            tick_size = float(row.get("TickSize") or DEFAULT_TICK_SIZE)
+        except ValueError:
+            tick_size = DEFAULT_TICK_SIZE
+
         expiry_chain = chains[underlying].setdefault(expiry_iso, {})
-        strike_entry = expiry_chain.setdefault(strike, {"lot_size": lot_size})
+        strike_entry = expiry_chain.setdefault(strike, {"lot_size": lot_size, "tick_size": tick_size})
 
         if option_type == "CE":
             strike_entry["ce_token"] = row["Token"].strip()

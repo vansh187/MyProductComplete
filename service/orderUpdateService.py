@@ -27,10 +27,12 @@ import psycopg2.errors
 
 from database.PostgresConnectionFactory import PostgresConnectionFactory
 from database.orderPersistence import OrderPersistence
+from service.brokerOrderMatcher import BrokerOrderMatcher
 from service.orderService import OrderService
 from service.tradeSettlementService import TradeSettlementService
 from service.tradeHistoryService import TradeHistoryService
 from utils.query_loader import QueryLoader
+from utils.safe_numbers import safe_float, safe_int
 
 logger = logging.getLogger(__name__)
 
@@ -55,20 +57,6 @@ _REPORT_TYPE_CANCELED = "Canceled"
 _RECONCILABLE_STATUSES = ("PENDING", "PENDING_TRIGGER")
 
 
-def _safe_int(val) -> Optional[int]:
-    try:
-        return int(float(val)) if val not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_float(val) -> Optional[float]:
-    try:
-        return float(val) if val not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
 def _enum_str(value) -> str:
     return value.value if hasattr(value, "value") else str(value)
 
@@ -80,6 +68,7 @@ class OrderUpdateService:
         self.order_service = OrderService()
         self.trade_settlement_service = TradeSettlementService()
         self.trade_history_service = TradeHistoryService()
+        self.broker_order_matcher = BrokerOrderMatcher()
         self.logger = logger
 
     async def handle_order_update(self, raw: Dict[str, Any]) -> None:
@@ -135,19 +124,29 @@ class OrderUpdateService:
 
     def _resolve_order_by_remarks_fallback(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         remarks = (raw.get("remarks") or "").strip()
-        match = _REMARKS_ORDER_ID_PATTERN.match(remarks)
-        if not match:
+        if not remarks:
             return None
 
-        order_id = int(match.group(1))
+        # remarks carries the order's client_order_id (current placements),
+        # or "primepip_<order_id>" (orders placed before that change, and
+        # placements with no client_order_id).
+        match = _REMARKS_ORDER_ID_PATTERN.match(remarks)
         try:
-            order_row = self.order_persistence.get_order_by_id_only(order_id)
+            if match:
+                order_row = self.order_persistence.get_order_by_id_only(int(match.group(1)))
+            else:
+                # The update's own tsym/side/qty must also single out exactly
+                # one unlinked broker-routed order, or nothing is linked - a
+                # remarks match alone is never trusted with a real fill.
+                candidates = self.order_persistence.get_unlinked_broker_orders_by_client_order_id(remarks)
+                order_row = self.broker_order_matcher.pick_order(candidates, raw)
         except Exception as ex:
-            self.logger.error(f"[OrderUpdate] Remarks fallback lookup failed for order_id={order_id}: {ex}")
+            self.logger.error(f"[OrderUpdate] Remarks fallback lookup failed for remarks={remarks!r}: {ex}")
             return None
 
         if order_row is None:
             return None
+        order_id = order_row["id"]
 
         broker_order_id = raw.get("norenordno")
         if not order_row.get("broker_order_id") and broker_order_id:
@@ -170,8 +169,8 @@ class OrderUpdateService:
         return order_row
 
     def _handle_fill(self, order_row: Dict[str, Any], raw: Dict[str, Any]) -> None:
-        fill_qty = _safe_int(raw.get("flqty"))
-        fill_price = _safe_float(raw.get("flprc"))
+        fill_qty = safe_int(raw.get("flqty"))
+        fill_price = safe_float(raw.get("flprc"))
         if not fill_qty or fill_qty <= 0 or not fill_price or fill_price <= 0:
             self.logger.warning(f"[OrderUpdate] Fill event missing/invalid flqty/flprc: {raw}")
             return

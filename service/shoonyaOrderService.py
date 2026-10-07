@@ -16,10 +16,15 @@ price_type/price/trigger_price/retention/remarks), and its response shape
 straight from that repo - no invented field names here.
 """
 
+import inspect
 import logging
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Whether a client class's place_order accepts algo_id, keyed by class so
+# inspect.signature runs once per class, not once per order.
+_ALGO_ID_SUPPORT: Dict[type, bool] = {}
 
 # BUY/SELL -> Shoonya's buy_or_sell code.
 _SIDE_MAP = {"BUY": "B", "SELL": "S"}
@@ -54,8 +59,23 @@ class ShoonyaOrderService:
         self._api = shoonya_api
         self.logger = logger
 
-    @staticmethod
-    def _map(mapping: dict, value: str, field_name: str) -> str:
+    def _accepts_algo_id(self) -> bool:
+        """NorenRestApiPy's place_order takes algo_id (verified against the
+        installed library), but an older/newer client without it would raise
+        TypeError inside the broker call - an "uncertain" outcome. Checked up
+        front instead so such an order is refused before anything is sent."""
+        api_type = type(self._api)
+        supported = _ALGO_ID_SUPPORT.get(api_type)
+        if supported is None:
+            try:
+                params = inspect.signature(self._api.place_order).parameters.values()
+                supported = any(p.name == "algo_id" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+            except (TypeError, ValueError):
+                supported = False
+            _ALGO_ID_SUPPORT[api_type] = supported
+        return supported
+
+    def _map(self, mapping: dict, value: str, field_name: str) -> str:
         code = mapping.get(value)
         if code is None:
             raise ShoonyaOrderMappingError(f"No Shoonya mapping for {field_name}={value!r}")
@@ -63,20 +83,27 @@ class ShoonyaOrderService:
 
     def place_order(self, *, side: str, product_type: str, exchange: str, tradingsymbol: str,
                      quantity: int, order_type: str, price: Optional[float] = None,
-                     trigger_price: Optional[float] = None, remarks: Optional[str] = None) -> Dict[str, Any]:
+                     trigger_price: Optional[float] = None, remarks: Optional[str] = None,
+                     algo_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Places a real order on Shoonya. Returns the raw response dict -
         callers must check `response.get("stat") == "Ok"` and read
         `response.get("norenordno")` on success, `response.get("emsg")` on
-        failure. Never raises for a broker-level rejection (that's a normal
-        `stat: Not_Ok` response, not an exception) - only raises for a
-        mapping error (our own bug) or if the underlying HTTP call itself
+        failure. NorenApi.place_order itself returns None (not the dict) when
+        the broker answers with stat != Ok, so None also means "explicitly
+        rejected". Never raises for a broker-level rejection - only raises for
+        a mapping error (our own bug) or if the underlying HTTP call itself
         blows up (network error, auth expired, etc.), which the caller
         (LiveOrderRoutingService) is responsible for catching.
+
+        algo_id: the exchange-approved SEBI algo ID, attached server-side
+        (see liveOrderRoutingService.sebi_algo_id) - never client-supplied.
         """
         buy_or_sell = self._map(_SIDE_MAP, side, "side")
         product_code = self._map(_PRODUCT_TYPE_MAP, product_type, "product_type")
         price_type = self._map(_PRICE_TYPE_MAP, order_type, "order_type")
+        if algo_id is not None and not self._accepts_algo_id():
+            raise ShoonyaOrderMappingError("Installed broker client's place_order does not accept algo_id")
 
         # MARKET orders must send price=0 (a real limit price on a market
         # order is meaningless to the broker and rejected by some brokers as
@@ -87,22 +114,28 @@ class ShoonyaOrderService:
         self.logger.info(
             f"Placing Shoonya order: side={buy_or_sell}, product={product_code}, "
             f"exchange={exchange}, tsym={tradingsymbol}, qty={quantity}, "
-            f"price_type={price_type}, price={effective_price}, trigger={effective_trigger}"
+            f"price_type={price_type}, price={effective_price}, trigger={effective_trigger}, "
+            f"remarks={remarks}, algo_id={algo_id}"
         )
 
-        return self._api.place_order(
-            buy_or_sell=buy_or_sell,
-            product_type=product_code,
-            exchange=exchange,
-            tradingsymbol=tradingsymbol,
-            quantity=quantity,
-            discloseqty=0,
-            price_type=price_type,
-            price=effective_price,
-            trigger_price=effective_trigger,
-            retention="DAY",
-            remarks=remarks or "primepip",
-        )
+        order_fields = {
+            "buy_or_sell": buy_or_sell,
+            "product_type": product_code,
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol,
+            "quantity": quantity,
+            "discloseqty": 0,
+            "price_type": price_type,
+            "price": effective_price,
+            "trigger_price": effective_trigger,
+            "retention": "DAY",
+            "remarks": remarks or "primepip",
+        }
+        # Only sent when configured, so a client library without the
+        # parameter is never handed it.
+        if algo_id is not None:
+            order_fields["algo_id"] = algo_id
+        return self._api.place_order(**order_fields)
 
     def modify_order(self, *, orderno: str, exchange: str, tradingsymbol: str,
                       newquantity: Optional[int] = None, newprice_type: Optional[str] = None,

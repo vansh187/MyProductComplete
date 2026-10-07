@@ -69,6 +69,13 @@ class ExchangeType(str, Enum):
     MCXSX = "MCXSX"
 
 
+# orders.source for orders sent to the real broker via POST /createLiveOrder.
+# Distinct from 'LIVE', which only means "placed in a prod deployment" (and is
+# set on peer-matched POST /orders too), so it's the one reliable marker that
+# an order exists in the master account's broker order book.
+BROKER_ROUTED_SOURCE = "BROKER"
+
+
 # Derivative exchanges routed to the F&O positions book (service/positionsService.py)
 # instead of equity holdings - NSE/BSE are the only cash-equity exchanges.
 DERIVATIVE_EXCHANGES = {ExchangeType.NFO, ExchangeType.NCDEX, ExchangeType.MCXSX}

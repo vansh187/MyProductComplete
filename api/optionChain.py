@@ -9,13 +9,14 @@ provides no IV field anywhere.
 import asyncio
 import contextlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from appconfig import OptionMaster
 from service.optionChain.OptionChainService import OPTIONS_EXCHANGE, OptionChainService
+from utils.market_hours import IST_OFFSET
 
 router = APIRouter(prefix="/api/market", tags=["Option Chain"])
 
@@ -42,8 +43,24 @@ def _envelope(underlying: str, expiry: str | None, data: dict | None, errors: li
         "spot": data["spot"] if data else None,
         "strikes": data["strikes"] if data else [],
         "errors": errors,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(IST_OFFSET).isoformat(timespec="milliseconds"),
     }
+
+
+@router.get("/{underlying}/expiries")
+def get_expiries(underlying: str) -> list[str]:
+    """
+    Still-tradable expiries for an index underlying from the broker's
+    contract list, as a sorted list of YYYY-MM-DD dates. Today's expiry is
+    included until the 15:30 close.
+
+    underlying: nifty | banknifty | finnifty | sensex
+
+    Response: ["2026-10-06", "2026-10-13", "2026-10-20", "2026-10-27", ...]
+    """
+    if not OptionMaster.is_valid_underlying(underlying):
+        raise HTTPException(status_code=400, detail=f"Invalid underlying: {underlying}")
+    return _optionChainService.list_expiries(underlying)
 
 
 @router.get("/{underlying}/optionchain")

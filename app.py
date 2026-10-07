@@ -39,6 +39,8 @@ from api.sectorPerformance import router as sectorPerformanceRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from api.candles import router as candlesRouter
 from api.optionChain import router as optionChainRouter, _optionChainService
+from api.margin import router as marginRouter
+from utils.auth_dependency import admin_allowlist_configured
 from service.positionTickService import positionTickService
 from service.orderUpdateService import OrderUpdateService
 from appconfig.OptionMaster import schedule_daily_refresh as option_master_daily_refresh
@@ -198,6 +200,8 @@ def _create_market_feeds(app: FastAPI) -> bool:
     try:
         stock_feed = ShoonyaStockFeed(option_feed)
         app.state.stock_feed = stock_feed
+        # Index spot for the option chain comes from these pinned ticks.
+        _optionChainService.set_spot_source(stock_feed)
         app.state.stock_feed_eviction_task = asyncio.create_task(
             _supervised_background_task(
                 lambda _app, feed=stock_feed: feed.evict_idle_loop(),
@@ -250,6 +254,14 @@ async def lifespan(app: FastAPI):
     app.state.mutual_fund_job_runner  = None
     app.state.mf_http_client          = None
     app.state.mf_cache                = None
+
+    if not admin_allowlist_configured():
+        # A deliberate choice for now (small trusted team), but it must stay
+        # visible: these routes control the master broker account.
+        app_logger.warning(
+            "ADMIN_USER_IDS is empty - /admin/shoonya/* (broker OAuth login, master position book) "
+            "is open to every logged-in user. Set ADMIN_USER_IDS to restrict it."
+        )
 
     # ── Stocks (Shoonya-backed Explore/Search/Quote/Chart) ────────────
     # Independent of Shoonya being reachable - the symbol master and search
@@ -478,6 +490,7 @@ app.include_router(sectorPerformanceRouter)
 app.include_router(topMoversRouter)
 app.include_router(candlesRouter)
 app.include_router(optionChainRouter)
+app.include_router(marginRouter)
 app.include_router(mutualFundsRouter)
 app.include_router(stocksRouter)
 app.include_router(searchRouter)

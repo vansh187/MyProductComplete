@@ -39,9 +39,9 @@ def test_candles_are_sorted_oldest_first():
     assert result is not None
     timestamps = [c["timestamp"] for c in result]
     assert timestamps == [
-        "03-07-2026 09:15:00",
-        "03-07-2026 09:16:00",
-        "03-07-2026 09:17:00",
+        "2026-07-03T09:15:00+05:30",
+        "2026-07-03T09:16:00+05:30",
+        "2026-07-03T09:17:00+05:30",
     ]
 
 
@@ -137,7 +137,7 @@ def test_malformed_candle_entries_are_skipped_not_fatal():
 
     assert result is not None
     assert len(result) == 1
-    assert result[0]["timestamp"] == "03-07-2026 09:15:00"
+    assert result[0]["timestamp"] == "2026-07-03T09:15:00+05:30"
 
 
 def test_calls_broker_with_expected_kwargs():

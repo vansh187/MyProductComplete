@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Optional, List, Dict, Any
 
 from appconfig import OptionMaster
-from api.models import ExchangeType
+from api.models import BROKER_ROUTED_SOURCE, ExchangeType
 from database.orderPersistence import OrderPersistence
 from database.portfolioPersistence import portfolioPersistence
 from service.tradeHistoryService import TradeHistoryService
@@ -21,6 +21,16 @@ import os
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+class FundsReleaseError(Exception):
+    """An order was cancelled, but its margin block and/or wallet debit
+    could not be released - needs manual reconciliation."""
+
+    def __init__(self, order_id: int, failures: list):
+        self.order_id = order_id
+        self.failures = failures
+        super().__init__(f"Order {order_id} cancelled but not fully released: {', '.join(failures)}")
+
+
 class OrderService:
     """Service class for order operations."""
 
@@ -31,13 +41,15 @@ class OrderService:
         self.wallet_service = WalletBalanceService()
         self.logger = logger
 
-    def create_order(self, order: Any, user_id: int) -> int:
+    def create_order(self, order: Any, user_id: int, broker_routed: bool = False) -> int:
         """
         Create a new order.
 
         Args:
             order: Order object with symbol, side, quantity, price, exchange, etc.
             user_id: User ID creating the order
+            broker_routed: True only for POST /createLiveOrder, which sends
+                the order to the real broker - stored as BROKER_ROUTED_SOURCE
 
         Returns:
             Order ID
@@ -87,8 +99,13 @@ class OrderService:
                 # Python bool True - `os.getenv(...) is True` was always
                 # False regardless of the env var's actual value, so every
                 # order was silently persisted with source='SIMULATED'
-                # even in a real "prod" deployment.
-                if os.getenv("IS_PROD_ENVIRONMENT", "false").strip().lower() == "true":
+                # even in a real "prod" deployment. source is always
+                # server-decided: whatever the request body carried is
+                # overwritten, so a client can never tag its own order as
+                # broker-routed.
+                if broker_routed:
+                    order.source = BROKER_ROUTED_SOURCE
+                elif os.getenv("IS_PROD_ENVIRONMENT", "false").strip().lower() == "true":
                     order.source = 'LIVE'
                 else:
                     order.source = 'SIMULATED'
@@ -217,7 +234,9 @@ class OrderService:
 
     def cancel_order_by_id(self, user_id: int, order_id: int) -> bool:
         """
-        Cancel a pending order.
+        Cancel a pending order. Releasing its margin block / wallet debit is
+        best-effort here (failures are logged, the cancel still stands) - see
+        cancel_rejected_order for the strict variant.
 
         Args:
             user_id: User ID
@@ -230,6 +249,31 @@ class OrderService:
             ValueError: If parameters are invalid
             Exception: If cancellation fails
         """
+        was_cancelled, _ = self._cancel_and_release(user_id, order_id)
+        return was_cancelled
+
+    def cancel_rejected_order(self, user_id: int, order_id: int) -> bool:
+        """
+        Cancel for an order the broker refused: same as cancel_order_by_id,
+        but a margin-release or wallet-refund failure is raised as
+        FundsReleaseError instead of only logged - the caller must not report
+        a clean rejection while the user's funds are still blocked.
+
+        Returns:
+            True if cancelled here, False if it was no longer pending
+
+        Raises:
+            FundsReleaseError: cancelled, but funds were not fully released
+        """
+        was_cancelled, release_failures = self._cancel_and_release(user_id, order_id)
+        if release_failures:
+            raise FundsReleaseError(order_id, release_failures)
+        return was_cancelled
+
+    def _cancel_and_release(self, user_id: int, order_id: int) -> tuple[bool, list[str]]:
+        """(was_cancelled, release_failures): cancels a PENDING/PENDING_TRIGGER
+        order, then releases its margin block and refunds its wallet debit,
+        collecting (not raising) any release failure."""
         if user_id is None or user_id <= 0:
             self.logger.error(f"cancel_order_by_id() received invalid user_id: {user_id}")
             raise ValueError("User ID must be a positive integer")
@@ -253,6 +297,7 @@ class OrderService:
             # for another request to change price/quantity in between.
             order_details = self.order_persistence.cancel_order_by_id(user_id, order_id)
             was_cancelled = order_details is not None
+            release_failures: list[str] = []
 
             if was_cancelled:
                 self.logger.info(f"Order {order_id} cancelled successfully")
@@ -266,12 +311,14 @@ class OrderService:
                         f"Margin release failed for cancelled order {order_id} "
                         f"(cancel already succeeded): {str(margin_ex)}"
                     )
+                    release_failures.append(f"margin release: {margin_ex}")
 
-                self._refund_wallet_for_cancelled_buy_order(user_id, order_id, order_details)
+                if not self._refund_wallet_for_cancelled_buy_order(user_id, order_id, order_details):
+                    release_failures.append("wallet refund")
             else:
                 self.logger.warning(f"No pending order found to cancel: {order_id}")
 
-            return was_cancelled
+            return was_cancelled, release_failures
 
         except ValueError as val_error:
             self.logger.error(f"Validation error: {str(val_error)}")
@@ -282,7 +329,7 @@ class OrderService:
             raise
 
     def _refund_wallet_for_cancelled_buy_order(self, user_id: int, order_id: int,
-                                                order_details: Optional[Dict[str, Any]]) -> None:
+                                                order_details: Optional[Dict[str, Any]]) -> bool:
         """
         Refunds the cash debited at order-creation time (api/orders.py) for
         a BUY order (equity or OPTION BUY - never FUTURES, which was never
@@ -310,23 +357,26 @@ class OrderService:
         cancellation itself has already committed by the time this runs,
         so a refund failure must be logged loudly (not silently swallowed)
         rather than raised - there is nothing left to roll back.
+
+        Returns False only when a refund was owed but failed (True when it
+        succeeded or nothing was owed), so a strict caller can surface it.
         """
         if not order_details:
             self.logger.error(
                 f"Cannot refund wallet for cancelled order {order_id}: order details "
                 f"were not found despite the cancel succeeding - manual reconciliation needed"
             )
-            return
+            return False
 
         side = order_details.get("side")
         side_value = side.value if hasattr(side, "value") else str(side)
         if side_value != "BUY":
-            return
+            return True
 
         price = order_details.get("price")
         quantity = order_details.get("quantity")
         if price is None or price <= 0 or quantity is None or quantity <= 0:
-            return
+            return True
 
         symbol = order_details.get("symbol")
         exchange = order_details.get("exchange")
@@ -339,19 +389,21 @@ class OrderService:
             if instrument["contract_type"] == "FUTURES":
                 # Futures BUY was never cash-debited at creation - margin
                 # release above already covers it.
-                return
+                return True
 
             refund_amount = Decimal(str(quantity)) * Decimal(str(price))
             self.wallet_service.creditWalletStandalone(user_id, refund_amount)
             self.logger.info(
                 f"Wallet refunded for cancelled order {order_id}: user={user_id}, amount={refund_amount}"
             )
+            return True
         except Exception as ex:
             self.logger.error(
                 f"Failed to refund wallet of {quantity}*{price} for user {user_id} "
                 f"after cancelling order {order_id} (cancel already succeeded): {str(ex)}",
                 exc_info=True,
             )
+            return False
 
     def modify_order_by_id(self, user_id: int, order_id: int, price: Optional[float] = None,
                             quantity: Optional[int] = None, trigger_price: Optional[float] = None,

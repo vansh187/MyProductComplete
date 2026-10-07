@@ -10,7 +10,7 @@ get_orders: |
   ORDER BY created_at DESC
 
 get_order_by_id: |
-  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, created_at, updated_at
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, source, created_at, updated_at
   FROM orders
   WHERE user_id = %s AND id = %s
 
@@ -33,6 +33,23 @@ get_order_by_id_only: |
   SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, lot_size, token, created_at, updated_at
   FROM orders
   WHERE id = %s
+
+get_order_by_client_order_id: |
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, source, lot_size, token, avg_fill_price, filled_qty, created_at, updated_at
+  FROM orders
+  WHERE user_id = %s AND client_order_id = %s
+  ORDER BY id DESC
+  LIMIT 1
+
+get_unlinked_broker_orders_by_client_order_id: |
+  SELECT id, user_id, symbol, side, quantity, price, status, exchange, order_type, product_type, validity, trigger_price, client_order_id, broker_order_id, source, lot_size, token, created_at, updated_at
+  FROM orders
+  WHERE client_order_id = %s
+    AND source = %s
+    AND broker_order_id IS NULL
+    AND status IN ('PENDING', 'PENDING_TRIGGER')
+  ORDER BY id DESC
+  LIMIT 10
 
 insert_processed_broker_fill: |
   INSERT INTO processed_broker_fills (flid, order_id)

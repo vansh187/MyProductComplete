@@ -14,6 +14,8 @@ from dotenv import load_dotenv, set_key
 
 from marketengine.BrokerHttpClient import BrokerHttpClient
 from marketengine.touchlineFields import TouchlineFieldParser
+from utils.market_hours import IST_OFFSET
+from utils.safe_numbers import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,28 @@ class _ShoonyaApi(_NorenApi):
     def is_ws_connected(self) -> bool:
         return bool(getattr(self, "_NorenApi__websocket_connected", False))
 
+    def post_jdata(self, route: str, values: dict, with_account: bool = True, with_source: bool = True):
+        """
+        Same request the library's own wrappers build (jData payload, OAuth
+        bearer header, the session's uid/actid), but returns the broker's
+        parsed JSON unfiltered. The stock get_positions()/get_order_book()/
+        single_order_history() collapse every non-list reply to None, so "no
+        positions/orders" and "request failed" are indistinguishable there.
+        Goes through the library module's `requests` attribute, i.e. the
+        pooled, timed BrokerHttpClient once installed. Raises on transport or
+        decode errors - callers own the try/except.
+        """
+        config = getattr(self, "_NorenApi__service_config")
+        headers = getattr(self, "_NorenApi__OAuthHeaders", None)
+        payload_values = {"ordersource": "API"} if with_source else {}
+        payload_values["uid"] = getattr(self, "_NorenApi__username", None)
+        if with_account:
+            payload_values["actid"] = getattr(self, "_NorenApi__accountid", None)
+        payload_values.update(values)
+        url = f"{config['host']}{config['routes'][route]}"
+        response = _noren_module.requests.post(url, data="jData=" + json.dumps(payload_values), headers=headers)
+        return response.json()
+
     def _join_instruments(self, instrument) -> str:
         return "#".join(instrument) if isinstance(instrument, (list, tuple, set)) else str(instrument)
 
@@ -109,10 +133,8 @@ class _ShoonyaApi(_NorenApi):
 
 
 def _safe_float(val, default: float = 0.0) -> float:
-    try:
-        return float(val) if val not in (None, "") else default
-    except (TypeError, ValueError):
-        return default
+    """Shared parser (utils.safe_numbers) with this module's 0.0 default."""
+    return safe_float(val, default)
 
 
 SLOW_BROKER_CALL_MS = 1000
@@ -450,7 +472,8 @@ class ShoonyaConnection:
             days: Number of days of history to fetch (default 1 = today)
 
         Returns:
-            List of dicts with keys: timestamp, open, high, low, close, volume
+            List of dicts with keys: timestamp (ISO 8601 IST, e.g.
+            '2026-07-01T09:15:00+05:30'), open, high, low, close, volume
             OR None on failure
         """
         if not self._connected or self._api is None:
@@ -479,13 +502,16 @@ class ShoonyaConnection:
             # returns candles newest-first, but callers expect chronological
             # (oldest-first) order for charting/trimming, so sort by the
             # broker's own timestamp before returning.
+            # The broker's "DD-MM-YYYY HH:MM:SS" is exchange-local (IST) time
+            # with no offset - emitted as ISO 8601 with +05:30 so clients
+            # never have to guess the timezone.
             parsed = []
             for candle in ret:
                 try:
                     raw_time = candle.get("time")
-                    sort_key = datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S")
+                    sort_key = datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=IST_OFFSET)
                     parsed.append((sort_key, {
-                        "timestamp": raw_time,
+                        "timestamp": sort_key.isoformat(),
                         "open":      _safe_float(candle.get("into")),
                         "high":      _safe_float(candle.get("inth")),
                         "low":       _safe_float(candle.get("intl")),
@@ -503,6 +529,75 @@ class ShoonyaConnection:
 
         except Exception as exc:
             logger.warning(f"[Shoonya] get_time_price_series error {exchange}:{token} interval={interval}: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Account data (master account)
+    # ------------------------------------------------------------------
+
+    def _is_no_data_reply(self, reply) -> bool:
+        """Shoonya answers an empty book with {"stat": "Not_Ok", "emsg": "no data"}."""
+        return (
+            isinstance(reply, dict)
+            and reply.get("stat") == "Not_Ok"
+            and "no data" in str(reply.get("emsg", "")).lower()
+        )
+
+    def _post_list(self, label: str, route: str, values: dict, with_account: bool, with_source: bool) -> list[dict] | None:
+        """List-returning broker call: the list, [] for an empty book, None on failure."""
+        if not self._connected or self._api is None:
+            return None
+        try:
+            reply = self._api.post_jdata(route, values, with_account=with_account, with_source=with_source)
+            if isinstance(reply, list):
+                return reply
+            if self._is_no_data_reply(reply):
+                return []
+            logger.warning(f"[Shoonya] {label} failed → {reply}")
+            return None
+        except Exception as exc:
+            logger.warning(f"[Shoonya] {label} error: {exc}")
+            return None
+
+    @_timed_broker_call
+    def get_position_book(self) -> list[dict] | None:
+        """The master account's positions exactly as Shoonya reports them
+        (PositionBook). [] when the account has no positions, None on failure."""
+        # Mirrors NorenApi.get_positions' payload: uid + actid, no ordersource.
+        return self._post_list("get_position_book", "positions", {}, with_account=True, with_source=False)
+
+    @_timed_broker_call
+    def get_order_book(self) -> list[dict] | None:
+        """The master account's order book for the day. [] when empty, None on failure."""
+        return self._post_list("get_order_book", "orderbook", {}, with_account=False, with_source=True)
+
+    @_timed_broker_call
+    def get_order_history(self, broker_order_id: str) -> list[dict] | None:
+        """Status history of one order (SingleOrdHist), latest entry first.
+        [] when the broker has no record of it, None on failure."""
+        if not broker_order_id:
+            return None
+        return self._post_list(
+            "get_order_history", "singleorderhistory", {"norenordno": str(broker_order_id)},
+            with_account=False, with_source=True,
+        )
+
+    @_timed_broker_call
+    def get_span_margin(self, positions: list[dict]) -> dict | None:
+        """SPAN + exposure margin for a hypothetical basket (SpanCalc).
+        positions: [{prd, exch, instname, symname, exd, optt, strprc, buyqty,
+        sellqty, netqty}] with every value a string, as the broker expects.
+        Returns the broker's raw reply (stat Ok or Not_Ok) or None on failure."""
+        if not self._connected or self._api is None or not positions:
+            return None
+        try:
+            reply = self._api.span_calculator(self._account_id, positions)
+            if not isinstance(reply, dict):
+                logger.warning(f"[Shoonya] get_span_margin unexpected reply → {reply}")
+                return None
+            return reply
+        except Exception as exc:
+            logger.warning(f"[Shoonya] get_span_margin error: {exc}")
             return None
 
     # ------------------------------------------------------------------
