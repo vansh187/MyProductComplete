@@ -10,3 +10,7 @@ logs/
 
 # Scrip-master refresh temp files (appconfig/ScripMasterRefresher.py)
 appconfig/*.tmp
+
+# Shoonya auto-login stop state and failure screenshot (marketengine/shoonyaLoginGuard.py)
+.shoonya_login_guard.json
+shoonya_login_failure.png

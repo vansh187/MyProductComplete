@@ -7,6 +7,7 @@ refresh in progress.
 
 import asyncio
 import threading
+from datetime import datetime
 import time
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,8 @@ import pytest
 import api.marketquotes as marketquotes
 import marketengine.ShoonyaConnection as shoonya_conn_module
 from marketengine.ShoonyaConnection import schedule_daily_refresh
+from marketengine.shoonyaLoginGuard import AutoLoginGuard
+from utils.market_hours import IST
 from marketengine.ShoonyaStockFeed import IDLE_TTL_SECS, STALE_TICK_SECS, ShoonyaStockFeed
 from service.stocksService import StocksService as stocks_module
 from service.stocksService.StocksService import StocksService
@@ -282,6 +285,11 @@ class _FakeAppState:
 class _FakeApp:
     def __init__(self):
         self.state = _FakeAppState()
+        # Inside the weekday login window, no state file - independent of
+        # when the tests run.
+        self.state.shoonya_login_guard = AutoLoginGuard(
+            clock=lambda: datetime(2026, 10, 8, 10, 0, tzinfo=IST), enabled=True,
+        )
 
 
 async def _run_refresh_briefly(app, seconds=0.05):
@@ -355,7 +363,7 @@ async def test_refresh_loop_adopts_login_done_by_admin_on_shared_instance():
     app.state.shoonya_connection = shoonya
     app.state.option_feed = None
 
-    with patch.object(shoonya_conn_module, "AUTO_LOGIN_RETRY_DELAY_SECS", 0):
+    with patch.object(shoonya_conn_module, "LOGIN_WAIT_POLL_SECS", 0):
         await _run_refresh_briefly(app)
 
     assert shoonya.auto_login.call_count == 1  # no second, competing login

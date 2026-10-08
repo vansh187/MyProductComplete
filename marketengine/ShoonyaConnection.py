@@ -12,6 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv, set_key
 
+from marketengine import shoonyaLoginGuard as shoonya_login_guard
 from marketengine.BrokerHttpClient import BrokerHttpClient
 from marketengine.touchlineFields import TouchlineFieldParser
 from utils.market_hours import IST_OFFSET
@@ -39,6 +40,8 @@ except (ImportError, AttributeError):
 # to (re)connect. The stock library waits forever.
 WS_SEND_WAIT_SECS = 2.0
 _WS_POLL_SECS = 0.05
+# auto_login waits for a fresh TOTP when the current one has less left.
+TOTP_MIN_REMAINING_SECS = 8
 _TOUCHLINE_FEED = 1   # NorenRestApiPy FeedType.TOUCHLINE
 _SNAPQUOTE_FEED = 2   # NorenRestApiPy FeedType.SNAPQUOTE
 
@@ -205,6 +208,9 @@ class ShoonyaConnection:
         self._api: _ShoonyaApi | None = None
         self._connected = False
         self._touchline_parser = TouchlineFieldParser()
+        # (reason, detail) of the last failed auto_login(); reasons are the
+        # ones marketengine.shoonyaLoginGuard understands.
+        self.last_login_failure: tuple[str, str] | None = None
 
     # ------------------------------------------------------------------
     # OAuth helpers
@@ -612,7 +618,17 @@ class ShoonyaConnection:
         connects — all without any human interaction.
 
         Requires: selenium, webdriver-manager, pyotp (all in requirements.txt)
+
+        Submits the credentials exactly once per call - every failed submit
+        counts towards Shoonya's account lockout. On failure,
+        last_login_failure says why (see shoonyaLoginGuard).
         """
+        self.last_login_failure = None
+
+        def _fail(reason: str, detail: str = "") -> bool:
+            self.last_login_failure = (reason, detail)
+            return False
+
         try:
             import pyotp
             from selenium import webdriver
@@ -620,20 +636,22 @@ class ShoonyaConnection:
             from selenium.webdriver.common.keys import Keys
             from selenium.webdriver.support.ui import WebDriverWait
             from selenium.webdriver.support import expected_conditions as EC
-            from selenium.common.exceptions import WebDriverException, StaleElementReferenceException
             from urllib.parse import urlparse, parse_qs
             from webdriver_manager.chrome import ChromeDriverManager
             from webdriver_manager.core.driver_cache import DriverCacheManager
             from selenium.webdriver.chrome.service import Service
         except ImportError as e:
             logger.warning(f"[Shoonya] auto_login dependency missing: {e}")
-            return False
+            return _fail("dependency_missing", str(e))
 
+        # Re-read so a password fixed in .env is used without a restart.
         load_dotenv(dotenv_path=_ENV_FILE, override=True)
+        self._user_id = os.getenv("SHOONYA_USER_ID", self._user_id)
+        self._password = os.getenv("SHOONYA_PASSWORD", self._password)
         totp_secret = os.getenv("SHOONYA_TOTP_SECRET", "")
         if not totp_secret:
             logger.warning("[Shoonya] SHOONYA_TOTP_SECRET not set — cannot auto_login")
-            return False
+            return _fail("totp_secret_missing")
 
         logger.info(f"[Shoonya] auto_login starting (pid={os.getpid()})")
 
@@ -667,11 +685,27 @@ class ShoonyaConnection:
             )
         except Exception as exc:
             logger.warning(f"[Shoonya] auto_login: could not start Chrome — {exc}")
-            return False
+            return _fail("browser_unavailable", str(exc))
 
         wait = WebDriverWait(driver, 30)
         auth_code = None
         last_url  = login_url
+        page_error: str | None = None
+        page_text = ""
+        # Only a submitted form reaches Shoonya's failed-login count.
+        submitted = False
+        # Lines the login form shows before submitting (e.g. an "unlock
+        # account" link) are not an answer to this submit.
+        form_lines: set[str] = set()
+
+        def _visible_text() -> str:
+            try:
+                return driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                return ""
+
+        def _new_text(text: str) -> str:
+            return "\n".join(line for line in text.splitlines() if line.strip() not in form_lines)
 
         try:
             driver.get(login_url)
@@ -681,8 +715,22 @@ class ShoonyaConnection:
             all_inputs     = driver.find_elements(By.CSS_SELECTOR, "input:not([type='hidden'])")
             visible_inputs = [i for i in all_inputs if i.is_displayed()]
 
-            def _fill(el, val):
-                el.click(); time.sleep(0.1); el.clear(); el.send_keys(val); time.sleep(0.1)
+            def _normalised(value) -> str:
+                # Pages may upper-case ids or space out codes as you type.
+                return "".join(str(value or "").split()).upper()
+
+            def _fill(el, val, label):
+                # clear() alone does not empty React-controlled inputs (a
+                # browser-autofilled or stale code would be prefixed to the
+                # new one), so select-all + delete first, then verify.
+                for _ in range(2):
+                    el.click(); time.sleep(0.1)
+                    el.send_keys(Keys.CONTROL, "a"); el.send_keys(Keys.DELETE); el.clear()
+                    el.send_keys(val); time.sleep(0.1)
+                    if _normalised(el.get_attribute("value")) == _normalised(val):
+                        return
+                # Not submitted yet, so this costs no failed login.
+                raise RuntimeError(f"[Shoonya] login form: {label} field did not take the typed value")
 
             if len(visible_inputs) < 3:
                 raise RuntimeError(
@@ -690,12 +738,21 @@ class ShoonyaConnection:
                     f"URL: {driver.current_url}"
                 )
 
-            totp_val = pyotp.TOTP(totp_secret).now()
-            _fill(visible_inputs[0], self._user_id)
-            _fill(visible_inputs[1], self._password)
-            _fill(visible_inputs[2], totp_val)
+            form_lines = {line.strip() for line in _visible_text().splitlines() if line.strip()}
+            _fill(visible_inputs[0], self._user_id, "user id")
+            _fill(visible_inputs[1], self._password, "password")
+
+            # A new code for every attempt, generated just before typing it.
+            # One about to rotate could expire in transit and fail the login,
+            # so wait for the next one rather than re-submitting later.
+            totp = pyotp.TOTP(totp_secret)
+            remaining = totp.interval - (time.time() % totp.interval)
+            if remaining < TOTP_MIN_REMAINING_SECS:
+                time.sleep(remaining + 0.5)
+            _fill(visible_inputs[2], totp.now(), "TOTP")
 
             # Submit via Enter key (avoids fragile button DOM iteration)
+            submitted = True
             visible_inputs[2].send_keys(Keys.RETURN)
 
             logger.info("[Shoonya] Credentials submitted, waiting for auth code...")
@@ -731,18 +788,12 @@ class ShoonyaConnection:
                 if auth_code:
                     break
 
-                # Re-submit if TOTP rotated before page responded
-                new_totp = pyotp.TOTP(totp_secret).now()
-                if new_totp != totp_val:
-                    try:
-                        all_inputs     = driver.find_elements(By.CSS_SELECTOR, "input:not([type='hidden'])")
-                        visible_now    = [i for i in all_inputs if i.is_displayed()]
-                        if len(visible_now) >= 3:
-                            _fill(visible_now[2], new_totp)
-                            visible_now[2].send_keys(Keys.RETURN)
-                        totp_val = new_totp
-                    except (StaleElementReferenceException, Exception):
-                        pass
+                # Shoonya's own rejection (blocked, wrong password, bad TOTP)
+                # will not change by waiting - stop now, never re-submit.
+                page_text = _visible_text()
+                page_error = shoonya_login_guard.classify_login_page(_new_text(page_text))
+                if page_error:
+                    break
 
                 time.sleep(0.5)
 
@@ -751,6 +802,9 @@ class ShoonyaConnection:
         finally:
             if not auth_code:
                 try:
+                    page_text = page_text or _visible_text()
+                    page_error = page_error or shoonya_login_guard.classify_login_page(_new_text(page_text))
+                    logger.warning(f"[Shoonya] auto_login failure diagnostics — page text: {' '.join(page_text.split())[:300]!r}")
                     logger.warning(f"[Shoonya] auto_login failure diagnostics — last URL: {last_url}")
                     logger.warning(f"[Shoonya] auto_login failure diagnostics — page title: {driver.title!r}")
                     screenshot_path = str(_ENV_FILE.parent / "shoonya_login_failure.png")
@@ -764,15 +818,24 @@ class ShoonyaConnection:
                 pass
 
         if not auth_code:
+            detail = " ".join(page_text.split())[:300]
+            if page_error:
+                logger.error(f"[Shoonya] auto_login rejected by Shoonya ({page_error}): {detail!r}")
+                return _fail(page_error, detail)
+            if not submitted:
+                logger.warning("[Shoonya] auto_login: login form never submitted (page not ready)")
+                return _fail("login_page_unavailable", detail)
             logger.warning("[Shoonya] auto_login: could not capture auth code")
-            return False
+            return _fail("no_auth_code", detail)
 
         logger.info(f"[Shoonya] Auth code captured, exchanging for token...")
         token = self.exchange_code(auth_code)
         if not token:
-            return False
+            return _fail("token_exchange_failed")
 
-        return self.connect_with_token(token)
+        if not self.connect_with_token(token):
+            return _fail("session_verify_failed")
+        return True
 
     def invalidate(self) -> None:
         """Marks the session as disconnected (e.g. right before a forced refresh),
@@ -799,7 +862,25 @@ def _next_refresh_delay() -> float:
     return (candidate - now).total_seconds()
 
 
-AUTO_LOGIN_RETRY_DELAY_SECS = 300
+# How often a disconnected refresh loop re-checks for a manual (admin) login
+# while the login guard keeps it from trying itself.
+LOGIN_WAIT_POLL_SECS = 60
+
+
+def _login_failure_of(shoonya) -> tuple[str, str]:
+    failure = getattr(shoonya, "last_login_failure", None)
+    if isinstance(failure, tuple) and len(failure) == 2 and isinstance(failure[0], str):
+        return failure[0], str(failure[1] or "")
+    return "unknown", ""
+
+
+def _login_wait_note(guard) -> str:
+    if guard.halted_reason == shoonya_login_guard.DISABLED_BY_CONFIG:
+        return "auto-login disabled (SHOONYA_AUTO_LOGIN=off); log in via /admin/shoonya/auth-url"
+    if guard.halted_reason:
+        return (f"auto-login stopped ({guard.halted_reason}); log in via /admin/shoonya/auth-url "
+                f"or POST /admin/shoonya/auto-login/resume")
+    return f"next auto-login attempt at {guard.next_attempt_at().strftime('%Y-%m-%d %H:%M IST')}"
 
 
 def get_or_create_connection(app) -> "ShoonyaConnection":
@@ -839,16 +920,21 @@ async def schedule_daily_refresh(app):
     """
     Background task that keeps the Shoonya session alive.
 
-    - If not currently connected (startup connect/auto_login failed, or a
-      previous scheduled refresh failed), retries auto_login() every
-      RETRY_DELAY seconds until it succeeds. This prevents a single
-      transient failure (Chrome crash, TOTP timing, etc.) from causing an
-      all-day outage — previously a failed 8:30 AM refresh wasn't retried
-      until the next weekday's 8:30 AM slot.
+    - The only place that runs the unattended login. While disconnected it
+      asks the login guard (marketengine/shoonyaLoginGuard.py) when an
+      attempt may start: weekday login window, growing waits after
+      failures, a daily cap, and a full stop when Shoonya rejects the
+      account itself. Unlimited 5-minute retries once got the account
+      blocked overnight.
+    - While waiting it re-checks the shared connection every
+      LOGIN_WAIT_POLL_SECS, so a manual admin login is adopted at once.
     - Once connected, sleeps until the next weekday 8:30 AM IST (Shoonya
       invalidates the previous session around market pre-open), marks the
-      session disconnected, and forces a fresh auto_login().
+      session disconnected, and logs in again through the same guard.
     """
+    guard = shoonya_login_guard.get_login_guard(app)
+    last_wait_note = None
+
     async def _auto_login(shoonya) -> bool:
         loop = asyncio.get_running_loop()
         try:
@@ -868,17 +954,39 @@ async def schedule_daily_refresh(app):
         shoonya = get_or_create_connection(app)
 
         while not shoonya.is_connected:
-            logger.warning(f"[Shoonya] Disconnected — attempting auto-login... (pid={os.getpid()})")
+            wait = guard.seconds_until_allowed()
+            if wait is None or wait > 0:
+                note = _login_wait_note(guard)
+                if note != last_wait_note:
+                    logger.warning(f"[Shoonya] Disconnected — {note}")
+                    last_wait_note = note
+                await asyncio.sleep(LOGIN_WAIT_POLL_SECS if wait is None else min(wait, LOGIN_WAIT_POLL_SECS))
+                # An admin OAuth login may have connected the shared
+                # instance meanwhile - adopt it instead of starting a
+                # competing Selenium login on the same account.
+                shoonya = get_or_create_connection(app)
+                continue
+
+            last_wait_note = None
+            guard.start_attempt()
+            logger.warning(f"[Shoonya] Disconnected — attempting auto-login "
+                           f"({guard.status()['attempts_today']}/{shoonya_login_guard.MAX_ATTEMPTS_PER_DAY} today, pid={os.getpid()})")
             if await _auto_login(shoonya):
                 logger.info(f"[Shoonya] Reconnected at {datetime.now(IST).strftime('%H:%M IST')}")
                 break
-            logger.warning(f"[Shoonya] Auto-login failed — retrying in {AUTO_LOGIN_RETRY_DELAY_SECS // 60} min")
-            await asyncio.sleep(AUTO_LOGIN_RETRY_DELAY_SECS)
-            # Re-resolve after every wait: an admin OAuth login may have
-            # connected the shared instance meanwhile - adopt it instead of
-            # starting a competing Selenium login on the same account.
+            reason, detail = _login_failure_of(shoonya)
+            guard.record_failure(reason, detail)
+            if guard.halted_reason:
+                logger.error(f"[Shoonya] Auto-login stopped: the account cannot log in ({reason}). "
+                             f"Fix the account/.env, then log in via /admin/shoonya/auth-url or "
+                             f"POST /admin/shoonya/auto-login/resume")
+            else:
+                logger.warning(f"[Shoonya] Auto-login failed ({reason}) — next attempt at "
+                               f"{guard.next_attempt_at().strftime('%Y-%m-%d %H:%M IST')}")
             shoonya = get_or_create_connection(app)
 
+        guard.record_success()
+        last_wait_note = None
         if getattr(app.state, "shoonya", None) is not shoonya:
             app.state.shoonya = shoonya
 
@@ -891,10 +999,5 @@ async def schedule_daily_refresh(app):
 
         # Shoonya invalidates sessions around this time — mark disconnected
         # immediately so endpoints correctly 503 (instead of silently using
-        # a dead token) until the refresh below completes or the retry loop
-        # above picks it back up.
+        # a dead token); the guarded loop above logs in again.
         shoonya.invalidate()
-        if await _auto_login(shoonya):
-            logger.info(f"[Shoonya] Scheduled auto-refresh succeeded at {datetime.now(IST).strftime('%H:%M IST')}")
-        else:
-            logger.warning("[Shoonya] Scheduled auto-refresh failed — entering retry mode")

@@ -9,20 +9,34 @@ No real broker/DB/network calls - every external boundary is mocked.
 
 import asyncio
 import re
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from appconfig import OptionMaster
+from appconfig import OptionMaster, ScripMasterRefresher
+from appconfig.ScripMasterRefresher import IST_OFFSET
 from service.optionChain.OptionChainCache import OptionChainCache
 from service.optionChain.OptionChainService import OptionChainService
 from service.spanMargin.SpanMarginService import SpanMarginService
 from utils.auth_dependency import get_current_user
 
 IST_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+05:30$")
+
+
+class _FrozenDatetime(datetime):
+    """The fixture master is built 2026-10-04; pin the wall clock to that
+    morning so expiry/staleness results don't drift as real dates pass."""
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 10, 4, 10, 0, tzinfo=IST_OFFSET).astimezone(tz) if tz else cls(2026, 10, 4, 10, 0)
+
+
+@pytest.fixture(autouse=True)
+def frozen_clock(monkeypatch):
+    monkeypatch.setattr(ScripMasterRefresher, "datetime", _FrozenDatetime)
 
 
 def _weekly_master():

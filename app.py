@@ -115,7 +115,7 @@ except Exception as _shoonya_import_err:
 
 lifespan_logger = logging.getLogger("lifespan")
 
-# Broker session-establishment calls (shoonya.connect/auto_login,
+# Broker session-establishment calls (shoonya.connect,
 # breeze.generate_session) are synchronous SDK calls with no built-in
 # timeout - an unresponsive broker endpoint during startup would otherwise
 # block the app from ever finishing lifespan and accepting requests
@@ -124,7 +124,6 @@ lifespan_logger = logging.getLogger("lifespan")
 # every other broker REST call in this codebase already is (see
 # service/optionChain/OptionChainService.py, api/marketquotes.py).
 SHOONYA_CONNECT_TIMEOUT_SECS = 15.0
-SHOONYA_AUTO_LOGIN_TIMEOUT_SECS = 90.0  # Chrome-automation OAuth flow - genuinely slower than a plain API call
 BREEZE_SESSION_TIMEOUT_SECS = 15.0
 
 # How long to wait before restarting a crashed background refresh loop -
@@ -372,24 +371,18 @@ async def lifespan(app: FastAPI):
             if connected:
                 app.state.shoonya = shoonya
             else:
-                app_logger.warning("Shoonya stored token invalid — attempting auto-login...")
-                ok = await asyncio.wait_for(
-                    loop.run_in_executor(None, shoonya.auto_login),
-                    timeout=SHOONYA_AUTO_LOGIN_TIMEOUT_SECS
-                )
-                if ok:
-                    app.state.shoonya = shoonya
-                else:
-                    app_logger.warning("Shoonya auto-login failed — will keep retrying in the background")
+                # No login here: a restart at any hour used to start one, and
+                # failed logins count towards Shoonya's account lockout. The
+                # refresh loop below logs in under the login guard's limits.
+                app_logger.warning("Shoonya stored token invalid — the refresh loop will auto-login within the allowed window")
         except asyncio.TimeoutError:
-            app_logger.warning("Shoonya connect/auto-login timed out during startup — will keep retrying in the background")
+            app_logger.warning("Shoonya connect timed out during startup — the refresh loop will log in")
         except Exception as e:
             app_logger.error(f"Shoonya init error: {e}")
 
         # Always start the refresh loop, even if the connection attempt
-        # above failed or raised — it will retry auto_login on a short
-        # interval instead of leaving the app permanently disconnected
-        # until a manual restart or the next scheduled 8:30 AM slot.
+        # above failed or raised — it owns every unattended login (see
+        # marketengine/shoonyaLoginGuard.py for when it may try).
         shoonya_refresh_task = asyncio.create_task(
             _supervised_background_task(shoonya_daily_refresh, "shoonya_refresh", app)
         )

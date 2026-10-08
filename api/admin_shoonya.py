@@ -4,6 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
+from marketengine.shoonyaLoginGuard import get_login_guard
 from utils.market_hours import IST_OFFSET
 from utils.auth_dependency import get_current_user, require_admin
 
@@ -59,9 +60,26 @@ async def exchange_code(body: CodeExchangeRequest, request: Request, current_use
         raise HTTPException(status_code=400, detail="Token obtained but connection verification failed — token may be invalid.")
 
     request.app.state.shoonya = shoonya
+    get_login_guard(request.app).record_success()
     activate_market_feeds(request.app)
     logger.info("[admin_shoonya] Shoonya connected via admin OAuth flow")
     return {"status": "connected", "message": "Shoonya connected and token saved to .env."}
+
+
+@router.post("/auto-login/resume")
+async def resume_auto_login(request: Request, current_user=Depends(get_current_user)):
+    """
+    Restarts unattended logins after they stopped because Shoonya rejected
+    the account (blocked, wrong/expired password, bad TOTP). Call only after
+    fixing that - unblocking the account or updating SHOONYA_PASSWORD /
+    SHOONYA_TOTP_SECRET in .env (re-read on the next attempt). The next
+    attempt still waits for the weekday login window.
+    """
+    guard = get_login_guard(request.app)
+    if not guard.resume():
+        raise HTTPException(status_code=409, detail="Auto-login is disabled by SHOONYA_AUTO_LOGIN=off in .env")
+    logger.info(f"[admin_shoonya] auto-login resumed by user {current_user.get('user_id')}")
+    return {"status": "resumed", "auto_login": guard.status()}
 
 
 POSITION_BOOK_TIMEOUT_SECS = 5.0
@@ -105,10 +123,12 @@ async def get_master_positions(request: Request, current_user=Depends(get_curren
 
 
 @router.get("/status")
-def get_status(request: Request, current_user=Depends(get_current_user)):
-    """Returns current Shoonya connection status."""
+async def get_status(request: Request, current_user=Depends(get_current_user)):
+    """Current Shoonya connection, plus whether unattended login is allowed,
+    when it next tries, and why it last failed or stopped."""
     shoonya = getattr(request.app.state, "shoonya", None)
     return {
         "connected": shoonya.is_connected if shoonya else False,
         "has_token": bool(getattr(shoonya, "_session_token", "")) if shoonya else False,
+        "auto_login": get_login_guard(request.app).status(),
     }

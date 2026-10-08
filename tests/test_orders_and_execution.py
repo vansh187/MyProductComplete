@@ -166,22 +166,25 @@ class TestAppStartup:
     ordinary HTTP requests are fast and unaffected by that duration.
     """
 
-    def test_auto_login_runs_on_a_worker_thread_not_the_main_thread(self):
-        """The actual blocking bootstrap work (auto_login) must execute off
-        the calling thread — proving the app relies on a background
-        executor thread rather than running broker I/O inline."""
+    def test_connect_runs_on_a_worker_thread_and_startup_never_logs_in(self):
+        """The blocking bootstrap work (connect) must execute off the calling
+        thread, and a failed stored-token connect must NOT start a login at
+        startup - only the guarded refresh loop may, so a restart at night
+        cannot run failed logins towards Shoonya's account lockout."""
         import app as app_module
 
         main_thread_id = threading.get_ident()
         seen_thread_id = {}
+        auto_login_called = MagicMock()
 
         class FakeShoonya:
             def connect(self):
-                return False  # forces the auto_login fallback path
-
-            def auto_login(self):
                 seen_thread_id["id"] = threading.get_ident()
                 time.sleep(0.05)
+                return False  # stored token invalid
+
+            def auto_login(self):
+                auto_login_called()
                 return True
 
         with patch.object(app_module, "ShoonyaConnection", FakeShoonya), \
@@ -194,9 +197,11 @@ class TestAppStartup:
             with TestClient(app_module.app) as client:
                 resp = client.get("/")
                 assert resp.status_code == 200
+                assert app_module.app.state.shoonya is None
 
         assert seen_thread_id.get("id") is not None
         assert seen_thread_id["id"] != main_thread_id
+        auto_login_called.assert_not_called()
 
     def test_http_requests_stay_fast_regardless_of_bootstrap_duration(self):
         """Once the app has started, a plain HTTP request must return in
@@ -207,10 +212,10 @@ class TestAppStartup:
 
         class SlowShoonya:
             def connect(self):
+                time.sleep(0.3)  # simulated slow token verification
                 return False
 
             def auto_login(self):
-                time.sleep(0.3)  # simulated Chrome-automation bootstrap cost
                 return True
 
         with patch.object(app_module, "ShoonyaConnection", SlowShoonya), \
@@ -222,7 +227,7 @@ class TestAppStartup:
 
             with TestClient(app_module.app) as client:
                 # Startup (the `with` statement above) already paid the 0.3s
-                # auto_login cost. The request itself must be fast.
+                # connect cost. The request itself must be fast.
                 start = time.perf_counter()
                 resp = client.get("/")
                 elapsed = time.perf_counter() - start

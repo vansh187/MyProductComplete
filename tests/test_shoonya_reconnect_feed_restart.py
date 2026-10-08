@@ -1,4 +1,4 @@
-"""
+﻿"""
 Regression tests: marketengine.ShoonyaConnection.schedule_daily_refresh() must
 restart the option-chain WebSocket feed after every successful reconnect,
 since ShoonyaConnection.connect() builds a brand new NorenApi instance each
@@ -8,11 +8,14 @@ keep working fine.
 """
 
 import asyncio
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from marketengine.ShoonyaConnection import schedule_daily_refresh
+from marketengine.shoonyaLoginGuard import AutoLoginGuard
+from utils.market_hours import IST
 
 
 class _FakeAppState:
@@ -22,6 +25,11 @@ class _FakeAppState:
 class _FakeApp:
     def __init__(self):
         self.state = _FakeAppState()
+        # Inside the weekday login window, no state file - independent of
+        # when the tests run.
+        self.state.shoonya_login_guard = AutoLoginGuard(
+            clock=lambda: datetime(2026, 10, 8, 10, 0, tzinfo=IST), enabled=True,
+        )
 
 
 async def _run_one_reconnect_cycle(app):
