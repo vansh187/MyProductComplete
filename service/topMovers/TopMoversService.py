@@ -70,10 +70,19 @@ class TopMoversFetcher:
                 missing.append(stock)
         if rest_used is not None:
             rest_used.extend(stock["symbol"] for stock in missing)
-        valid = from_ticks + (await self._fetch_rest(shoonya, missing) if missing else [])
+        valid = from_ticks + (await self._fetch_rest(shoonya, missing, tick_source) if missing else [])
         return self._rank(valid, is_open)
 
-    async def _fetch_rest(self, shoonya, stocks: list[dict]) -> list[dict]:
+    def _remember_close(self, tick_source, stock: dict, quote: dict) -> None:
+        """A tick lacking only the previous close is complete from now on."""
+        remember_close = getattr(tick_source, "remember_close", None)
+        if callable(remember_close):
+            try:
+                remember_close(f"{stock['exchange']}|{stock['token']}", quote.get("prev_close"))
+            except Exception as exc:
+                logger.debug(f"[TopMovers] remember_close failed for {stock.get('symbol')}: {exc}")
+
+    async def _fetch_rest(self, shoonya, stocks: list[dict], tick_source=None) -> list[dict]:
         if shoonya is None:
             return []
         loop = asyncio.get_running_loop()
@@ -91,6 +100,7 @@ class TopMoversFetcher:
                 if quote is None:
                     logger.warning(f"[TopMovers] No data for {stock['symbol']} ({stock['token']})")
                     return None
+                self._remember_close(tick_source, stock, quote)
                 return {
                     "symbol":     stock["symbol"],
                     "name":       stock["name"],

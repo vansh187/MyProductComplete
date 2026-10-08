@@ -397,7 +397,21 @@ async def _resolve_index_quote(idx: dict, shoonya, breeze, stock_feed, trading_d
             return quote, "shoonya"
     if rest_used is not None:
         rest_used.append(idx["stock_code"])
-    return await _fetch_index_quote(idx, shoonya, breeze, trading_day, loop)
+    quote, source = await _fetch_index_quote(idx, shoonya, breeze, trading_day, loop)
+    if quote is not None and source == "shoonya":
+        # The tick may only lack the previous close: remember it so the next
+        # read is served from the tick instead of REST again.
+        _remember_close(stock_feed, f"{idx['shoonya_exchange']}|{idx['shoonya_token']}", quote.get("prev_close"))
+    return quote, source
+
+
+def _remember_close(stock_feed, instrument_key: str, close) -> None:
+    remember_close = getattr(stock_feed, "remember_close", None)
+    if callable(remember_close):
+        try:
+            remember_close(instrument_key, close)
+        except Exception as exc:
+            logger.debug(f"[Indices] remember_close failed for {instrument_key}: {exc}")
 
 
 async def _fetch_indices(shoonya, breeze, stock_feed=None, rest_used: list | None = None) -> tuple[list[dict], list[dict]]:

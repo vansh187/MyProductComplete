@@ -56,6 +56,21 @@ stream `msgs_per_sec(_per_client)`, `bytes_per_sec(_per_client)`,
 Every REST response carries `X-Process-Time` / `Server-Timing` (server time in
 ms; for a stream, the time until it opened).
 
+## Morning check (after 09:15 IST)
+
+1. Tick health, logged in: `GET /api/internal/latency` → `pinned_ticks`.
+   Every index/sector row should show `subscriptions >= 1`, `age_secs` of a
+   few seconds and a close in `close_in_tick` or `known_close`. A row with
+   `has_tick: false` or a large `age_secs` is a token the broker isn't
+   sending; the server re-subscribes such tokens once a minute and logs
+   `[StockFeed] Re-subscribing ...`:
+   `sudo journalctl -u backend.service --since "today 09:00" | grep Re-subscribing`
+2. Index tiles from ticks: `GET /api/market/indices` → every item has an
+   `as_of` (an empty `as_of` means it came from REST).
+3. Run `scripts/perf_check.py` on the server (127.0.0.1) for exact lag:
+   expect `/indices` and `/sectors` p95 < 100 ms and chain first frame
+   < 300 ms once all index ticks are healthy.
+
 ## How the pipeline works
 
 1. **One WebSocket** to Shoonya (`ShoonyaOptionFeed`). Index, sector and the
@@ -76,7 +91,11 @@ ms; for a stream, the time until it opened).
 5. **IV** is recomputed at flush time only for legs whose price changed (all
    legs at most once a second when spot moves), from the bid/ask mid when
    the spread ≤ 20% of mid, else from a price traded today, else `null`.
-6. **Indices / sectors / top movers** are read from the tick cache. The
+6. **Pinned tokens stay complete.** The previous close only arrives in the
+   broker's first full frame, so it is remembered for the day (from that
+   frame or the first REST answer). A pinned token without a fresh tick or
+   a previous close for 60 s during market hours is re-subscribed.
+7. **Indices / sectors / top movers** are read from the tick cache. The
    indices stream checks every 250 ms and sends only when a value changed;
    sectors every 1 s; top movers rebuild every 5 s. When a value has to come
    from REST (feed not up yet), the next rebuild waits 5–300 s so the

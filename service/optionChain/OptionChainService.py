@@ -183,10 +183,18 @@ class OptionChainService:
             self._seed_from_rest(shoonya, cache, strike_chain, exchange), name=f"chain-seed-{key}"
         )
         self._seed_tasks[key] = seed_task
-        seed_task.add_done_callback(lambda _task, seed_key=key: self._seed_tasks.pop(seed_key, None))
+        seed_task.add_done_callback(lambda task, seed_key=key: self._forget_seed_task(seed_key, task))
         await asyncio.wait({seed_task}, timeout=SEED_WAIT_SECS)
 
         return cache, None
+
+    def _forget_seed_task(self, key: str, task: asyncio.Task) -> None:
+        """Done-callback: drop only this task's entry. The chain may have been
+        released and re-created under the same key before this callback
+        runs; removing that newer task's entry would leave it uncancellable
+        on the next release, seeding an evicted cache."""
+        if self._seed_tasks.get(key) is task:
+            del self._seed_tasks[key]
 
     def _subscribe_feed(self, tokens: set[str]) -> None:
         if self._feed is None:

@@ -70,12 +70,21 @@ class SectorPerformanceFetcher:
         missing = [sector for sector in self._registry.sectors() if sector["sector"] not in from_ticks]
         if rest_used is not None:
             rest_used.extend(sector["sector"] for sector in missing)
-        rest_results, errors = await self._fetch_rest(shoonya, missing)
+        rest_results, errors = await self._fetch_rest(shoonya, missing, tick_source)
         by_sector = {**from_ticks, **{result["sector"]: result for result in rest_results}}
         ordered = [by_sector[sector["sector"]] for sector in self._registry.sectors() if sector["sector"] in by_sector]
         return ordered, errors
 
-    async def _fetch_rest(self, shoonya, sectors: list[dict]) -> tuple[list[dict], list[dict]]:
+    def _remember_close(self, tick_source, sector: dict, quote: dict) -> None:
+        """A tick lacking only the previous close is complete from now on."""
+        remember_close = getattr(tick_source, "remember_close", None)
+        if callable(remember_close):
+            try:
+                remember_close(f"{sector['exchange']}|{sector['token']}", quote.get("prev_close"))
+            except Exception as exc:
+                logger.debug(f"[SectorPerf] remember_close failed for {sector['sector']}: {exc}")
+
+    async def _fetch_rest(self, shoonya, sectors: list[dict], tick_source=None) -> tuple[list[dict], list[dict]]:
         loop = asyncio.get_running_loop()
 
         async def _fetch_one(sector: dict) -> tuple[dict | None, dict | None]:
@@ -91,6 +100,7 @@ class SectorPerformanceFetcher:
                 if quote is None:
                     logger.warning(f"[SectorPerf] No data for {sector['sector']} ({sector['token']})")
                     return None, {"sector": sector["sector"], "reason": "no_data"}
+                self._remember_close(tick_source, sector, quote)
                 return {
                     "sector":     sector["sector"],
                     "change_pct": quote["change_pct"],

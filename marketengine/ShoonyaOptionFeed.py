@@ -256,6 +256,23 @@ class ShoonyaOptionFeed:
         except Exception as exc:
             logger.warning(f"[OptionFeed] ensure_subscribed failed: {exc}")
 
+    def resubscribe(self, tokens: set[str]) -> None:
+        """Re-sends a subscribe frame for tokens that are still in use (ref
+        count > 0), so the broker replies with a fresh full first frame -
+        used to recover a token that went quiet or whose first frame was
+        missed. Never blocks and never raises."""
+        try:
+            with self._lock:
+                live = [token for token in tokens if self._subscribed_tokens.get(token, 0) > 0]
+            if live:
+                self._queue_frame("subscribe", live)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] resubscribe failed: {exc}")
+
+    def subscribed_count(self, token: str) -> int:
+        with self._lock:
+            return self._subscribed_tokens.get(token, 0)
+
     def release(self, tokens: set[str]) -> None:
         """Decrements ref-counts; unsubscribes tokens that drop to zero.
         Never blocks and never raises (see ensure_subscribed)."""

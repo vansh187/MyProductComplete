@@ -51,6 +51,11 @@ IDLE_TTL_SECS = 90.0
 # silence while the market is open means the socket died without a close.
 STALE_TICK_SECS = 120.0
 EVICTION_SWEEP_INTERVAL_SECS = 30.0
+# A pinned token (index / sector / watchlist tile) without a fresh tick, or
+# without the previous close, for this long while the market is open is
+# re-subscribed: the broker then resends its full first frame (previous
+# close included). At most once per token per this interval.
+PIN_HEAL_AFTER_SECS = 60.0
 
 
 class ShoonyaStockFeed:
@@ -71,6 +76,11 @@ class ShoonyaStockFeed:
         self._active_tokens: set[str] = set()
         self._pinned_tokens: set[str] = set()
         self._last_access: dict[str, float] = {}
+        # Previous close per token for today: "close" only arrives in the
+        # broker's first (full) frame after subscribing, so a missed first
+        # frame would otherwise force REST for that token all day.
+        self._known_close: dict[str, tuple[str, float]] = {}
+        self._last_heal_at: dict[str, float] = {}
         self._lock = threading.Lock()
         self._shared_feed.on_raw_tick(self.ingest_raw_tick)
 
@@ -124,11 +134,94 @@ class ShoonyaStockFeed:
         with self._lock:
             tick = self._ticks.get(instrument_key)
             received_at = self._received_at.get(instrument_key, 0.0)
+            known_close = self._known_close.get(instrument_key)
         if not tick:
             return None
         if self._is_market_open() and (self._clock() - received_at) > STALE_TICK_SECS:
             return None
-        return dict(tick)
+        tick = dict(tick)
+        if not self._positive(tick.get("close")) and known_close and known_close[0] == self._today():
+            tick["close"] = known_close[1]
+        return tick
+
+    def remember_close(self, instrument_key: str, close) -> None:
+        """Records today's previous-close for a token (e.g. from a REST
+        quote), so later tick reads are complete without another REST call."""
+        value = self._field_parser.safe_float(close)
+        if not instrument_key or not self._positive(value):
+            return
+        with self._lock:
+            self._known_close[instrument_key] = (self._today(), value)
+
+    def _positive(self, value) -> bool:
+        return isinstance(value, (int, float)) and value > 0
+
+    def _today(self) -> str:
+        return datetime.now(IST_OFFSET).date().isoformat()
+
+    def tick_health(self, instrument_keys) -> list[dict]:
+        """Per token: is it pinned and subscribed, does it have a tick, how
+        old, and is the previous close known - for /api/internal/latency."""
+        now = self._clock()
+        subscribed_count = getattr(self._shared_feed, "subscribed_count", None)
+        report = []
+        for key in instrument_keys:
+            with self._lock:
+                tick = dict(self._ticks.get(key) or {})
+                received_at = self._received_at.get(key)
+                known_close = self._known_close.get(key)
+                pinned = key in self._pinned_tokens
+            report.append({
+                "key": key,
+                "pinned": pinned,
+                "subscriptions": subscribed_count(key) if callable(subscribed_count) else None,
+                "has_tick": bool(tick),
+                "age_secs": round(now - received_at, 1) if received_at is not None else None,
+                "ltp": tick.get("ltp"),
+                "close_in_tick": tick.get("close"),
+                "known_close": known_close[1] if known_close and known_close[0] == self._today() else None,
+                "as_of": self.received_at_iso(key),
+            })
+        return report
+
+    def _pinned_needing_resubscribe(self) -> list[str]:
+        """Pinned tokens that, while the market is open, have no fresh tick
+        or no previous close - and were not re-subscribed recently."""
+        if not self._is_market_open():
+            return []
+        now = self._clock()
+        today = self._today()
+        needing = []
+        with self._lock:
+            for key in self._pinned_tokens:
+                if now - self._last_heal_at.get(key, float("-inf")) < PIN_HEAL_AFTER_SECS:
+                    continue
+                tick = self._ticks.get(key)
+                received_at = self._received_at.get(key)
+                known_close = self._known_close.get(key)
+                no_fresh_tick = not tick or received_at is None or (now - received_at) > PIN_HEAL_AFTER_SECS
+                no_close = not (tick and self._positive(tick.get("close"))) and not (known_close and known_close[0] == today)
+                if no_fresh_tick or no_close:
+                    needing.append(key)
+                    self._last_heal_at[key] = now
+        return needing
+
+    def heal_pinned(self) -> list[str]:
+        """Re-subscribes pinned tokens that went quiet or never delivered
+        their first full frame. Returns the keys it re-subscribed."""
+        keys = self._pinned_needing_resubscribe()
+        if not keys:
+            return []
+        resubscribe = getattr(self._shared_feed, "resubscribe", None)
+        if not callable(resubscribe):
+            return []
+        logger.warning(f"[StockFeed] Re-subscribing {len(keys)} pinned tokens without a fresh tick or previous close: "
+                       f"{sorted(keys)[:12]}")
+        try:
+            resubscribe(set(keys))
+        except Exception as exc:
+            logger.warning(f"[StockFeed] re-subscribe failed: {exc}")
+        return keys
 
     def received_at_iso(self, instrument_key: str) -> str | None:
         """When the last tick for 'EXCH|TOKEN' arrived, ISO 8601 IST with ms,
@@ -157,6 +250,10 @@ class ShoonyaStockFeed:
                 self._evict_idle_tokens()
             except Exception as exc:
                 logger.warning(f"[StockFeed] Idle eviction sweep failed: {exc}")
+            try:
+                self.heal_pinned()
+            except Exception as exc:
+                logger.warning(f"[StockFeed] Pinned-token heal failed: {exc}")
 
     def _evict_idle_tokens(self) -> None:
         now = time.monotonic()
@@ -247,6 +344,8 @@ class ShoonyaStockFeed:
             with self._lock:
                 merged = self._ticks.get(instrument_key, {})
                 merged.update(fields)
+                if self._positive(fields.get("close")):
+                    self._known_close[instrument_key] = (self._today(), fields["close"])
                 if depth_delta is not None:
                     depth = merged.get("depth") or self._field_parser.empty_depth()
                     merged["depth"] = self._field_parser.apply_depth_delta(depth, depth_delta)

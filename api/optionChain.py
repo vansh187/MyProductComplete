@@ -110,6 +110,22 @@ async def get_option_chain(
     return _envelope(underlying, expiry, data, errors)
 
 
+def _delta_snapshot_frame(underlying: str, expiry: str | None, data: dict) -> str:
+    """A delta-protocol snapshot ({"t":"s"}) built from a cached chain, for
+    a client that connects while the broker is down: it must still get the
+    last-known chain, as full-format clients do."""
+    rows = [
+        [entry["strike"], (entry.get("ce") or {}).get("token"), (entry.get("pe") or {}).get("token"),
+         entry.get("ce"), entry.get("pe")]
+        for entry in data.get("strikes", [])
+    ]
+    payload = {
+        "t": "s", "seq": 0, "sym": underlying.upper(), "exch": data.get("exchange") or OPTIONS_EXCHANGE.get(underlying.lower(), "NFO"),
+        "exp": expiry, "spot": data.get("spot"), "srv_ts": int(time.time() * 1000), "rows": rows,
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 def _error_frame(fmt: str, underlying: str, expiry: str | None, data: dict | None, errors: list[dict]) -> str:
     """A status frame (connecting / broker down / failure) in the client's
     format. Delta clients keep their last state and just show the status."""
@@ -158,6 +174,8 @@ async def stream_option_chain(
         cached, resolved_expiry = _optionChainService.peek_cached_chain(underlying, expiry)
 
         async def _cached_only_stream():
+            if fmt == FORMAT_DELTA and cached is not None:
+                yield _delta_snapshot_frame(underlying, resolved_expiry, cached)
             yield _error_frame(fmt, underlying, resolved_expiry, cached, [{"reason": "shoonya_disconnected"}])
 
         return StreamingResponse(_cached_only_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
