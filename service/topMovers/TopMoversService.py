@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import logging
 
+from utils.safe_numbers import safe_float
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +30,52 @@ class TopMoversFetcher:
         self._watchlist = watchlist
         self._top_n = top_n
 
-    async def fetch_top_movers(self, shoonya, is_open: bool) -> dict:
+    def _quote_from_tick(self, tick_source, stock: dict) -> dict | None:
+        if tick_source is None:
+            return None
+        try:
+            tick = tick_source.get_tick(f"{stock['exchange']}|{stock['token']}")
+        except Exception as exc:
+            logger.debug(f"[TopMovers] get_tick failed for {stock.get('symbol')}: {exc}")
+            return None
+        if not tick:
+            return None
+        ltp = safe_float(tick.get("ltp"))
+        prev_close = safe_float(tick.get("close"))
+        if not ltp or not prev_close or ltp <= 0 or prev_close <= 0:
+            return None
+        change = round(ltp - prev_close, 2)
+        return {
+            "symbol":     stock["symbol"],
+            "name":       stock["name"],
+            "sector":     stock["sector"],
+            "ltp":        ltp,
+            "change_pct": round(change / prev_close * 100, 2),
+            "change":     change,
+        }
+
+    async def fetch_top_movers(self, shoonya, is_open: bool, tick_source=None,
+                               rest_used: list | None = None) -> dict:
+        """tick_source: anything with get_tick('EXCH|TOKEN') (the stock tick
+        cache, where the watchlist is pinned) - read first, in memory; REST
+        only for stocks without a usable tick. rest_used, when given,
+        collects the symbols that needed REST."""
+        from_ticks = []
+        missing = []
+        for stock in self._watchlist.stocks():
+            quote = self._quote_from_tick(tick_source, stock)
+            if quote is not None:
+                from_ticks.append(quote)
+            else:
+                missing.append(stock)
+        if rest_used is not None:
+            rest_used.extend(stock["symbol"] for stock in missing)
+        valid = from_ticks + (await self._fetch_rest(shoonya, missing) if missing else [])
+        return self._rank(valid, is_open)
+
+    async def _fetch_rest(self, shoonya, stocks: list[dict]) -> list[dict]:
+        if shoonya is None:
+            return []
         loop = asyncio.get_running_loop()
 
         async def _fetch_one(stock: dict) -> dict | None:
@@ -60,7 +107,6 @@ class TopMoversFetcher:
                 return None
 
         # Fetch in batches of 10 to reduce total time while managing load
-        stocks = self._watchlist.stocks()
         valid = []
         failed = []
 
@@ -87,6 +133,9 @@ class TopMoversFetcher:
                 except Exception:
                     pass
 
+        return valid
+
+    def _rank(self, valid: list[dict], is_open: bool) -> dict:
         valid.sort(key=lambda x: x["change_pct"], reverse=True)
         n = self._top_n
         if len(valid) >= 2 * n:

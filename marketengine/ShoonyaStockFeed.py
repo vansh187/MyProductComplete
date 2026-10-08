@@ -38,9 +38,10 @@ import asyncio
 import logging
 import threading
 import time
+from datetime import datetime
 
 from marketengine.touchlineFields import TouchlineFieldParser
-from utils.market_hours import is_market_open
+from utils.market_hours import IST_OFFSET, is_market_open
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class ShoonyaStockFeed:
         self._is_market_open = market_open_fn
         self._ticks: dict[str, dict] = {}
         self._received_at: dict[str, float] = {}
+        # Wall-clock receive time (epoch seconds) for "as of" display; the
+        # monotonic _received_at above is for staleness checks only.
+        self._received_wall: dict[str, float] = {}
         self._active_tokens: set[str] = set()
         self._pinned_tokens: set[str] = set()
         self._last_access: dict[str, float] = {}
@@ -126,6 +130,15 @@ class ShoonyaStockFeed:
             return None
         return dict(tick)
 
+    def received_at_iso(self, instrument_key: str) -> str | None:
+        """When the last tick for 'EXCH|TOKEN' arrived, ISO 8601 IST with ms,
+        or None if none has."""
+        with self._lock:
+            received = self._received_wall.get(instrument_key)
+        if received is None:
+            return None
+        return datetime.fromtimestamp(received, IST_OFFSET).isoformat(timespec="milliseconds")
+
     def _shared_feed_connected(self) -> bool:
         try:
             return bool(getattr(self._shared_feed, "is_connected", True))
@@ -159,6 +172,7 @@ class ShoonyaStockFeed:
                 self._last_access.pop(token, None)
                 self._ticks.pop(token, None)
                 self._received_at.pop(token, None)
+                self._received_wall.pop(token, None)
 
         if stale:
             logger.info(f"[StockFeed] Releasing {len(stale)} idle tokens")
@@ -238,5 +252,6 @@ class ShoonyaStockFeed:
                     merged["depth"] = self._field_parser.apply_depth_delta(depth, depth_delta)
                 self._ticks[instrument_key] = merged
                 self._received_at[instrument_key] = self._clock()
+                self._received_wall[instrument_key] = time.time()
         except Exception as exc:
             logger.warning(f"[StockFeed] Error processing tick {raw}: {exc}")

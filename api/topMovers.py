@@ -23,6 +23,19 @@ _watchlist = StockWatchlist(_CONFIG_PATH)
 _fetcher   = TopMoversFetcher(_watchlist, top_n=5)
 _cache     = TopMoversCache()
 
+TICK_REFRESH_SECS = 5
+REST_REFRESH_SECS = 300
+CLOSED_REFRESH_SECS = 600
+STREAM_CHECK_SECS = 5
+
+
+def _movers_content(data: dict | None) -> tuple | None:
+    """What viewers see, without the always-new last_updated stamp: the cache
+    (and so every stream client) is only updated when this changes."""
+    if data is None:
+        return None
+    return data.get("market_status"), data.get("gainers"), data.get("losers")
+
 
 def _require_shoonya(request: Request):
     shoonya = getattr(request.app.state, "shoonya", None)
@@ -36,13 +49,13 @@ async def get_top_movers(request: Request):
     """
     Returns top 5 gainers and top 5 losers from Nifty 50 stocks.
     Served from in-memory cache — response time < 1ms.
-    Cache is refreshed every 5 minutes by a background task.
+    Cache is rebuilt from live ticks every few seconds by a background task.
     On the very first request (cache empty), data is fetched live.
     """
     data = _cache.get()
     if data is None:
         shoonya = _require_shoonya(request)
-        data = await _fetcher.fetch_top_movers(shoonya, _is_market_open())
+        data = await _fetcher.fetch_top_movers(shoonya, _is_market_open(), getattr(request.app.state, "stock_feed", None))
         await _cache.update(data)
     return data
 
@@ -51,8 +64,8 @@ async def get_top_movers(request: Request):
 async def stream_top_movers(request: Request):
     """
     SSE endpoint — pushes updated top movers data to the frontend
-    every time the background cache refreshes (every 5 minutes during
-    market hours, every 10 minutes after close).
+    every time the background cache refreshes (every few seconds during
+    market hours from live ticks, every 10 minutes after close).
 
     Sends current cached data immediately on connect so the UI
     does not have to make a separate one-shot request.
@@ -77,8 +90,7 @@ async def stream_top_movers(request: Request):
                 last_seen_gen = current_gen
                 yield f"data: {json.dumps(current_data)}\n\n"
 
-            # Check every 30s — fine-grained enough for a 5-min refresh cycle
-            await asyncio.sleep(30)
+            await asyncio.sleep(STREAM_CHECK_SECS)
 
     return StreamingResponse(
         _event_generator(),
@@ -93,24 +105,32 @@ async def stream_top_movers(request: Request):
 async def start_background_refresh(app):
     """
     Background task started from app.py lifespan.
-    Refreshes the top movers cache every 5 minutes when market is open,
-    every 10 minutes when closed (keeps data current across the trading day).
+    Market open: rebuilt from the live tick cache every TICK_REFRESH_SECS
+    (in-memory, no broker calls); if stocks had to come from REST (feed
+    not up yet) the next refresh waits REST_REFRESH_SECS so the broker is
+    never hammered. Market closed: every CLOSED_REFRESH_SECS.
     Initial refresh happens 15 seconds after startup.
     """
     await asyncio.sleep(15)
 
     while True:
         is_open = _is_market_open()
+        rest_used: list[str] = []
         try:
             shoonya = getattr(app.state, "shoonya", None)
             if shoonya and shoonya.is_connected:
-                data = await _fetcher.fetch_top_movers(shoonya, is_open)
-                await _cache.update(data)
-                logger.info(f"[TopMovers] Refreshed — "
-                    f"{len(data.get('gainers', []))} gainers, "
-                    f"{len(data.get('losers', []))} losers, "
-                    f"{data.get('total_tracked', 0)} stocks tracked")
+                data = await _fetcher.fetch_top_movers(
+                    shoonya, is_open, getattr(app.state, "stock_feed", None), rest_used
+                )
+                if _movers_content(data) != _movers_content(_cache.get()):
+                    await _cache.update(data)
+                if rest_used:
+                    logger.info(f"[TopMovers] Refreshed — {data.get('total_tracked', 0)} stocks tracked, "
+                                f"{len(rest_used)} via REST")
         except Exception as exc:
             logger.warning(f"[TopMovers] Refresh error: {exc}")
 
-        await asyncio.sleep(300 if is_open else 600)
+        if not is_open:
+            await asyncio.sleep(CLOSED_REFRESH_SECS)
+        else:
+            await asyncio.sleep(REST_REFRESH_SECS if rest_used else TICK_REFRESH_SECS)

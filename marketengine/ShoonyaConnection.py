@@ -140,6 +140,12 @@ def _safe_float(val, default: float = 0.0) -> float:
     return safe_float(val, default)
 
 
+def _positive_or_none(val) -> float | None:
+    """A price field: the value when it is a real positive price, else None."""
+    price = safe_float(val)
+    return price if price is not None and price > 0 else None
+
+
 SLOW_BROKER_CALL_MS = 1000
 # Child of this module's logger, so LOG_LEVELS=marketengine.ShoonyaConnection=DEBUG
 # enables both the module's own lines and these timings.
@@ -395,10 +401,13 @@ class ShoonyaConnection:
                 logger.warning(f"[Shoonya] get_option_quote failed {exchange}:{token} → {ret}")
                 return None
 
+            # Missing price fields are None, never 0.0: a 0 LTP reads as a
+            # real price (and a UI fallback like `ltp || spot` then shows
+            # the index value in an option row).
             return {
-                "ltp":    _safe_float(ret.get("lp")),
-                "bid":    _safe_float(ret.get("bp1")),
-                "ask":    _safe_float(ret.get("sp1")),
+                "ltp":    _positive_or_none(ret.get("lp")),
+                "bid":    _positive_or_none(ret.get("bp1")),
+                "ask":    _positive_or_none(ret.get("sp1")),
                 "oi":     int(_safe_float(ret.get("oi"))) if ret.get("oi") not in (None, "") else None,
                 "volume": int(_safe_float(ret.get("v"))) if ret.get("v") not in (None, "") else None,
             }

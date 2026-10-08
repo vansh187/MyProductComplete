@@ -32,6 +32,11 @@ OrderUpdateHandler = Callable[[dict], Awaitable[None] | None]
 RawTickHandler = Callable[[dict], None]
 
 
+def _price_or_none(value) -> float | None:
+    price = safe_float(value)
+    return price if price is not None and price > 0 else None
+
+
 def normalize_touchline_tick(raw: dict) -> dict:
     """
     Normalizes a Shoonya touchline tick ('tk' ack or 'tf' update) into our
@@ -41,18 +46,25 @@ def normalize_touchline_tick(raw: dict) -> dict:
     replacing it outright.
     """
     result = {}
+    # Prices of 0 mean "none" (no trade / empty book side): None, never 0.0.
     if "lp" in raw:
-        result["ltp"] = safe_float(raw.get("lp"))
+        result["ltp"] = _price_or_none(raw.get("lp"))
     if "bp1" in raw:
-        result["bid"] = safe_float(raw.get("bp1"))
+        result["bid"] = _price_or_none(raw.get("bp1"))
     if "sp1" in raw:
-        result["ask"] = safe_float(raw.get("sp1"))
+        result["ask"] = _price_or_none(raw.get("sp1"))
     if "v" in raw:
         result["volume"] = safe_int(raw.get("v"))
     if "oi" in raw:
         result["oi"] = safe_int(raw.get("oi"))
     if "poi" in raw:
         result["poi"] = safe_int(raw.get("poi"))
+    # Exchange feed time (epoch seconds) - only alongside real fields, so a
+    # frame that changed nothing we use still dispatches nothing.
+    if result:
+        feed_time = safe_int(raw.get("ft"))
+        if feed_time and feed_time > 0:
+            result["exch_ts"] = feed_time * 1000
     return result
 
 

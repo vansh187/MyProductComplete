@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import logging
 
+from utils.safe_numbers import safe_float
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,14 +18,64 @@ class SectorIndexRegistry:
     def sectors(self) -> list[dict]:
         return self._sectors
 
+    def instrument_keys(self) -> list[str]:
+        """'EXCH|TOKEN' of every sector index, for pinning on the live feed."""
+        return [
+            f"{sector['exchange']}|{sector['token']}"
+            for sector in self._sectors
+            if sector.get("exchange") and sector.get("token")
+        ]
+
 
 class SectorPerformanceFetcher:
-    """Fetches live NSE sector index quotes in parallel via Shoonya."""
+    """Sector index quotes: live WebSocket ticks first (in-memory), REST only
+    for a sector with no usable tick yet."""
 
     def __init__(self, registry: SectorIndexRegistry):
         self._registry = registry
 
-    async def fetch_all(self, shoonya) -> tuple[list[dict], list[dict]]:
+    def _quote_from_tick(self, tick_source, sector: dict) -> dict | None:
+        if tick_source is None:
+            return None
+        try:
+            tick = tick_source.get_tick(f"{sector['exchange']}|{sector['token']}")
+        except Exception as exc:
+            logger.debug(f"[SectorPerf] get_tick failed for {sector['sector']}: {exc}")
+            return None
+        if not tick:
+            return None
+        ltp = safe_float(tick.get("ltp"))
+        prev_close = safe_float(tick.get("close"))
+        if not ltp or not prev_close or ltp <= 0 or prev_close <= 0:
+            return None
+        change = round(ltp - prev_close, 2)
+        return {
+            "sector":     sector["sector"],
+            "change_pct": round(change / prev_close * 100, 2),
+            "change":     change,
+            "ltp":        ltp,
+        }
+
+    async def fetch_all(self, shoonya, tick_source=None, rest_used: list | None = None) -> tuple[list[dict], list[dict]]:
+        """tick_source: anything with get_tick('EXCH|TOKEN') (the stock tick
+        cache). rest_used, when given, collects the sectors that needed REST."""
+        from_ticks = {}
+        for sector in self._registry.sectors():
+            quote = self._quote_from_tick(tick_source, sector)
+            if quote is not None:
+                from_ticks[sector["sector"]] = quote
+        if len(from_ticks) == len(self._registry.sectors()):
+            return [from_ticks[sector["sector"]] for sector in self._registry.sectors()], []
+
+        missing = [sector for sector in self._registry.sectors() if sector["sector"] not in from_ticks]
+        if rest_used is not None:
+            rest_used.extend(sector["sector"] for sector in missing)
+        rest_results, errors = await self._fetch_rest(shoonya, missing)
+        by_sector = {**from_ticks, **{result["sector"]: result for result in rest_results}}
+        ordered = [by_sector[sector["sector"]] for sector in self._registry.sectors() if sector["sector"] in by_sector]
+        return ordered, errors
+
+    async def _fetch_rest(self, shoonya, sectors: list[dict]) -> tuple[list[dict], list[dict]]:
         loop = asyncio.get_running_loop()
 
         async def _fetch_one(sector: dict) -> tuple[dict | None, dict | None]:
@@ -53,7 +105,6 @@ class SectorPerformanceFetcher:
                 return None, {"sector": sector["sector"], "reason": str(exc)}
 
         # Fetch in batches of 2 to avoid overwhelming Shoonya with 8 concurrent requests
-        sectors = self._registry.sectors()
         results = []
         errors = []
 

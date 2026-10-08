@@ -8,10 +8,13 @@ returns the (data, errors) tuple convention used across this codebase
 import asyncio
 import bisect
 import logging
+import time
 
 from appconfig import OptionMaster
+from service.optionChain.ChainBroadcaster import METRIC_STREAM, ChainBroadcaster, ChainSubscriber
 from service.optionChain.OptionChainCache import OptionChainCache
 from utils.safe_numbers import safe_float
+from utils.streamMetrics import stream_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,10 @@ OPTIONS_EXCHANGE = {
 # subscriptions bounded (avoids the exchange's undocumented subscription cap).
 STRIKES_EACH_SIDE = 20
 SEED_BATCH_SIZE = 10
+# How long a new chain waits for its REST seed before answering; the rest of
+# the seed keeps filling in the background and reaches clients as deltas,
+# so one slow quote can't hold back the first screen.
+SEED_WAIT_SECS = 1.5
 
 
 class OptionChainService:
@@ -63,6 +70,13 @@ class OptionChainService:
         # second concurrent viewer of the same chain silently loses live
         # updates the moment the first viewer disconnects.
         self._refcounts: dict[str, int] = {}
+        self._broadcasters: dict[str, ChainBroadcaster] = {}
+        self._seed_tasks: dict[str, asyncio.Task] = {}
+        # Index tick -> chains of that underlying, so spot (and the IV that
+        # depends on it) stays live instead of frozen at connect time.
+        self._spot_key_to_underlying = {
+            f"{exch}|{token}": underlying.upper() for underlying, (exch, token) in UNDERLYING_SPOT_TOKENS.items()
+        }
         # Anything with get_tick('EXCH|TOKEN') -> {"ltp": ...} | None (the
         # ShoonyaStockFeed tick cache, where index tokens are pinned).
         self._spot_source = None
@@ -83,15 +97,34 @@ class OptionChainService:
         return f"{underlying.upper()}:{expiry}"
 
     async def _route_tick(self, instrument_key: str, tick_fields: dict) -> None:
+        underlying = self._spot_key_to_underlying.get(instrument_key)
+        if underlying is not None:
+            self._apply_spot(underlying, tick_fields.get("ltp"))
+            return
+
+        cache_keys = self._token_to_cache_keys.get(instrument_key)
+        if not cache_keys:
+            return
+        exch_ts = tick_fields.get("exch_ts")
+        if exch_ts:
+            stream_metrics.record_exch_to_recv(METRIC_STREAM, time.time() * 1000.0 - exch_ts)
         # tuple() snapshot: a concurrent _release may mutate the set while
         # apply_tick awaits its condition lock.
-        for key in tuple(self._token_to_cache_keys.get(instrument_key, ())):
+        for key in tuple(cache_keys):
             cache = self._caches.get(key)
             if cache is not None:
                 try:
                     await cache.apply_tick(instrument_key, tick_fields)
                 except Exception as e:
                     logger.warning(f"[OptionChainService] tick for {instrument_key} not applied: {e}")
+
+    def _apply_spot(self, underlying: str, ltp) -> None:
+        spot = safe_float(ltp)
+        if spot is None or spot <= 0:
+            return
+        for cache in self._caches.values():
+            if cache.underlying == underlying:
+                cache.set_spot(spot)
 
     def list_expiries(self, underlying: str) -> list[str]:
         """Still-tradable expiries (YYYY-MM-DD, ascending) from the scrip master."""
@@ -146,7 +179,12 @@ class OptionChainService:
 
         self._subscribe_feed(cache.tokens())
 
-        await self._seed_from_rest(shoonya, cache, strike_chain, exchange)
+        seed_task = asyncio.get_running_loop().create_task(
+            self._seed_from_rest(shoonya, cache, strike_chain, exchange), name=f"chain-seed-{key}"
+        )
+        self._seed_tasks[key] = seed_task
+        seed_task.add_done_callback(lambda _task, seed_key=key: self._seed_tasks.pop(seed_key, None))
+        await asyncio.wait({seed_task}, timeout=SEED_WAIT_SECS)
 
         return cache, None
 
@@ -207,6 +245,12 @@ class OptionChainService:
             return
 
         self._refcounts.pop(key, None)
+        broadcaster = self._broadcasters.pop(key, None)
+        if broadcaster is not None:
+            broadcaster.stop()
+        seed_task = self._seed_tasks.pop(key, None)
+        if seed_task is not None:
+            seed_task.cancel()
         cache = self._caches.pop(key, None)
         if cache is None:
             return
@@ -227,6 +271,30 @@ class OptionChainService:
             self._feed.release(tokens)
         except Exception as e:
             logger.warning(f"[OptionChainService] feed release failed: {e}")
+
+    def subscribe_stream(self, underlying: str, expiry: str, fmt: str) -> ChainSubscriber | None:
+        """Adds a live SSE client to the chain's broadcaster (created on the
+        first client). The chain must already be held via
+        get_cache_for_stream(); None if it is not cached."""
+        key = self._cache_key(underlying, expiry)
+        cache = self._caches.get(key)
+        if cache is None:
+            return None
+        broadcaster = self._broadcasters.get(key)
+        if broadcaster is None:
+            broadcaster = ChainBroadcaster(cache)
+            self._broadcasters[key] = broadcaster
+        return broadcaster.subscribe(fmt)
+
+    def unsubscribe_stream(self, underlying: str, expiry: str, subscriber: ChainSubscriber) -> None:
+        broadcaster = self._broadcasters.get(self._cache_key(underlying, expiry))
+        if broadcaster is not None:
+            broadcaster.unsubscribe(subscriber)
+
+    def resync_stream(self, underlying: str, expiry: str, subscriber: ChainSubscriber) -> None:
+        broadcaster = self._broadcasters.get(self._cache_key(underlying, expiry))
+        if broadcaster is not None:
+            broadcaster.resync(subscriber)
 
     async def release_chain(self, underlying: str, expiry: str) -> None:
         """Called when an SSE stream client (that previously called
@@ -359,8 +427,8 @@ class OptionChainService:
         }, resolved_expiry
 
     async def get_cache_for_stream(self, shoonya, underlying: str, expiry: str | None) -> tuple[OptionChainCache | None, str | None, list[dict]]:
-        """Resolution/subscription-trigger only (no synchronous fetch) - the SSE
-        endpoint waits on the returned cache's wait_for_next() directly."""
+        """Resolves and holds the chain for a stream's lifetime (release with
+        release_chain); the stream then reads it through subscribe_stream()."""
         try:
             return await self._get_cache_for_stream(shoonya, underlying, expiry)
         except Exception as e:

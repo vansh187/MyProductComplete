@@ -68,6 +68,8 @@ python-socketio==5.16.3
 pytz==2026.2
 PyYAML==6.0.3
 NorenRestApiOAuth==0.0.38
+# Fast JSON for market-data streams (utils/fastjson.py falls back to the stdlib without it)
+orjson==3.13.0
 pyotp==2.10.0
 selenium>=4.15.0
 webdriver-manager>=4.0.0
@@ -92,6 +94,9 @@ tzdata==2026.2
 tzlocal==5.3.1
 urllib3==2.7.0
 uvicorn==0.49.0
+# Faster event loop for uvicorn on the Linux server (start with --loop uvloop);
+# not available on Windows, where uvicorn uses its default loop.
+uvloop==0.23.0; sys_platform != "win32"
 websocket-client==1.9.0
 websockets==15.0.1
 wsproto==1.3.2

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Regression tests: marketengine.ShoonyaConnection.schedule_daily_refresh() must
 restart the option-chain WebSocket feed after every successful reconnect,
 since ShoonyaConnection.connect() builds a brand new NorenApi instance each

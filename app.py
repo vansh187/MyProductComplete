@@ -19,7 +19,7 @@ setup_logging()
 app_logger = logging.getLogger("app")
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from api.signup import router as signup_router
 from api.login import router as login_router
@@ -35,7 +35,8 @@ from api.AddfundstoWallet import router as razorPayPaymentRouter
 from api.marketquotes import router as marketQuotesRouter, index_instrument_keys
 from api.auth_google import router as googleAuthRouter
 from api.admin_shoonya import router as adminShoonyaRouter
-from api.sectorPerformance import router as sectorPerformanceRouter
+from api.sectorPerformance import router as sectorPerformanceRouter, sector_instrument_keys
+from api.internal import router as internalRouter
 from api.topMovers import router as topMoversRouter, start_background_refresh as top_movers_refresh
 from api.candles import router as candlesRouter
 from api.optionChain import router as optionChainRouter, _optionChainService
@@ -207,7 +208,9 @@ def _create_market_feeds(app: FastAPI) -> bool:
                 "stock_feed_idle_eviction", app,
             )
         )
-        pinned = list(index_instrument_keys())
+        # Index tiles, sector tiles and the explore watchlist are read on
+        # every request: pinned so they are always served from ticks.
+        pinned = list(index_instrument_keys()) + sector_instrument_keys()
         stocks_service = getattr(app.state, "stocks_service", None)
         if stocks_service is not None:
             pinned += stocks_service.watchlist_instrument_keys()
@@ -487,6 +490,7 @@ app.include_router(marginRouter)
 app.include_router(mutualFundsRouter)
 app.include_router(stocksRouter)
 app.include_router(searchRouter)
+app.include_router(internalRouter)
 # SSE (text/event-stream) is excluded from compression by Starlette itself.
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 app.add_middleware(
@@ -504,7 +508,7 @@ latency_logger = logging.getLogger("latency")
 #   journalctl -u backend.service | grep SLOW
 SLOW_REQUEST_THRESHOLD_MS = 1000
 # Uptime-monitor pings; logged at DEBUG so they don't drown real traffic.
-_QUIET_PATHS = {"/"}
+_QUIET_PATHS = {"/", "/healthz"}
 
 
 _REQUEST_ID_RX = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -571,6 +575,7 @@ async def add_latency_tracking(request, call_next):
     duration_ms = (time.perf_counter() - start) * 1000
     response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+    response.headers["X-Process-Time"] = f"{duration_ms:.1f}"
     response.headers["X-Request-ID"] = request_id
 
     stream = " stream" if response.headers.get("content-type", "").startswith("text/event-stream") else ""
@@ -602,3 +607,16 @@ async def add_coop_header(request, call_next):
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"Message": "Finnaly I am able to run my first API"}
+
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+async def healthz(request: Request):
+    """Liveness for uptime checks / systemd watchdogs: 200 while the process
+    serves requests; the market-data fields say whether data is live."""
+    shoonya = getattr(request.app.state, "shoonya", None)
+    feed = getattr(request.app.state, "option_feed", None)
+    return {
+        "status": "ok",
+        "broker_connected": bool(shoonya is not None and shoonya.is_connected),
+        "market_feed_connected": bool(getattr(feed, "is_connected", False)),
+    }

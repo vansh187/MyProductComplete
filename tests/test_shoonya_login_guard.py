@@ -37,11 +37,15 @@ class _Clock:
 
 
 class _SteppingClock:
-    def __init__(self, start, step):
-        self.now, self.step = start, step
+    """Moves `step` forward on every reading, but never past `cap` - so a
+    test can let time pass backoffs without ever reaching tomorrow's window,
+    however fast the loop spins."""
+
+    def __init__(self, start, step, cap):
+        self.now, self.step, self.cap = start, step, cap
 
     def __call__(self):
-        self.now += self.step
+        self.now = min(self.now + self.step, self.cap)
         return self.now
 
 
@@ -280,9 +284,10 @@ async def test_blocked_account_gets_exactly_one_attempt():
 
 @pytest.mark.asyncio
 async def test_failed_submits_pause_the_loop_after_the_daily_limit():
-    # Every clock reading moves 1s forward: past the 5-minute backoff
-    # within a few hundred loop turns, nowhere near tomorrow's window.
-    clock = _SteppingClock(datetime(2026, 10, 8, 10, 0, tzinfo=IST), timedelta(seconds=1))
+    # Every clock reading moves 1s forward (past the 5-minute backoff within
+    # a few hundred loop turns) but stops at 23:00, before tomorrow's window.
+    clock = _SteppingClock(datetime(2026, 10, 8, 10, 0, tzinfo=IST), timedelta(seconds=1),
+                           cap=datetime(2026, 10, 8, 23, 0, tzinfo=IST))
     guard = AutoLoginGuard(clock=clock, enabled=True)
     shoonya = _disconnected_shoonya(("no_auth_code", ""))
     app = _FakeApp(guard)

@@ -3,13 +3,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List
 import asyncio
+import contextlib
 import json
 import math
 import time
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
+from utils.fastjson import json_encoder
 from utils.market_hours import is_market_open
+from utils.streamMetrics import stream_metrics
 import logging
 
 logger = logging.getLogger(__name__)
@@ -368,11 +371,22 @@ def _index_quote_from_tick(stock_feed, idx: dict) -> dict | None:
         "prev_close": prev_close,
         "change":     change,
         "change_pct": round(change / prev_close * 100, 2),
-        "as_of":      tick.get("last_trade_time"),
+        "as_of":      _tick_received_iso(stock_feed, f"{idx['shoonya_exchange']}|{idx['shoonya_token']}"),
     }
 
 
-async def _resolve_index_quote(idx: dict, shoonya, breeze, stock_feed, trading_day: str, loop):
+def _tick_received_iso(stock_feed, instrument_key: str) -> str | None:
+    received_at_iso = getattr(stock_feed, "received_at_iso", None)
+    if not callable(received_at_iso):
+        return None
+    try:
+        return received_at_iso(instrument_key)
+    except Exception:
+        return None
+
+
+async def _resolve_index_quote(idx: dict, shoonya, breeze, stock_feed, trading_day: str, loop,
+                               rest_used: list | None = None):
     # Ticks only count as live Shoonya data while the session is connected
     # (get_tick itself also refuses dead-socket / stale ticks); otherwise the
     # original Breeze -> closed-market-cache fallback chain applies unchanged.
@@ -381,20 +395,22 @@ async def _resolve_index_quote(idx: dict, shoonya, breeze, stock_feed, trading_d
         if quote is not None:
             _LAST_PRICE_CACHE[idx["stock_code"]] = {"quote": quote, "source": "shoonya"}
             return quote, "shoonya"
+    if rest_used is not None:
+        rest_used.append(idx["stock_code"])
     return await _fetch_index_quote(idx, shoonya, breeze, trading_day, loop)
 
 
-async def _fetch_indices(shoonya, breeze, stock_feed=None) -> tuple[list[dict], list[dict]]:
+async def _fetch_indices(shoonya, breeze, stock_feed=None, rest_used: list | None = None) -> tuple[list[dict], list[dict]]:
     """Fetch ALL indices: WebSocket tick cache first, then in parallel REST
     with per-call timeouts (Shoonya 10s, Breeze 2s) for any index without a
-    usable tick."""
+    usable tick. rest_used, when given, collects the indices that needed REST."""
     trading_day = _last_trading_day()
     loop        = asyncio.get_running_loop()
     results     = []
     errors      = []
 
     tasks = [
-        _resolve_index_quote(idx, shoonya, breeze, stock_feed, trading_day, loop)
+        _resolve_index_quote(idx, shoonya, breeze, stock_feed, trading_day, loop, rest_used)
         for idx in _ALL_INDICES
     ]
 
@@ -435,23 +451,48 @@ async def _fetch_indices(shoonya, breeze, stock_feed=None) -> tuple[list[dict], 
 # Single-flight snapshot shared by /indices, /indices/stream (every connected
 # client) and /marquee - without it each SSE client polled the broker itself,
 # so N open tabs meant N x 6 REST calls every 5 seconds on the shared pool.
-_INDICES_SNAPSHOT_TTL_SECS = 1.0
-_indices_snapshot: dict = {"at": 0.0, "data": None}
+# Served from ticks it is an in-memory read, so it may be rebuilt often; once
+# any index needed REST the next rebuild waits longer, so a dead feed can't
+# turn the 250 ms stream cadence into a broker-REST hammer.
+_INDICES_TICK_TTL_SECS = 0.2
+_INDICES_REST_TTL_SECS = 5.0
+_indices_snapshot: dict = {"at": 0.0, "data": None, "ttl": _INDICES_TICK_TTL_SECS}
 _indices_snapshot_lock = asyncio.Lock()
+
+# The indices stream checks for changes this often while the market is open
+# (pushes only when a value changed), and less often when it's closed.
+INDICES_STREAM_INTERVAL_SECS = 0.25
+INDICES_STREAM_CLOSED_INTERVAL_SECS = 5.0
+INDICES_KEEP_ALIVE_SECS = 15.0
+
+
+def _indices_snapshot_fresh() -> bool:
+    return (
+        _indices_snapshot["data"] is not None
+        and (time.monotonic() - _indices_snapshot["at"]) < _indices_snapshot["ttl"]
+    )
 
 
 async def _get_indices_snapshot(shoonya, breeze, stock_feed) -> tuple[list[dict], list[dict]]:
-    cached = _indices_snapshot["data"]
-    if cached is not None and (time.monotonic() - _indices_snapshot["at"]) < _INDICES_SNAPSHOT_TTL_SECS:
-        return cached
+    if _indices_snapshot_fresh():
+        return _indices_snapshot["data"]
     async with _indices_snapshot_lock:
-        cached = _indices_snapshot["data"]
-        if cached is not None and (time.monotonic() - _indices_snapshot["at"]) < _INDICES_SNAPSHOT_TTL_SECS:
-            return cached
-        data = await _fetch_indices(shoonya, breeze, stock_feed)
+        if _indices_snapshot_fresh():
+            return _indices_snapshot["data"]
+        rest_used: list[str] = []
+        data = await _fetch_indices(shoonya, breeze, stock_feed, rest_used)
         _indices_snapshot["data"] = data
         _indices_snapshot["at"] = time.monotonic()
+        _indices_snapshot["ttl"] = _INDICES_REST_TTL_SECS if rest_used else _INDICES_TICK_TTL_SECS
         return data
+
+
+def _indices_values_key(indices: list[dict]) -> tuple:
+    """What a viewer sees; a new frame is sent only when this changes."""
+    return tuple(
+        (item.get("stock_code"), item.get("value"), item.get("change"), item.get("change_pct"))
+        for item in indices
+    )
 
 
 def _normalize_index(item: dict) -> dict:
@@ -499,8 +540,10 @@ async def stream_market_indices(request: Request):
     """
     SSE endpoint — pushes live Nifty 50, Sensex, Bank Nifty, India VIX,
     Fin Nifty, and Midcap Nifty to the frontend automatically.
-      - Market open:   every 10 seconds
-      - Market closed: every 60 seconds (keeps connection alive)
+      - First frame immediately on connect.
+      - Market open: a new frame within ~250 ms of any index value changing
+        (served from live ticks, never more than one frame per 250 ms).
+      - Nothing changed: an SSE comment every 15 s keeps the connection open.
 
     Frontend:
         const es = new EventSource('/api/market/indices/stream');
@@ -509,6 +552,18 @@ async def stream_market_indices(request: Request):
         };
     """
     async def _event_generator():
+        stream_metrics.subscriber_added("indices")
+        try:
+            async with contextlib.aclosing(_indices_frames()) as frames:
+                async for frame in frames:
+                    yield frame
+        finally:
+            stream_metrics.subscriber_removed("indices")
+
+    async def _indices_frames():
+        loop = asyncio.get_running_loop()
+        last_key = None
+        last_write = loop.time()
         while True:
             if await request.is_disconnected():
                 break
@@ -519,6 +574,8 @@ async def stream_market_indices(request: Request):
             breeze  = getattr(request.app.state, "breeze",  None)
             if shoonya is None and breeze is None:
                 yield f"data: {json.dumps({'market_status': 'open' if is_open else 'closed', 'indices': [], 'errors': [{'reason': 'market_data_unavailable'}], 'last_updated': datetime.now(timezone.utc).isoformat()})}\n\n"
+                last_key = None
+                last_write = loop.time()
                 await asyncio.sleep(30)
                 continue
 
@@ -526,17 +583,26 @@ async def stream_market_indices(request: Request):
                 indices, errors = await _get_indices_snapshot(
                     shoonya, breeze, getattr(request.app.state, "stock_feed", None)
                 )
-                payload = json.dumps({
-                    "market_status": "open" if is_open else "closed",
-                    "indices":       indices,
-                    "errors":        errors,
-                    "last_updated":  datetime.now(timezone.utc).isoformat(),
-                })
-                yield f"data: {payload}\n\n"
+                values_key = (is_open, _indices_values_key(indices), len(errors))
+                if values_key != last_key:
+                    last_key = values_key
+                    frame = json_encoder.sse_data({
+                        "market_status": "open" if is_open else "closed",
+                        "indices":       indices,
+                        "errors":        errors,
+                        "last_updated":  datetime.now(timezone.utc).isoformat(),
+                        "srv_ts":        int(time.time() * 1000),
+                    })
+                    stream_metrics.record_send("indices", len(frame))
+                    last_write = loop.time()
+                    yield frame
+                elif loop.time() - last_write >= INDICES_KEEP_ALIVE_SECS:
+                    last_write = loop.time()
+                    yield ": keep-alive\n\n"
             except Exception as exc:
                 logger.warning(f"[SSE/indices] Error: {exc}")
 
-            await asyncio.sleep(5 if is_open else 60)
+            await asyncio.sleep(INDICES_STREAM_INTERVAL_SECS if is_open else INDICES_STREAM_CLOSED_INTERVAL_SECS)
 
     return StreamingResponse(
         _event_generator(),
