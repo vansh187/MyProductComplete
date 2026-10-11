@@ -14,3 +14,10 @@ appconfig/*.tmp
 # Shoonya auto-login stop state and failure screenshot (marketengine/shoonyaLoginGuard.py)
 .shoonya_login_guard.json
 shoonya_login_failure.png
+
+# Market data recorder output (data/market/DD-MM-YYYY/...) - never committed; uploaded to Drive
+data/
+# Google Drive OAuth secrets
+secrets/
+client_secret*.json
+drive_token*.json

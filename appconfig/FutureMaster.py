@@ -95,6 +95,12 @@ def get_expiries(underlying: str) -> list[str]:
     return expiries if isinstance(expiries, list) else []
 
 
+def get_contract(underlying: str, expiry: str) -> dict | None:
+    """{token, tsym, lot_size} of one futures contract, or None. A copy."""
+    info = _contracts_for(underlying).get(expiry) if isinstance(expiry, str) and expiry != "expiries" else None
+    return dict(info) if isinstance(info, dict) else None
+
+
 def nearest_expiry(underlying: str, today: date | None = None, now: datetime | None = None) -> str | None:
     """Earliest still-tradable expiry, or None if none is left - same
     expiry-day close rule as OptionMaster (ScripMasterRefresher.upcoming_expiry_dates)."""

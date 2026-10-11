@@ -42,8 +42,7 @@ WS_SEND_WAIT_SECS = 2.0
 _WS_POLL_SECS = 0.05
 # auto_login waits for a fresh TOTP when the current one has less left.
 TOTP_MIN_REMAINING_SECS = 8
-_TOUCHLINE_FEED = 1   # NorenRestApiPy FeedType.TOUCHLINE
-_SNAPQUOTE_FEED = 2   # NorenRestApiPy FeedType.SNAPQUOTE
+from marketengine.feedTypes import DEPTH_FEED as _SNAPQUOTE_FEED, TOUCHLINE_FEED as _TOUCHLINE_FEED  # noqa: E402
 
 
 class _ShoonyaApi(_NorenApi):
@@ -500,16 +499,10 @@ class ShoonyaConnection:
         try:
             starttime = time.time() - (days * 86400)
 
-            ret = self._api.get_time_price_series(
-                exchange=exchange,
-                token=token,
-                starttime=starttime,
-                interval=interval,
-            )
+            ret = self._fetch_tpseries(exchange, token, starttime, None, interval)
 
-            # NorenApi returns a plain list of candle dicts on success, or a
-            # dict (e.g. {"stat": "Not_Ok", "emsg": ...}) on failure.
-            if not ret or not isinstance(ret, list):
+            # None = request failed; [] = no candles. Either way nothing to chart.
+            if not ret:
                 logger.warning(f"[Shoonya] get_time_price_series failed {exchange}:{token} interval={interval} → {ret}")
                 return None
 
@@ -545,6 +538,43 @@ class ShoonyaConnection:
         except Exception as exc:
             logger.warning(f"[Shoonya] get_time_price_series error {exchange}:{token} interval={interval}: {exc}")
             return None
+
+    @_timed_broker_call
+    def get_raw_time_price_series(self, exchange: str, token: str, starttime: float, endtime: float,
+                                  interval: str = "1") -> list[dict] | None:
+        """
+        Shoonya TPSeries candles exactly as the broker returns them (fields
+        time, into, inth, intl, intc, intvwap, intv, v, oi, intoi, ...), for
+        the market data recorder, which keeps every field. starttime/endtime
+        are epoch seconds. [] when the broker has no candles; None on failure
+        or when not connected. Never raises.
+        """
+        if not self._connected or self._api is None:
+            return None
+        try:
+            return self._fetch_tpseries(exchange, token, starttime, endtime, interval)
+        except Exception as exc:
+            logger.warning(f"[Shoonya] get_raw_time_price_series error {exchange}:{token}: {exc}")
+            return None
+
+    def _fetch_tpseries(self, exchange: str, token: str, starttime: float, endtime: float | None,
+                        interval: str) -> list[dict] | None:
+        """The one TPSeries round trip both public candle methods use (they
+        carry the timing decorator; this doesn't, so each call is timed once).
+        NorenApi returns a list of candles on success, or a dict (e.g.
+        {"stat": "Not_Ok", "emsg": ...}) on failure - except "no data", which
+        means no candles ([]). Raises on transport errors; callers catch."""
+        kwargs = {"exchange": exchange, "token": token, "starttime": starttime, "interval": interval}
+        if endtime is not None:
+            kwargs["endtime"] = endtime
+        ret = self._api.get_time_price_series(**kwargs)
+        if isinstance(ret, list):
+            return ret
+        if isinstance(ret, dict) and "no data" in str(ret.get("emsg", "")).lower():
+            return []
+        if ret is not None:
+            logger.warning(f"[Shoonya] TPSeries failed {exchange}:{token} → {ret}")
+        return None
 
     # ------------------------------------------------------------------
     # Account data (master account)

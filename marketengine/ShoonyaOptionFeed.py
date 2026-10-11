@@ -20,6 +20,7 @@ import threading
 from typing import Awaitable, Callable
 
 from marketengine.WsSubscriptionSender import WsSubscriptionSender
+from marketengine.feedTypes import DEPTH_FEED, DEPTH_FRAME_TYPES as _DEPTH_FRAME_TYPES, TOUCHLINE_FEED
 from utils.safe_numbers import safe_float, safe_int
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,9 @@ class ShoonyaOptionFeed:
         self._raw_tick_handlers: list[RawTickHandler] = []
         self._order_update_handlers: list[OrderUpdateHandler] = []
         self._subscribed_tokens: dict[str, int] = {}  # "EXCH|TOKEN" -> ref count
+        # Same ref-counting for the depth feed, which Shoonya tracks
+        # separately from touchline (a token can be on both).
+        self._depth_tokens: dict[str, int] = {}
         self._lock = threading.Lock()
         self._reconnecting = False
         # True only between _on_open and the next close/error/restart, so
@@ -114,7 +118,8 @@ class ShoonyaOptionFeed:
         For consumers that need fields _on_tick's own normalize_touchline_tick
         doesn't forward (e.g. equity OHLC/full depth for the stocks feature -
         see marketengine/ShoonyaStockFeed.py) rather than duplicating a second
-        WebSocket connection. Called synchronously on NorenApi's WS thread,
+        WebSocket connection. Receives touchline (tk/tf) AND depth (dk/df)
+        frames - consumers filter on raw["t"]. Called synchronously on NorenApi's WS thread,
         so handlers must be fast and must never raise (this call site catches
         and logs, but a slow handler would still stall every other consumer's
         ticks)."""
@@ -238,89 +243,140 @@ class ShoonyaOptionFeed:
         if thread.is_alive():
             logger.warning("[OptionFeed] Old WS thread did not exit within timeout")
 
+    # -- ref-counted subscriptions (touchline and depth share one implementation)
+
+    def _counts_for(self, feed_type: int) -> dict[str, int]:
+        return self._depth_tokens if feed_type == DEPTH_FEED else self._subscribed_tokens
+
+    def _acquire(self, tokens: set[str], feed_type: int, label: str) -> None:
+        """Increments ref-counts; queues a subscribe frame for tokens that go
+        from 0 to 1. Never blocks and never raises."""
+        try:
+            counts = self._counts_for(feed_type)
+            new_tokens = []
+            with self._lock:
+                for token in tokens:
+                    count = counts.get(token, 0)
+                    if count == 0:
+                        new_tokens.append(token)
+                    counts[token] = count + 1
+            if new_tokens:
+                self._queue_frame("subscribe", new_tokens, feed_type)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] {label} failed: {exc}")
+
+    def _release_tokens(self, tokens: set[str], feed_type: int, label: str) -> None:
+        """Decrements ref-counts; queues an unsubscribe frame for tokens that
+        drop to zero. Never blocks and never raises."""
+        try:
+            counts = self._counts_for(feed_type)
+            to_unsubscribe = []
+            with self._lock:
+                for token in tokens:
+                    count = counts.get(token, 0)
+                    if count <= 1:
+                        counts.pop(token, None)
+                        to_unsubscribe.append(token)
+                    else:
+                        counts[token] = count - 1
+            if to_unsubscribe:
+                self._queue_frame("unsubscribe", to_unsubscribe, feed_type)
+                if feed_type == DEPTH_FEED:
+                    # In case the broker's depth unsubscribe ('ud') also drops the
+                    # token's touchline stream: re-send touchline for tokens still
+                    # in use (queued after the 'ud', and a no-op for the rest).
+                    self.resubscribe(set(to_unsubscribe))
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] {label} failed: {exc}")
+
+    def _count(self, token: str, feed_type: int) -> int:
+        try:
+            with self._lock:
+                return self._counts_for(feed_type).get(token, 0)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] subscription count failed for {token}: {exc}")
+            return 0
+
     def ensure_subscribed(self, tokens: set[str]) -> None:
         """tokens: set of 'EXCH|TOKEN' strings. Subscribes only genuinely-new
         tokens. Never blocks and never raises: the ref-count is updated here
         and the frame is queued for the sender thread. If the socket is not
         open, nothing is sent - _on_open subscribes every ref-counted token."""
-        try:
-            new_tokens = []
-            with self._lock:
-                for token in tokens:
-                    count = self._subscribed_tokens.get(token, 0)
-                    if count == 0:
-                        new_tokens.append(token)
-                    self._subscribed_tokens[token] = count + 1
-            if new_tokens:
-                self._queue_frame("subscribe", new_tokens)
-        except Exception as exc:
-            logger.warning(f"[OptionFeed] ensure_subscribed failed: {exc}")
+        self._acquire(tokens, TOUCHLINE_FEED, "ensure_subscribed")
 
-    def resubscribe(self, tokens: set[str]) -> None:
+    def resubscribe(self, tokens: set[str], feed_type: int = TOUCHLINE_FEED) -> None:
         """Re-sends a subscribe frame for tokens that are still in use (ref
         count > 0), so the broker replies with a fresh full first frame -
         used to recover a token that went quiet or whose first frame was
-        missed. Never blocks and never raises."""
+        missed, or to give a new consumer of an already-subscribed token its
+        full snapshot. Never blocks and never raises."""
         try:
+            counts = self._counts_for(feed_type)
             with self._lock:
-                live = [token for token in tokens if self._subscribed_tokens.get(token, 0) > 0]
+                live = [token for token in tokens if counts.get(token, 0) > 0]
             if live:
-                self._queue_frame("subscribe", live)
+                self._queue_frame("subscribe", live, feed_type)
         except Exception as exc:
             logger.warning(f"[OptionFeed] resubscribe failed: {exc}")
 
     def subscribed_count(self, token: str) -> int:
-        with self._lock:
-            return self._subscribed_tokens.get(token, 0)
+        return self._count(token, TOUCHLINE_FEED)
 
     def release(self, tokens: set[str]) -> None:
         """Decrements ref-counts; unsubscribes tokens that drop to zero.
         Never blocks and never raises (see ensure_subscribed)."""
+        self._release_tokens(tokens, TOUCHLINE_FEED, "release")
+
+    def ensure_depth_subscribed(self, tokens: set[str]) -> None:
+        """Depth-feed (5-level book, dk/df frames) counterpart of ensure_subscribed."""
+        self._acquire(tokens, DEPTH_FEED, "ensure_depth_subscribed")
+
+    def release_depth(self, tokens: set[str]) -> None:
+        """Depth-feed counterpart of release."""
+        self._release_tokens(tokens, DEPTH_FEED, "release_depth")
+
+    def depth_subscribed_count(self, token: str) -> int:
+        return self._count(token, DEPTH_FEED)
+
+    def _queue_frame(self, action: str, tokens: list[str], feed_type: int = TOUCHLINE_FEED) -> None:
         try:
-            to_unsubscribe = []
-            with self._lock:
-                for token in tokens:
-                    count = self._subscribed_tokens.get(token, 0)
-                    if count <= 1:
-                        self._subscribed_tokens.pop(token, None)
-                        to_unsubscribe.append(token)
-                    else:
-                        self._subscribed_tokens[token] = count - 1
-            if to_unsubscribe:
-                self._queue_frame("unsubscribe", to_unsubscribe)
+            if not self._socket_open:
+                logger.debug("[OptionFeed] Socket not open - %s of %d tokens deferred to next connect", action, len(tokens))
+                return
+            label = f"{action} {len(tokens)} {'depth ' if feed_type == DEPTH_FEED else ''}tokens"
+            if self._sender.submit(label, lambda: self._send_frame(action, tokens, feed_type)):
+                logger.info(f"[OptionFeed] Queued {label}")
+            else:
+                logger.warning(f"[OptionFeed] Could not queue {label} - applied on next reconnect")
         except Exception as exc:
-            logger.warning(f"[OptionFeed] release failed: {exc}")
+            logger.warning(f"[OptionFeed] Could not queue {action} of {len(tokens)} tokens: {exc}")
 
-    def _queue_frame(self, action: str, tokens: list[str]) -> None:
-        if not self._socket_open:
-            logger.debug("[OptionFeed] Socket not open - %s of %d tokens deferred to next connect", action, len(tokens))
-            return
-        label = f"{action} {len(tokens)} tokens"
-        if self._sender.submit(label, lambda: self._send_frame(action, tokens)):
-            logger.info(f"[OptionFeed] Queued {label}")
-        else:
-            logger.warning(f"[OptionFeed] Could not queue {label} - applied on next reconnect")
-
-    def _send_frame(self, action: str, tokens: list[str]) -> None:
+    def _send_frame(self, action: str, tokens: list[str], feed_type: int = TOUCHLINE_FEED) -> None:
         """Runs on the sender thread. Targets the instance whose socket is
         actually open (never self._shoonya._api, which after a token refresh is
         a newer instance with no socket yet), and re-reads the ref-counts at
         send time so a frame queued before a disconnect cannot resurrect a
         token released while the socket was down."""
-        api = self._api_instance
-        if api is None or not self._socket_open:
-            return
-        with self._lock:
+        try:
+            api = self._api_instance
+            if api is None or not self._socket_open:
+                return
+            counts = self._counts_for(feed_type)
+            with self._lock:
+                if action == "subscribe":
+                    live = [t for t in tokens if counts.get(t, 0) > 0]
+                else:
+                    live = [t for t in tokens if counts.get(t, 0) == 0]
+            if not live:
+                return
+            # Touchline frames keep the library's default feed type (no kwarg).
+            kwargs = {"feed_type": feed_type} if feed_type != TOUCHLINE_FEED else {}
             if action == "subscribe":
-                live = [t for t in tokens if self._subscribed_tokens.get(t, 0) > 0]
+                api.subscribe(live, **kwargs)
             else:
-                live = [t for t in tokens if self._subscribed_tokens.get(t, 0) == 0]
-        if not live:
-            return
-        if action == "subscribe":
-            api.subscribe(live)
-        else:
-            api.unsubscribe(live)
+                api.unsubscribe(live, **kwargs)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] {action} frame for {len(tokens)} tokens failed: {exc}")
 
     def close(self) -> None:
         """Closes the instance the socket was actually opened on, not whatever
@@ -339,6 +395,15 @@ class ShoonyaOptionFeed:
     def _on_tick(self, raw: dict) -> None:
         try:
             msg_type = raw.get("t")
+            if msg_type in _DEPTH_FRAME_TYPES:
+                # Depth frames only go to raw consumers (the market data
+                # recorder) - and also to the touchline consumers below when
+                # the product watches this token on touchline, so it never
+                # goes quiet for them if the broker sends its updates as depth
+                # frames (lp/bp1/sp1/v/oi share their names across both feeds).
+                self._dispatch_raw(raw)
+                self._dispatch_depth_to_touchline(raw)
+                return
             if msg_type not in ("tk", "tf"):
                 return
 
@@ -354,29 +419,51 @@ class ShoonyaOptionFeed:
             # ticks from being dispatched, so each is isolated in its own
             # try/except and none of them can block on the asyncio loop (they
             # run inline on this WS thread, not scheduled onto it).
-            for raw_handler in self._raw_tick_handlers:
-                try:
-                    raw_handler(raw)
-                except Exception as exc:
-                    logger.warning(f"[OptionFeed] raw_tick handler failed: {exc}")
-
-            tick = normalize_touchline_tick(raw)
-            if not tick or not self._tick_handlers or self._async_loop is None:
-                return
-
-            for handler in self._tick_handlers:
-                result = handler(instrument_key, tick)
-                if inspect.isawaitable(result):
-                    future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
-                    # run_coroutine_threadsafe schedules `result` as a detached
-                    # Task - nothing ever calls .result() on the returned Future,
-                    # so an exception raised inside tick processing (e.g. a bad
-                    # expiry date, a KeyError) would otherwise vanish silently:
-                    # that option leg would simply stop updating with no log,
-                    # metric, or alert anywhere. This surfaces it.
-                    future.add_done_callback(self._log_tick_task_exception)
+            self._dispatch_raw(raw)
+            self._dispatch_ticks(instrument_key, raw)
         except Exception as e:
             logger.warning(f"[OptionFeed] Error processing tick {raw}: {e}")
+
+    def _dispatch_ticks(self, instrument_key: str, raw: dict) -> None:
+        """Normalized touchline fields to every on_tick handler. A handler
+        raising propagates to the caller's try (unchanged behaviour)."""
+        tick = normalize_touchline_tick(raw)
+        if not tick or not self._tick_handlers or self._async_loop is None:
+            return
+
+        for handler in self._tick_handlers:
+            result = handler(instrument_key, tick)
+            if inspect.isawaitable(result):
+                future = asyncio.run_coroutine_threadsafe(result, self._async_loop)
+                # run_coroutine_threadsafe schedules `result` as a detached
+                # Task - nothing ever calls .result() on the returned Future,
+                # so an exception raised inside tick processing (e.g. a bad
+                # expiry date, a KeyError) would otherwise vanish silently:
+                # that option leg would simply stop updating with no log,
+                # metric, or alert anywhere. This surfaces it.
+                future.add_done_callback(self._log_tick_task_exception)
+
+    def _dispatch_depth_to_touchline(self, raw: dict) -> None:
+        """Depth frame of a token that is also touchline-subscribed -> the
+        touchline consumers too. One dict lookup per depth frame (only the
+        recorder's few depth tokens send them), so the live path stays fast."""
+        try:
+            exch, token = raw.get("e"), raw.get("tk")
+            if not exch or not token:
+                return
+            instrument_key = f"{exch}|{token}"
+            # dict.get is atomic in CPython - no lock on the WS thread.
+            if self._subscribed_tokens.get(instrument_key, 0) > 0:
+                self._dispatch_ticks(instrument_key, raw)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] Depth frame to touchline consumers failed: {exc}")
+
+    def _dispatch_raw(self, raw: dict) -> None:
+        for raw_handler in self._raw_tick_handlers:
+            try:
+                raw_handler(raw)
+            except Exception as exc:
+                logger.warning(f"[OptionFeed] raw_tick handler failed: {exc}")
 
     def _log_tick_task_exception(self, future: "asyncio.Future") -> None:
         try:
@@ -432,6 +519,16 @@ class ShoonyaOptionFeed:
                 api.subscribe(tokens)
         except Exception as exc:
             logger.warning(f"[OptionFeed] Resubscribe after connect failed: {exc}")
+        try:
+            # Separate try: a failed touchline resubscribe must not leave depth unsubscribed.
+            api = self._api_instance
+            with self._lock:
+                depth_tokens = list(self._depth_tokens.keys())
+            if depth_tokens and api is not None:
+                logger.info(f"[OptionFeed] Resubscribing {len(depth_tokens)} depth tokens after (re)connect")
+                api.subscribe(depth_tokens, feed_type=DEPTH_FEED)
+        except Exception as exc:
+            logger.warning(f"[OptionFeed] Depth resubscribe after connect failed: {exc}")
 
     def _on_close(self, *args) -> None:
         logger.warning("[OptionFeed] WebSocket closed - scheduling reconnect")

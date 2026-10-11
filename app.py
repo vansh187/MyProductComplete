@@ -51,6 +51,9 @@ from api.stocks import router as stocksRouter
 from api.search import router as searchRouter
 from appconfig.StockSymbolMaster import StockSymbolMaster, schedule_daily_refresh as stock_symbol_master_daily_refresh
 from marketengine.ShoonyaStockFeed import ShoonyaStockFeed
+from service.marketRecorder.config import load_recorder_config
+from service.marketRecorder.recorder import MarketRecorder
+from service.marketRecorder.uploadScheduler import UploadScheduler
 from service.stocksService.StockCollectionsCatalog import StockCollectionsCatalog
 from service.stocksService.StocksService import StocksService
 from service.topMovers.TopMoversService import StockWatchlist
@@ -136,6 +139,16 @@ BACKGROUND_TASK_RESTART_DELAY_SECS = 30.0
 # network), so this is sized for concurrency, not CPU count.
 BROKER_IO_MAX_WORKERS = 32
 
+RECORDER_WATCHDOG_SECS = 10.0
+
+
+async def _recorder_watchdog(app: FastAPI) -> None:
+    while True:
+        await asyncio.sleep(RECORDER_WATCHDOG_SECS)
+        recorder = getattr(app.state, "market_recorder", None)
+        if recorder is not None:
+            recorder.ensure_running()
+
 
 async def _supervised_background_task(coro_func, name: str, app: FastAPI) -> None:
     """
@@ -218,6 +231,21 @@ def _create_market_feeds(app: FastAPI) -> bool:
         app_logger.info(f"Stock tick cache attached, {len(pinned)} tokens pinned.")
     except Exception as e:
         app_logger.error(f"Stock tick cache init error: {e}")
+
+    # Market data recorder: a passenger on the same socket (RECORDER_ENABLED).
+    try:
+        recorder_config = load_recorder_config()
+        if recorder_config.enabled:
+            # A getter: a broker re-login replaces app.state.shoonya.
+            recorder = MarketRecorder(option_feed, recorder_config,
+                                      shoonya_getter=lambda: getattr(app.state, "shoonya", None))
+            recorder.start()
+            app.state.market_recorder = recorder
+            app.state.market_recorder_watchdog = asyncio.create_task(
+                _supervised_background_task(_recorder_watchdog, "market_recorder_watchdog", app)
+            )
+    except Exception as e:
+        app_logger.error(f"Market data recorder init error: {e}")
     return True
 
 
@@ -250,6 +278,10 @@ async def lifespan(app: FastAPI):
     app.state.shoonya_connection = None
     app.state.option_feed  = None
     app.state.stock_feed   = None
+    app.state.market_recorder = None
+    app.state.market_recorder_watchdog = None
+    app.state.recorder_uploader = None
+    recorder_upload_task = None
     app.state.stock_symbol_master = None
     app.state.stocks_service      = None
     app.state.mutual_fund_service     = None
@@ -441,7 +473,30 @@ async def lifespan(app: FastAPI):
     # ── Equity curve snapshot capture (Postgres-only, no market client) ─
     equity_curve_task = asyncio.create_task(equity_curve_refresh())
 
+    # ── Market data recorder: end-of-day upload of recorded days to Drive ─
+    try:
+        recorder_config = load_recorder_config()
+        if recorder_config.enabled and recorder_config.upload_enabled:
+            uploader = UploadScheduler(recorder_config)
+            app.state.recorder_uploader = uploader
+            recorder_upload_task = asyncio.create_task(
+                _supervised_background_task(lambda _app: uploader.run_forever(), "recorder_upload", app)
+            )
+            app_logger.info(f"Recorder uploads to Drive daily at {recorder_config.upload_at:%H:%M} IST.")
+    except Exception as e:
+        app_logger.error(f"Recorder upload scheduler init error: {e}")
+
     yield
+
+    if recorder_upload_task:
+        recorder_upload_task.cancel()
+    if getattr(app.state, "market_recorder_watchdog", None):
+        app.state.market_recorder_watchdog.cancel()
+    if getattr(app.state, "market_recorder", None) is not None:
+        # Journals the buffered rows; the open window is merged after a restart.
+        await asyncio.get_running_loop().run_in_executor(None, app.state.market_recorder.stop)
+    if getattr(app.state, "recorder_uploader", None) is not None:
+        app.state.recorder_uploader.close()
 
     if refresh_task:
         refresh_task.cancel()
