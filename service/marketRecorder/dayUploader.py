@@ -281,6 +281,9 @@ class DayUploader:
                 logger.warning(f"[Drive] {day_name}: no ticks recorded - not uploaded")
                 return result
 
+            logger.info(f"[Drive] Uploading {day_name}: {len(files)} files, "
+                        f"{sum(p.stat().st_size for p in files) / 1e6:.1f} MB, rows {manifest['rows_by_stream']}, "
+                        f"candles {(manifest.get('candles') or {}).get('status', 'none')}")
             uploaded = 0
             for path in files:
                 record = self._upload_file(path, [self._root_name, day_name, path.parent.name], PARQUET_MIME)

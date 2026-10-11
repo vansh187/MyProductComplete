@@ -76,7 +76,24 @@ class UploadScheduler:
         target = datetime.combine(now.date(), self._config.upload_at, IST)
         return target if target > now else target + timedelta(days=1)
 
+    def _log_startup(self) -> None:
+        """INFO: where uploads go and whether the Drive login is in place. Never raises."""
+        try:
+            config = self._config
+            token = config.drive_token_file
+            logger.info(f"[Drive] Upload scheduler: daily at {config.upload_at:%H:%M} IST to Drive folder "
+                        f"'{config.drive_root}' of {config.drive_account or 'ANY account (RECORDER_DRIVE_ACCOUNT not set)'}, "
+                        f"keep {config.local_keep_days} days locally, Drive budget {config.drive_budget_gb:g} GB")
+            if token.is_file():
+                logger.info(f"[Drive] Login token found: {token}")
+            else:
+                logger.error(f"[Drive] Login token NOT found at {token} - uploads will fail until it is copied there "
+                             "(scripts/recorder_drive_login.py), the recorded data stays on disk")
+        except Exception as exc:
+            logger.warning(f"[Drive] Could not log the upload settings: {exc!r}")
+
     async def run_forever(self) -> None:
+        self._log_startup()
         await self.run_once()   # catch-up on startup
         while not self._stop.is_set():
             try:
@@ -86,6 +103,7 @@ class UploadScheduler:
                     target = now + timedelta(seconds=RETRY_SOON_SECS)
                 else:
                     target = self._next_upload_time(now)
+                    logger.info(f"[Drive] Next upload run at {target:%a %d-%m-%Y %H:%M} IST")
                 self.next_run_at = target.isoformat(timespec="minutes")
                 await asyncio.sleep(max(1.0, (target - now).total_seconds()))
             except asyncio.CancelledError:
@@ -177,7 +195,13 @@ class UploadScheduler:
             if upload_time and today not in days and self._today_unsettled(today, now):
                 # Today is waiting for its session close or candles: check again shortly.
                 self._retry_soon = True
+                logger.info(f"[Drive] Today's upload is waiting: {self._today_wait_reason(today, now)} - "
+                            f"checking again in {RETRY_SOON_SECS // 60} min")
             self._backlog_cache = None
+            if days:
+                logger.info(f"[Drive] Upload run: {len(days)} day(s) to upload {[day_folder_name(d) for d in days]}")
+            else:
+                logger.info("[Drive] Upload run: nothing to upload")
             result = {"status": "ok", "days": {}, "pending_before": [day_folder_name(d) for d in days]}
             for day in days:
                 try:
@@ -196,9 +220,36 @@ class UploadScheduler:
                         self._config.drive_budget_gb, self._config.drive_prune_after_days, today)
                 except UploadCancelled:
                     result["status"] = "stopped"
+                self._log_run_summary(result)
             return result
         finally:
             self._running.release()
+
+    def _today_wait_reason(self, today, now: datetime) -> str:
+        try:
+            if not self._session_closed(today, now):
+                return "session not closed yet (last hour's file not written)"
+            name = day_folder_name(today)
+            if self._config.candles_enabled and not (self._config.data_dir / name / CANDLES_MARKER_NAME).is_file():
+                return "broker candles still downloading"
+            if self.uploader.has_late_candles(today):
+                return "late candles to add"
+            return "pending"
+        except Exception as exc:
+            return f"unknown ({exc!r})"
+
+    def _log_run_summary(self, result: dict) -> None:
+        try:
+            outcome = {day: info.get("status") for day, info in (result.get("days") or {}).items()}
+            drive = result.get("drive") or {}
+            level = logging.INFO if result.get("status") == "ok" else logging.WARNING
+            logger.log(level, f"[Drive] Upload run finished ({result.get('status')}): {outcome}"
+                              + (f", recorder data in Drive {drive.get('recorder_usage_after_gb', drive.get('recorder_usage_gb'))} GB"
+                                 f" of {drive.get('budget_gb')} GB budget" if drive.get("recorder_usage_gb") is not None else "")
+                              + (f", Drive budget pruned {drive.get('pruned')}" if drive.get("pruned") else "")
+                              + (f", local days removed {result.get('local_removed')}" if result.get("local_removed") else ""))
+        except Exception as exc:
+            logger.warning(f"[Drive] Upload summary log failed: {exc!r}")
 
     def backlog(self) -> list[str]:
         """Finished days still waiting for Drive (alert when non-empty).

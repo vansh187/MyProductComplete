@@ -26,7 +26,7 @@ import shutil
 import statistics
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -59,6 +59,8 @@ CLOCK_OFFSET_LIMIT_SECS = (-1.5, 3.0)
 SESSION_RETRY_SECS = 60.0
 # Without option chains (master not loaded yet), the day plan is reloaded this often.
 MASTER_RETRY_SECS = 300.0
+# INFO heartbeat while recording: rows, rates, queue, drops, subscriptions.
+HEARTBEAT_SECS = 300.0
 
 
 class MarketRecorder:
@@ -115,6 +117,11 @@ class MarketRecorder:
         self._recovered = threading.Event()    # journal recovery done: day files are final
         self._candle_wake = threading.Event()  # session end: fetch now instead of at the next check
         self._candle_thread: threading.Thread | None = None
+        # INFO tracking (recorder thread only - nothing on the WS thread).
+        self._next_heartbeat = 0.0
+        self._heartbeat_base = {"rows": dict(self._rows_today), "frames": 0, "errors": 0, "dropped": 0}
+        self._first_tick_logged = False
+        self._idle_logged_for = None
 
         try:
             if hasattr(feed, "on_raw_tick"):
@@ -150,10 +157,42 @@ class MarketRecorder:
             self._thread = threading.Thread(target=self._run, name="market-recorder", daemon=True)
             self._thread.start()
             logger.info(f"[Recorder] Started ({RECORDER_VERSION}), data dir {self._config.data_dir}")
+            self._log_settings()
             self.refresh_holidays_in_background()
             self._start_candle_loop()
         except Exception as exc:
             logger.error(f"[Recorder] Start failed: {exc!r}")
+
+    def _log_settings(self) -> None:
+        """One INFO line with what the recorder will do, and when it records next."""
+        try:
+            config = self._config
+            logger.info(
+                f"[Recorder] Settings: session {config.session_start:%H:%M}-{config.session_end:%H:%M} IST, "
+                f"{config.window_minutes}-min files, underlyings {list(config.underlyings)}, "
+                f"{config.strikes_each_side} strikes each side, chain snapshot every {config.chain_snapshot_secs:g}s, "
+                f"journal flush every {config.journal_flush_secs:g}s, candles {'on' if config.candles_enabled else 'off'}, "
+                f"heartbeat every {HEARTBEAT_SECS / 60:g} min")
+            # Outside the session, the worker logs "Idle ... next recording starts ..." itself.
+            now = ist_from_ns(self._clock_ns())
+            if self.calendar.in_session(now):
+                logger.info(f"[Recorder] In session now - recording starts within a second for {day_folder_name(now.date())}")
+        except Exception as exc:
+            logger.warning(f"[Recorder] Could not log the settings: {exc!r}")
+
+    def _next_session_text(self, now: datetime) -> str:
+        """'Mon 12-10-2026 09:00 IST' for the next session start after now."""
+        try:
+            for offset in range(0, 15):
+                day = now.date() + timedelta(days=offset)
+                if not self.calendar.is_trading_day(day):
+                    continue
+                start, _ = self.calendar.session_bounds(day)
+                if start > now:
+                    return f"{start:%a} {day_folder_name(day)} {start:%H:%M} IST"
+            return "not within 15 days (check the holiday list)"
+        except Exception as exc:
+            return f"unknown ({exc!r})"
 
     def _start_candle_loop(self) -> None:
         try:
@@ -163,6 +202,8 @@ class MarketRecorder:
                 return
             self._candle_thread = threading.Thread(target=self._candle_loop, name="recorder-candles", daemon=True)
             self._candle_thread.start()
+            logger.info(f"[Recorder] Candle loop started: after the close, then every "
+                        f"{self._config.candles_retry_secs / 60:g} min until each day's candles are settled")
         except Exception as exc:
             logger.error(f"[Recorder] Could not start the candle loop: {exc!r}")
 
@@ -187,10 +228,15 @@ class MarketRecorder:
                     return
             while not self._stop.is_set():
                 try:
-                    for day in self._days_missing_candles():
+                    days = self._days_missing_candles()
+                    if days:
+                        logger.info(f"[Recorder] Candle download pending for {[day_folder_name(d) for d in days]}")
+                    for day in days:
                         if self._stop.is_set():
                             return
-                        self.candles.fetch_day(day)
+                        result = self.candles.fetch_day(day) or {}
+                        if result.get("status") in ("busy", "journal_open", "stopped"):
+                            logger.info(f"[Recorder] Candles for {day_folder_name(day)}: {result.get('status')} - next pass")
                 except Exception as exc:
                     logger.error(f"[Recorder] Candle pass failed: {exc!r}")
                 self._candle_wake.wait(self._config.candles_retry_secs)
@@ -394,8 +440,15 @@ class MarketRecorder:
             if now_mono >= self._next["clock"]:
                 self._next["clock"] = now_mono + CLOCK_CHECK_SECS
                 self._guard("clock check", self._check_clock, now_ns)
+            if in_session:
+                self._guard("first tick log", self._log_first_tick, now)
+                if now_mono >= self._next_heartbeat:
+                    self._next_heartbeat = now_mono + HEARTBEAT_SECS
+                    self._guard("heartbeat", self._log_heartbeat, now)
             if not in_session:
                 self._guard("session end", self._end_session, now_ns)
+        elif not in_session:
+            self._guard("idle log", self._log_idle, now)
 
         self._guard("window close", self._close_finished_windows, now_ns)
         if now_mono >= self._next["flush"]:
@@ -427,7 +480,89 @@ class MarketRecorder:
             self._event("GAP", from_ns=last_ns, to_ns=now_ns, detail="recorder restart")
         self._guard("instruments snapshot", self._write_instruments, day)
         self._guard("subscriptions", self._apply_plan, now_ns)
-        logger.info(f"[Recorder] Session started for {day_folder_name(day)}")
+        self._log_session_started(day, last_ns, now_ns)
+
+    def _log_session_started(self, day, last_ns: int | None, now_ns: int) -> None:
+        """INFO summary at the session start, and the heartbeat baseline. Never raises."""
+        try:
+            self._first_tick_logged = self._rows_today.get("ticks", 0) > 0
+            self._heartbeat_base = {"rows": dict(self._rows_today), "frames": self._frames,
+                                    "errors": self.errors_total, "dropped": self._dropped}
+            self._next_heartbeat = time.monotonic() + HEARTBEAT_SECS
+            self._idle_logged_for = None
+            resumed = f", resumed after a restart (gap from {ist_from_ns(last_ns):%H:%M:%S})" \
+                if last_ns is not None and last_ns < now_ns else ""
+            logger.info(f"[Recorder] Session started for {day_folder_name(day)}: subscribed {len(self._touchline)} "
+                        f"touchline + {len(self._depth)} depth, websocket "
+                        f"{'connected' if getattr(self._feed, 'is_connected', False) else 'NOT connected yet'}{resumed}")
+            if not self.planner.option_keys():
+                logger.warning("[Recorder] No option chains in the day plan yet (scrip master not loaded?) - "
+                               f"retrying every {MASTER_RETRY_SECS / 60:g} min")
+        except Exception as exc:
+            logger.warning(f"[Recorder] Session start log failed: {exc!r}")
+
+    def _log_first_tick(self, now: datetime) -> None:
+        """One INFO line when the first tick of the day is recorded: proof that data is flowing."""
+        try:
+            if self._first_tick_logged or self._rows_today.get("ticks", 0) == 0:
+                return
+            self._first_tick_logged = True
+            logger.info(f"[Recorder] First ticks recorded at {now:%H:%M:%S} - data is flowing "
+                        f"({self._rows_today.get('ticks', 0)} tick rows, {self._rows_today.get('depth', 0)} depth rows so far)")
+        except Exception as exc:
+            logger.warning(f"[Recorder] First-tick log failed: {exc!r}")
+
+    def _log_heartbeat(self, now: datetime) -> None:
+        """Every HEARTBEAT_SECS while recording: what was recorded since the
+        last heartbeat, and a WARNING when something looks wrong (no ticks,
+        dropped frames, new errors, websocket down, journal/file lagging)."""
+        try:
+            base = self._heartbeat_base
+            rows = dict(self._rows_today)
+            delta = {stream: rows.get(stream, 0) - base["rows"].get(stream, 0) for stream in rows}
+            frames = self._frames - base["frames"]
+            new_errors = self.errors_total - base["errors"]
+            new_drops = self._dropped - base["dropped"]
+            self._heartbeat_base = {"rows": rows, "frames": self._frames, "errors": self.errors_total, "dropped": self._dropped}
+
+            last_files = {}
+            for stream, writer in self.writers.items():
+                closed = writer.last_closed or {}
+                if closed.get("file"):
+                    last_files[stream] = f"{closed['file'].replace(chr(92), '/').rsplit('/', 1)[-1]}({closed.get('rows')})"
+            ws = {True: "connected", False: "DOWN", None: "unknown"}.get(self._ws_connected, "unknown")
+            minutes = HEARTBEAT_SECS / 60
+            logger.info(
+                f"[Recorder] Heartbeat {now:%H:%M}: last {minutes:g} min +{delta.get('ticks', 0)} ticks, "
+                f"+{delta.get('depth', 0)} depth, +{delta.get('chain', 0)} chain, +{delta.get('events', 0)} events "
+                f"({frames} frames read) | today {rows} | subscribed {len(self._touchline)}+{len(self._depth)} | "
+                f"ws {ws} | queue {len(self._queue)} | dropped {self._dropped} | errors {self.errors_total} | "
+                f"last files {last_files or 'none yet'}")
+
+            if self._ws_connected and delta.get("ticks", 0) == 0:
+                logger.warning(f"[Recorder] No ticks recorded in the last {minutes:g} min although the websocket is "
+                               "connected - check the feed / subscriptions")
+            if self._ws_connected is False:
+                logger.warning("[Recorder] Websocket is down - nothing is being recorded (gap logged in events)")
+            if new_drops:
+                logger.warning(f"[Recorder] {new_drops} frames dropped in the last {minutes:g} min (queue full)")
+            if new_errors:
+                logger.warning(f"[Recorder] {new_errors} new errors in the last {minutes:g} min - last: {self.last_error}")
+            if len(self._queue) > self._queue_max // 2:
+                logger.warning(f"[Recorder] Queue {len(self._queue)}/{self._queue_max} - the recorder is falling behind")
+        except Exception as exc:
+            logger.warning(f"[Recorder] Heartbeat failed: {exc!r}")
+
+    def _log_idle(self, now: datetime) -> None:
+        """Outside the session: one INFO line per day saying when recording resumes."""
+        try:
+            if self._idle_logged_for == now.date():
+                return
+            self._idle_logged_for = now.date()
+            reason = "not a trading day" if not self.calendar.is_trading_day(now.date()) else "outside session hours"
+            logger.info(f"[Recorder] Idle ({reason}) - next recording starts {self._next_session_text(now)}")
+        except Exception as exc:
+            logger.warning(f"[Recorder] Idle log failed: {exc!r}")
 
     def _reload_day_plan(self, now_ns: int) -> None:
         """No option chains yet (scrip master missing or stale at the open):
@@ -459,7 +594,9 @@ class MarketRecorder:
             except Exception as exc:
                 self._report_error(f"closing {writer.stream} at session end", exc)
         self._active_day = None
-        logger.info(f"[Recorder] Session ended for {day_folder_name(day)}: rows {self._rows_today}")
+        logger.info(f"[Recorder] Session ended for {day_folder_name(day)}: rows {self._rows_today}, "
+                    f"frames dropped {self._dropped}, errors {self.errors_total}"
+                    + (", candle download starts now" if self._config.candles_enabled else ""))
         self.refresh_holidays_in_background()
         self.fetch_candles_in_background(day)
 
@@ -480,15 +617,23 @@ class MarketRecorder:
         ended are written now; the window in progress keeps its segments and
         is merged when it ends."""
         now_ns = self._clock_ns()
+        recovered, still_open = 0, 0
         for writer in self.writers.values():
             try:
                 for window in writer.pending_windows():
                     if window.end_ns + WINDOW_CLOSE_GRACE_NS <= now_ns:
                         writer.close_window(window)
+                        recovered += 1
                     else:
                         self._open_windows.add(window)
+                        still_open += 1
             except Exception as exc:
                 self._report_error(f"recovering {writer.stream}", exc)
+        if recovered or still_open:
+            logger.info(f"[Recorder] Recovery after restart: {recovered} unfinished hourly files written from the "
+                        f"journal, {still_open} current-hour journals kept and continued")
+        else:
+            logger.info("[Recorder] Recovery: nothing left from a previous run")
 
     def _close_finished_windows(self, now_ns: int) -> None:
         current = self.calendar.window_for_ns(now_ns)
@@ -606,10 +751,15 @@ class MarketRecorder:
         if not connected:
             self._ws_down_since_ns = now_ns
             self._event("WS_DISCONNECT", from_ns=now_ns, ts_ns=now_ns)
+            logger.warning(f"[Recorder] Websocket disconnected at {ist_from_ns(now_ns):%H:%M:%S} - recording paused")
         elif self._ws_connected is False:
             down_since = self._ws_down_since_ns or now_ns
             self._event("WS_RECONNECT", ts_ns=now_ns)
             self._event("GAP", from_ns=down_since, to_ns=now_ns, detail="websocket down", ts_ns=now_ns)
+            logger.info(f"[Recorder] Websocket reconnected at {ist_from_ns(now_ns):%H:%M:%S} - recording resumed "
+                        f"(gap of {(now_ns - down_since) / 1e9:.0f}s logged in events)")
+        else:
+            logger.info("[Recorder] Websocket connected - recording")
         self._ws_connected = connected
 
     def _report_drops(self) -> None:

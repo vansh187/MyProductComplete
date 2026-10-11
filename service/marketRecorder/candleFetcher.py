@@ -271,6 +271,9 @@ class DayCandleFetcher:
         start, end = self._calendar.session_bounds(day)
         start_s, end_s = start.timestamp(), end.timestamp()
         pause = 1.0 / max(0.2, float(self._config.candles_calls_per_sec))
+        logger.info(f"[Recorder] Downloading 1-min candles for {day_name}: {len(keys)} instruments"
+                    + (f" (retry {int(attempts.get('attempts', 0)) + 1}, only the ones that failed)" if retry_only else "")
+                    + f", ~{len(keys) * pause / 60:.1f} min")
         failed = []
         began = time.monotonic()
         for key in keys:

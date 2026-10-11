@@ -906,6 +906,49 @@ def record_morning(tmp_path, tick_at=(9, 15, 10)):
     return recorder, option_key
 
 
+class TestInfoLogs:
+    """The INFO trail that shows, from the log alone, that a day was recorded."""
+
+    def test_a_day_leaves_a_readable_info_trail(self, tmp_path, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="service.marketRecorder")
+        clock = Clock(ns_at(8, 50))
+        recorder, feed = make_recorder(tmp_path, clock)
+        pump(recorder, clock, ns_at(8, 50))                                    # before the open
+        pump(recorder, clock, ns_at(9, 0, 1))
+        pump(recorder, clock, ns_at(9, 0, 2), [{"t": "tk", "e": "NSE", "tk": "26000", "lp": "25010"}])
+        recorder._next_heartbeat = 0.0
+        pump(recorder, clock, ns_at(9, 5))                                     # heartbeat
+        feed.is_connected = False
+        pump(recorder, clock, ns_at(9, 6))
+        feed.is_connected = True
+        pump(recorder, clock, ns_at(9, 7))
+        recorder._next_heartbeat = 0.0
+        pump(recorder, clock, ns_at(9, 10))                                    # heartbeat, no new ticks
+        pump(recorder, clock, ns_at(15, 30, 1))                                # session end
+        pump(recorder, clock, ns_at(15, 30, 2))                                # next pass: idle
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        for expected in ("Idle (outside session hours) - next recording starts Mon 12-10-2026 09:00 IST",
+                         "Session started for 12-10-2026", "Websocket connected - recording",
+                         "First ticks recorded at 09:00:02", "Heartbeat 09:05", "Websocket disconnected at 09:06:00",
+                         "Websocket reconnected at 09:07:00", "No ticks recorded in the last 5 min",
+                         "Closed ticks 12-10-2026 part-0900.parquet", "Session ended for 12-10-2026",
+                         "next recording starts Tue 13-10-2026 09:00 IST"):
+            assert expected in text, expected
+
+    def test_heartbeat_never_raises(self, tmp_path):
+        recorder, _ = make_recorder(tmp_path, Clock(ns_at(9, 0, 1)))
+        recorder._heartbeat_base = None              # corrupt state
+        recorder._log_heartbeat(datetime.combine(DAY, time(9, 5), IST))   # logged as a warning, no exception
+
+    def test_upload_logs_missing_token(self, tmp_path, caplog):
+        import logging
+        from service.marketRecorder.uploadScheduler import UploadScheduler
+        caplog.set_level(logging.INFO, logger="service.marketRecorder")
+        UploadScheduler(make_config(tmp_path, drive_token_file=tmp_path / "missing.json"))._log_startup()
+        assert any("Login token NOT found" in r.getMessage() for r in caplog.records)
+
+
 class TestCandles:
 
     def _fetcher(self, recorder, shoonya):
